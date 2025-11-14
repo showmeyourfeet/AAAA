@@ -149,21 +149,21 @@ class Transformer(nn.Module):
             bs, _, _, _ = src.shape
             src = src.flatten(2).permute(2, 0, 1)
             pos_embed = pos_embed.flatten(2).permute(2, 0, 1)
-            if pos_embed.shape[1] == 1:
-                pos_embed = pos_embed.repeat(1, bs, 1)
-            pos_batch = pos_embed.shape[1]
+
             query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
 
-            if additional_pos_embed is not None:
-                additional_pos_embed = additional_pos_embed.unsqueeze(1).repeat(1, pos_batch, 1)
-                pos_embed = torch.cat([additional_pos_embed, pos_embed], dim=0)
+            additional_pos_embed = additional_pos_embed.unsqueeze(1).repeat(1, bs, 1)
+            pos_embed = torch.cat([additional_pos_embed, pos_embed], axis=0)
 
-            addition_inputs = [x for x in (latent_input, proprio_input, command_embedding) if x is not None]
-            if addition_inputs:
-                addition_tensor = torch.stack(addition_inputs, dim=0)
-                src = torch.cat([addition_tensor, src], dim=0)
-                if pos_embed.shape[1] != src.shape[1]:
-                    pos_embed = pos_embed[:, : src.shape[1], :]
+            if command_embedding is not None:
+                addition_input = torch.stack(
+                    [latent_input, proprio_input, command_embedding], axis=0
+                )
+            else:
+                addition_input = torch.stack([latent_input, proprio_input], axis=0)
+
+            src = torch.cat([addition_input, src], axis=0)
+
         else:
             assert len(src.shape) == 3
             bs, hw, c = src.shape
