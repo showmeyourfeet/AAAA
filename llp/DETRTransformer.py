@@ -148,7 +148,7 @@ class Transformer(nn.Module):
         if len(src.shape) == 4:
             bs, _, _, _ = src.shape
             src = src.flatten(2).permute(2, 0, 1)
-            pos_embed = pos_embed.flatten(2).permute(2, 0, 1)
+            pos_embed = pos_embed.flatten(2).permute(2, 0, 1).repeat(1, bs, 1)
 
             query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
 
