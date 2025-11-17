@@ -31,24 +31,7 @@ The high-level policy takes in images from multiple cameras and determines the o
 To train the high-level policy, run the following command:
 
 ```bash
-python hlp/train.py \
---ckpt_dir ./hlp/ckpts \
---batch_size 16 \
---num_epochs 1000 \
---lr 1e-5 \
---seed 0 \
---gpu 0  \
---history_len 4 \
---history_skip_frame 30 \
---prediction_offset 15 \
---use_splitted \
---use_paired_sequences True  \
---splitted_root /home/beta/projs/pys/AutoSurgical-Algorithms/srt-h/splitted_datasets/training_datasets  \
---val_splitted_root /home/beta/projs/pys/AutoSurgical-Algorithms/srt-h/splitted_datasets/validation_datasets \
---stage_embeddings_file /home/beta/projs/pys/AutoSurgical-Algorithms/srt-h/splitted_datasets/stage_embeddings_distilbert.json \
---stage_texts_file /home/beta/projs/pys/AutoSurgical-Algorithms/srt-h/splitted_datasets/stage_embeddings_distilbert.json \     
---use_augmentation
-
+python hlp/train.py --splitted_root /home/beta/projs/pys/AutoSurgical-Algorithms/srt-h/splitted_datasets/training_datasets  --val_splitted_root /home/beta/projs/pys/AutoSurgical-Algorithms/srt-h/splitted_datasets/validation_datasets --stage_embeddings_file /home/beta/projs/pys/AutoSurgical-Algorithms/srt-h/splitted_datasets/stage_embeddings_distilbert.json  --stage_texts_file /home/beta/projs/pys/AutoSurgical-Algorithms/srt-h/splitted_datasets/stage_embeddings_distilbert.json   --ckpt_dir ./hlp/ckpts --batch_size 16 --num_epochs 1000 --lr 1e-5 --seed 0 --gpu 0  --history_len 4 --history_skip_frame 10  --prediction_offset 15 --use_composite --n_repeats 10 --use_augmentation
 ```
 
 ## Low-Level Policy
@@ -60,25 +43,7 @@ The low-level policy takes the high-level command and the current robot state (i
 To train the low-level policy, run the following command:
 
 ```bash
-python llp/train.py \
---ckpt_dir ./llp/ckpts \
---batch_size 16 \
---seed 42 \
---num_epochs 1500 \
---lr 1e-4 \
---chunk_size 30 \
---hidden_dim 512 \
---dim_feedforward 3200 \
---kl_weight 80 \
---image_encoder efficientnet_b3film \
---use_language \
---language_encoder distilbert \
---use_splitted \
---splitted_root /home/beta/projs/pys/AutoSurgical-Algorithms/srt-h/splitted_datasets/training_datasets \
---val_splitted_root /home/beta/projs/pys/AutoSurgical-Algorithms/srt-h/splitted_datasets/validation_datasets \
---stage_embeddings_file /home/beta/projs/pys/AutoSurgical-Algorithms/srt-h/splitted_datasets/stage_embeddings_distilbert.json \
---no_encoder \
---use_augmentation
+python llp/train.py --splitted_root /home/beta/projs/pys/AutoSurgical-Algorithms/srt-h/splitted_datasets/training_datasets --val_splitted_root /home/beta/projs/pys/AutoSurgical-Algorithms/srt-h/splitted_datasets/validation_datasets --stage_embeddings_file /home/beta/projs/pys/AutoSurgical-Algorithms/srt-h/splitted_datasets/stage_embeddings_distilbert.json --ckpt_dir ./llp/ckpts --batch_size 16 --seed 42 --num_epochs 1500 --lr 1e-4 --chunk_size 30 --hidden_dim 512 --dim_feedforward 3200 --kl_weight 80 --image_encoder efficientnet_b3film --use_language --language_encoder distilbert --use_splitted --no_encoder --use_augmentation
 ```
 
 ## Key Technologies

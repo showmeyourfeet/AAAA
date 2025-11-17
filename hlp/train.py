@@ -20,6 +20,7 @@ from tqdm import tqdm
 from PIL import Image, ImageDraw, ImageFont
 from sklearn.manifold import TSNE
 from collections import OrderedDict
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 
 from hlp.dataset import load_merged_data, load_splitted_data, load_composite_data
 from llp.dataset import load_paired_stage_sequences, load_sequential_stage_sequences
@@ -27,10 +28,37 @@ from hlp.model import HighLevelModel
 # removed aloha memory_monitor dependency
 
 
-def train(model, dataloader, optimizer, criterion, device, logger=None, log_wandb=False, epoch: int | None = None):
+def calculate_hl_loss(logits, true_labels):
+    """
+    Calculate high-level loss with L1 distance weighting.
+    Penalizes predictions that are further from the correct stage.
+    
+    Args:
+        logits: Model output logits, shape (batch_size, num_classes)
+        true_labels: Ground truth labels, shape (batch_size,)
+    
+    Returns:
+        weighted_loss: Scalar tensor, distance-weighted cross-entropy loss
+    """
+    # Unreduced cross-entropy loss
+    ce_loss_unreduced = torch.nn.functional.cross_entropy(logits, true_labels, reduction='none')
+    
+    # Calculate L1 distance between predicted and true labels
+    with torch.no_grad():
+        pred_indices = torch.argmax(logits, dim=-1)
+        l1_distance = torch.abs(pred_indices - true_labels).float() + 1.0
+    
+    # Weight the loss by L1 distance
+    weighted_loss = (ce_loss_unreduced * l1_distance).mean()
+    
+    return weighted_loss
+
+
+def train(model, dataloader, optimizer, scheduler, device, logger=None, log_wandb=False, epoch: int | None = None):
     model.train()
     total_loss = 0.0
     num_batches = 0
+    
     batch_bar = tqdm(
         dataloader,
         desc=f"Train {epoch}" if epoch is not None else "Train",
@@ -51,10 +79,12 @@ def train(model, dataloader, optimizer, criterion, device, logger=None, log_wand
             ]
             for cmd in commands
         ]
-
         commands_idx = torch.tensor(commands_idx, device=device)
 
-        loss = criterion(logits, commands_idx)
+        # Calculate distance-weighted loss
+        loss = calculate_hl_loss(logits, commands_idx)
+        
+        # Backpropagation
         loss.backward()
         optimizer.step()
 
@@ -70,13 +100,17 @@ def train(model, dataloader, optimizer, criterion, device, logger=None, log_wand
             loss=f"{loss.item():.4f}",
             temp=f"{temp_val:.3f}",
         )
-    return total_loss / num_batches if num_batches > 0 else 0.0
+    
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    
+    return avg_loss
 
 
-def evaluate(model, dataloader, criterion, device, epoch: int | None = None):
+def evaluate(model, dataloader, device, epoch: int | None = None):
     model.eval()
     total_loss = 0.0
     num_batches = 0
+    
     with torch.no_grad():
         val_bar = tqdm(
             dataloader,
@@ -97,11 +131,16 @@ def evaluate(model, dataloader, criterion, device, epoch: int | None = None):
             ]
             commands_idx = torch.tensor(commands_idx, device=device)
 
-            loss = criterion(logits, commands_idx)
+            # Calculate distance-weighted loss
+            loss = calculate_hl_loss(logits, commands_idx)
+            
             total_loss += loss.item()
             num_batches += 1
             val_bar.set_postfix(loss=f"{loss.item():.4f}")
-    return total_loss / num_batches if num_batches > 0 else float('inf')
+    
+    avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
+    
+    return avg_loss
 
 
 def test(model, dataloader, device, current_epoch):
@@ -546,8 +585,22 @@ if __name__ == "__main__":
         )
 
         model = build_HighLevelModel(dataset_dirs, args.history_len, device)
+    
+    # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    criterion = torch.nn.CrossEntropyLoss()
+    
+    # Learning rate scheduler with warmup and cosine annealing
+    total_steps = args.num_epochs
+    warmup_steps = max(1, total_steps // 100)  # 1% warmup
+    
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[
+            LinearLR(optimizer, start_factor=0.001, end_factor=1.0, total_iters=warmup_steps),
+            CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
+        ],
+        milestones=[warmup_steps]
+    )
 
     # WandB removed
 
@@ -685,38 +738,48 @@ if __name__ == "__main__":
                 logger.info(f"Epoch {epoch}: Test Success Rate = {test_success_rate * 100:.2f}%")
 
         # Training
-        train_loss = train(model, train_dataloader, optimizer, criterion, device, logger=logger, log_wandb=False, epoch=epoch)
+        train_loss = train(model, train_dataloader, optimizer, scheduler, device, logger=logger, log_wandb=False, epoch=epoch)
+        
+        # Step scheduler after training
+        scheduler.step()
         
         # Validation
-        eval_loss = None
+        val_loss = None
         if val_dataloader is not None and dagger_ratio is None:
-            eval_loss = evaluate(model, val_dataloader, criterion, device, epoch=epoch)
+            val_loss = evaluate(model, val_dataloader, device, epoch=epoch)
+        
+        # Get current learning rate
+        current_lr = optimizer.param_groups[0]['lr']
         
         # Update progress bar
         postfix_dict = {"Train Loss": f"{train_loss:.5f}"}
-        if eval_loss is not None:
-            postfix_dict["Val Loss"] = f"{eval_loss:.5f}"
+        if val_loss is not None:
+            postfix_dict["Val Loss"] = f"{val_loss:.5f}"
         pbar_epochs.set_postfix(postfix_dict)
 
-        # Logging
+        # Logging in unified format (compatible with llp/train.py)
         if logger:
-            msg = f"Epoch {epoch}: Train Loss = {train_loss:.5f}"
-            if eval_loss is not None:
-                msg += f", Val Loss = {eval_loss:.5f}"
-            logger.info(msg)
+            # Main training loss line
+            logger.info(f"Train loss: {train_loss:.5f}")
+            
+            # Detailed metrics line with learning rate
+            logger.info(f"loss: {train_loss:.5f} lr: {current_lr:.5e}")
+            
+            if val_loss is not None:
+                logger.info(f"Val loss: {val_loss:.5f}")
         else:
-            tqdm.write(f"Epoch {epoch}: Train Loss = {train_loss:.5f}" + 
-                      (f", Val Loss = {eval_loss:.5f}" if eval_loss is not None else ""))
+            tqdm.write(f"Train loss: {train_loss:.5f}" + 
+                      (f", Val loss: {val_loss:.5f}" if val_loss is not None else ""))
 
         # wandb removed
 
         # Save best model based on validation loss
-        if eval_loss is not None and eval_loss < best_val_loss:
-            best_val_loss = eval_loss
+        if val_loss is not None and val_loss < best_val_loss:
+            best_val_loss = val_loss
             best_epoch = epoch
             best_ckpt_path = os.path.join(ckpt_dir, f"best_model.ckpt")
             torch.save(model.state_dict(), best_ckpt_path)
-            logger.info(f"✓ New best model! Epoch {epoch}: Val Loss = {best_val_loss:.5f} -> {best_ckpt_path}")
+            logger.info(f"✓ New best model! Epoch {epoch}: Val loss = {best_val_loss:.5f} -> {best_ckpt_path}")
 
         # Save a checkpoint every 100 epochs
         save_ckpt_every = 100
@@ -746,7 +809,7 @@ if __name__ == "__main__":
     logger.info("=" * 80)
     logger.info("Training Summary:")
     if best_ckpt_path:
-        logger.info(f"  Best Model: Epoch {best_epoch}, Val Loss = {best_val_loss:.5f}")
+        logger.info(f"  Best Model: Epoch {best_epoch}, Val loss = {best_val_loss:.5f}")
         logger.info(f"  Best Model Path: {best_ckpt_path}")
     logger.info(f"  Final Model Path: {final_ckpt_path}")
     logger.info("=" * 80)
