@@ -137,17 +137,28 @@ def train_bc(
         print(f"Checkpoint directory {ckpt_dir} is not empty. Load checkpoint? (y/n)")
         load_ckpt = input().strip().lower()
         if load_ckpt == "y":
-            existing_epochs = [
-                int(f.split("_")[2])
-                for f in os.listdir(ckpt_dir)
-                if f.startswith("policy_epoch_")
-            ]
-            if existing_epochs:
-                latest_idx = max(existing_epochs)
-                ckpt_path = os.path.join(
-                    ckpt_dir, f"policy_epoch_{latest_idx}_seed_{seed}.ckpt"
-                )
+            # Priority 1: Try to load latest checkpoint (rolling backup)
+            latest_ckpt_path = os.path.join(ckpt_dir, f"policy_latest_seed_{seed}.ckpt")
+            if os.path.exists(latest_ckpt_path):
+                ckpt_path = latest_ckpt_path
                 checkpoint = torch.load(ckpt_path)
+                print(f"Found latest checkpoint: {ckpt_path}")
+            else:
+                # Priority 2: Fallback to policy_epoch_* files
+                existing_epochs = [
+                    int(f.split("_")[2])
+                    for f in os.listdir(ckpt_dir)
+                    if f.startswith("policy_epoch_")
+                ]
+                if existing_epochs:
+                    latest_idx = max(existing_epochs)
+                    ckpt_path = os.path.join(
+                        ckpt_dir, f"policy_epoch_{latest_idx}_seed_{seed}.ckpt"
+                    )
+                    checkpoint = torch.load(ckpt_path)
+                    print(f"Found periodic checkpoint: {ckpt_path}")
+            
+            if checkpoint is not None:
                 model_state_dict = checkpoint["model_state_dict"]
                 ckpt_state_dim = infer_state_dim_from_checkpoint(model_state_dict)
                 if ckpt_state_dim is not None and ckpt_state_dim != policy_config.get("state_dim", 20):
@@ -185,6 +196,12 @@ def train_bc(
     policy.cuda()
     best_val = float("inf")
     best_ckpt_path = None
+    
+    # Restore best_val from checkpoint if available
+    if load_ckpt == "y" and checkpoint is not None and "best_val" in checkpoint:
+        best_val = checkpoint["best_val"]
+        print(f"Restored best_val: {best_val:.5f}")
+    
     train_history: List[Dict[str, torch.Tensor]] = []
 
     epoch_bar = trange(start_epoch, num_epochs, desc="Epochs", leave=True)
@@ -256,6 +273,20 @@ def train_bc(
                 )
                 if logger:
                     logger.info(f"Saved best checkpoint to {best_ckpt_path}")
+
+        # Save latest checkpoint every epoch (rolling backup)
+        # This allows resuming from any epoch, not just multiples of 100
+        latest_ckpt_path = os.path.join(ckpt_dir, f"policy_latest_seed_{seed}.ckpt")
+        torch.save(
+            {
+                "model_state_dict": policy.serialize(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "epoch": epoch,
+                "best_val": best_val,
+            },
+            latest_ckpt_path,
+        )
 
         save_ckpt_every = 100
         if epoch % save_ckpt_every == 0 and epoch > 0:
@@ -407,7 +438,7 @@ def main(args: Dict):
         "kl_weight": args["kl_weight"],
         "hidden_dim": args["hidden_dim"],
         "dim_feedforward": args["dim_feedforward"],
-        "lr_backbone": 1e-5,
+        "lr_backbone": args.get("lr_backbone", 1e-5),
         "backbone": args["image_encoder"],
         "enc_layers": 4,
         "dec_layers": 7,
@@ -420,6 +451,7 @@ def main(args: Dict):
         "vq": args.get("vq", False),
         "vq_class": args.get("vq_class", 512),
         "vq_dim": args.get("vq_dim", 32),
+        "train_image_encoder": args.get("train_image_encoder", False),
     }
 
     config = {
@@ -466,6 +498,10 @@ if __name__ == "__main__":
 
     parser.add_argument("--task_config", type=json.loads, default=None)
     parser.add_argument("--log_every", type=int, default=1)
+    
+    # Image encoder training control
+    parser.add_argument("--train_image_encoder", action="store_true", help="Enable training of the image encoder (default: frozen)")
+    parser.add_argument("--lr_backbone", type=float, default=1e-5, help="Learning rate for image encoder backbone (only used if --train_image_encoder is set)")
 
     args = parser.parse_args()
     main(vars(args))

@@ -193,7 +193,22 @@ def test(model, dataloader, device, current_epoch):
 def latest_checkpoint(ckpt_dir):
     """
     Returns the latest checkpoint file from the given directory.
+    Priority:
+    1. latest_checkpoint.ckpt (rolling backup, most recent)
+    2. epoch_*.ckpt (periodic backups every 100 epochs)
     """
+    # First, check for latest_checkpoint.ckpt (rolling backup)
+    latest_ckpt_path = os.path.join(ckpt_dir, "latest_checkpoint.ckpt")
+    if os.path.exists(latest_ckpt_path):
+        try:
+            checkpoint = torch.load(latest_ckpt_path, map_location='cpu', weights_only=False)
+            if isinstance(checkpoint, dict) and 'epoch' in checkpoint:
+                epoch_idx = checkpoint['epoch']
+                return latest_ckpt_path, epoch_idx
+        except Exception as e:
+            print(f"Warning: Failed to load latest_checkpoint.ckpt: {e}")
+    
+    # Fallback: Find the latest epoch_*.ckpt
     all_ckpts = [
         f
         for f in os.listdir(ckpt_dir)
@@ -399,7 +414,7 @@ def load_candidate_texts_and_embeddings(dataset_dirs, device=torch.device("cuda"
     return candidate_texts, candidate_embeddings
 
 
-def build_HighLevelModel(dataset_dirs, history_len, device, stage_embeddings_file=None, stage_texts_file=None):
+def build_HighLevelModel(dataset_dirs, history_len, device, stage_embeddings_file=None, stage_texts_file=None, train_image_encoder=False):
     # Load candidate texts and embeddings
     candidate_texts, candidate_embeddings = load_candidate_texts_and_embeddings(
         dataset_dirs, device=device, stage_embeddings_file=stage_embeddings_file, stage_texts_file=stage_texts_file
@@ -413,6 +428,7 @@ def build_HighLevelModel(dataset_dirs, history_len, device, stage_embeddings_fil
         candidate_embeddings=candidate_embeddings,
         candidate_texts=candidate_texts,
         command_to_index=command_to_index,
+        train_image_encoder=train_image_encoder,
     ).to(device)
     return model
 
@@ -459,6 +475,8 @@ if __name__ == "__main__":
     # traditional format replacements
     parser.add_argument('--dataset_dirs', nargs='+', type=str, help='List of dataset directories (traditional format)')
     parser.add_argument('--camera_names', nargs='+', type=str, default=['left_frame','right_frame'], help='Camera names')
+    # Image encoder training control
+    parser.add_argument('--train_image_encoder', action='store_true', help='Enable training of the image encoder (default: frozen)')
 
     args = parser.parse_args()
 
@@ -561,6 +579,7 @@ if __name__ == "__main__":
             device=device,
             stage_embeddings_file=args.stage_embeddings_file,
             stage_texts_file=args.stage_texts_file,
+            train_image_encoder=args.train_image_encoder,
         )
     else:
         # Traditional format: use explicit dataset_dirs and camera_names
@@ -584,7 +603,12 @@ if __name__ == "__main__":
             image_size=args.image_size,
         )
 
-        model = build_HighLevelModel(dataset_dirs, args.history_len, device)
+        model = build_HighLevelModel(
+            dataset_dirs, 
+            args.history_len, 
+            device,
+            train_image_encoder=args.train_image_encoder,
+        )
     
     # Optimizer
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-2)
@@ -650,6 +674,7 @@ if __name__ == "__main__":
     logger.info(f"  History Length: {args.history_len}")
     logger.info(f"  Prediction Offset: {args.prediction_offset}")
     logger.info(f"  History Skip Frame: {args.history_skip_frame}")
+    logger.info(f"  Train Image Encoder: {args.train_image_encoder}")
     logger.info(f"  Use Splitted Dataset: {args.use_splitted}")
     logger.info(f"  Use Composite Dataset: {args.use_composite}")
     if args.use_composite:
@@ -685,6 +710,11 @@ if __name__ == "__main__":
     logger.info(f"  Val Samples: {val_size if val_size is not None else 'N/A'}")
     logger.info(f"  Test Samples: {test_size if test_size is not None else 'N/A'}")
 
+    # Initialize training state variables
+    best_val_loss = float('inf')
+    best_ckpt_path = None
+    best_epoch = -1
+
     if not os.path.isdir(ckpt_dir):
         os.makedirs(ckpt_dir)
         latest_idx = 0
@@ -693,7 +723,24 @@ if __name__ == "__main__":
         latest_ckpt, latest_idx = latest_checkpoint(args.ckpt_dir)
         if latest_ckpt:
             logger.info(f"Loading checkpoint: {latest_ckpt}")
-            model.load_state_dict(torch.load(latest_ckpt, map_location=device))
+            checkpoint = torch.load(latest_ckpt, map_location=device, weights_only=False)
+            
+            # Handle both old format (state_dict only) and new format (dict with keys)
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                # New format with full training state
+                model.load_state_dict(checkpoint['model_state_dict'])
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                if 'best_val_loss' in checkpoint:
+                    best_val_loss = checkpoint['best_val_loss']
+                    logger.info(f"Restored best_val_loss: {best_val_loss:.5f}")
+                if 'best_epoch' in checkpoint:
+                    best_epoch = checkpoint.get('best_epoch', -1)
+                logger.info("Loaded full training state (model + optimizer + scheduler)")
+            else:
+                # Old format: only state_dict
+                model.load_state_dict(checkpoint)
+                logger.info("Loaded model weights only (old format)")
         else:
             logger.info("No checkpoint found. Starting from scratch.")
             latest_idx = 0
@@ -706,10 +753,7 @@ if __name__ == "__main__":
         test(model, test_dataloader, device, latest_idx)
         exit()
 
-    # Training loop with validation monitoring and best model saving
-    best_val_loss = float('inf')
-    best_ckpt_path = None
-    best_epoch = -1
+    # Start training from loaded or initial state
     
     logger.info(f"Starting training from epoch {latest_idx} to {args.num_epochs}")
     
@@ -778,14 +822,40 @@ if __name__ == "__main__":
             best_val_loss = val_loss
             best_epoch = epoch
             best_ckpt_path = os.path.join(ckpt_dir, f"best_model.ckpt")
-            torch.save(model.state_dict(), best_ckpt_path)
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'epoch': epoch,
+                'best_val_loss': best_val_loss,
+                'best_epoch': best_epoch,
+            }, best_ckpt_path)
             logger.info(f"✓ New best model! Epoch {epoch}: Val loss = {best_val_loss:.5f} -> {best_ckpt_path}")
+
+        # Save latest checkpoint every epoch (rolling backup)
+        # This allows resuming from any epoch, not just multiples of 100
+        latest_ckpt_path = os.path.join(ckpt_dir, "latest_checkpoint.ckpt")
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'epoch': epoch,
+            'best_val_loss': best_val_loss,
+            'best_epoch': best_epoch,
+        }, latest_ckpt_path)
 
         # Save a checkpoint every 100 epochs
         save_ckpt_every = 100
         if epoch % save_ckpt_every == 0 and epoch > 0:
             ckpt_path = os.path.join(ckpt_dir, f"epoch_{epoch}.ckpt")
-            torch.save(model.state_dict(), ckpt_path)
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'epoch': epoch,
+                'best_val_loss': best_val_loss,
+                'best_epoch': best_epoch,
+            }, ckpt_path)
             if logger:
                 logger.info(f"Saved checkpoint to {ckpt_path}")
 
@@ -802,7 +872,14 @@ if __name__ == "__main__":
 
     # Save final model
     final_ckpt_path = os.path.join(ckpt_dir, "final_model.ckpt")
-    torch.save(model.state_dict(), final_ckpt_path)
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'epoch': epoch,
+        'best_val_loss': best_val_loss,
+        'best_epoch': best_epoch,
+    }, final_ckpt_path)
     logger.info(f"Saved final model to {final_ckpt_path}")
     
     # Summary

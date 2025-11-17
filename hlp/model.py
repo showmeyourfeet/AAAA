@@ -31,6 +31,7 @@ class HighLevelModel(nn.Module):
         candidate_texts=None,
         command_to_index=None,
         num_cameras=4,
+        train_image_encoder=False,
     ):
         super().__init__()
 
@@ -43,8 +44,11 @@ class HighLevelModel(nn.Module):
             global_pool="avg",
         )
         self.visual_out_dim = self.image_encoder.num_features
-        for param in self.image_encoder.parameters():
-            param.requires_grad = False  # Freeze image encoder parameters
+        
+        # Conditionally freeze/unfreeze image encoder parameters
+        if not train_image_encoder:
+            for param in self.image_encoder.parameters():
+                param.requires_grad = False  # Freeze image encoder parameters
 
         # Transformer for processing sequences of image embeddings
         self.transformer = nn.TransformerEncoder(

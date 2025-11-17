@@ -348,8 +348,19 @@ def build_act_model(args) -> DETRVAE:
         vq_dim=vq_dim,
     )
 
+    # Handle image encoder training control
+    train_image_encoder = getattr(args, "train_image_encoder", False)
+    if not train_image_encoder:
+        # Freeze all backbone parameters
+        for backbone in model.backbones:
+            for param in backbone.parameters():
+                param.requires_grad = False
+        print("Image encoder backbones frozen (default)")
+    else:
+        print("Image encoder backbones unfrozen for training")
+
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print("number of parameters: %.2fM" % (n_parameters / 1e6,))
+    print("number of trainable parameters: %.2fM" % (n_parameters / 1e6,))
 
     return model
 
@@ -406,13 +417,22 @@ def build_act_model_and_optimizer(args_override: dict):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    param_dicts = [
-        {"params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad]},
-        {
-            "params": [p for n, p in model.named_parameters() if "backbone" in n and p.requires_grad],
-            "lr": args.lr_backbone,
-        },
-    ]
+    # Build optimizer with separate learning rates for backbone and other parameters
+    train_image_encoder = getattr(args, "train_image_encoder", False)
+    non_backbone_params = [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad]
+    backbone_params = [p for n, p in model.named_parameters() if "backbone" in n and p.requires_grad]
+    
+    if train_image_encoder and len(backbone_params) > 0:
+        # Train backbone with separate learning rate
+        param_dicts = [
+            {"params": non_backbone_params},
+            {"params": backbone_params, "lr": args.lr_backbone},
+        ]
+        print(f"Optimizer: backbone lr={args.lr_backbone}, other lr={args.lr}")
+    else:
+        # Backbone frozen or no backbone params
+        param_dicts = [{"params": non_backbone_params}]
+        print(f"Optimizer: only non-backbone parameters, lr={args.lr}")
 
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
     return model, optimizer
