@@ -21,7 +21,7 @@ from PIL import Image, ImageDraw, ImageFont
 from sklearn.manifold import TSNE
 from collections import OrderedDict
 
-from hlp.dataset import load_merged_data, load_splitted_data, load_composite_data
+from hlp.dataset import load_merged_data, load_splitted_data
 from llp.dataset import load_paired_stage_sequences, load_sequential_stage_sequences
 from hlp.model import HighLevelModel
 # removed aloha memory_monitor dependency
@@ -51,7 +51,6 @@ def train(model, dataloader, optimizer, criterion, device, logger=None, log_wand
             ]
             for cmd in commands
         ]
-
         commands_idx = torch.tensor(commands_idx, device=device)
 
         loss = criterion(logits, commands_idx)
@@ -306,12 +305,11 @@ def load_candidate_texts_and_embeddings(dataset_dirs, device=torch.device("cuda"
                     texts_entries = texts_data.get('stage_texts', texts_data)
                     if isinstance(texts_entries, dict):
                         # Try to get text by stage_idx (as int or str)
-                        # stage_idx is already 1-based from the file key, so use it directly
-                        text = texts_entries.get(stage_idx_str, texts_entries.get(str(stage_idx), f"stage_{stage_idx}"))
+                        text = texts_entries.get(stage_idx_str, texts_entries.get(str(stage_idx), f"stage_{stage_idx + 1}"))
                     else:
-                        text = f"stage_{stage_idx}"
+                        text = f"stage_{stage_idx + 1}"
                 else:
-                    text = f"stage_{stage_idx}"
+                    text = f"stage_{stage_idx + 1}"
                 candidate_texts.append(text)
         
         if candidate_embeddings:
@@ -399,19 +397,10 @@ if __name__ == "__main__":
     parser.add_argument('--image_size', action='store', type=int, help='Image size for augmentation', default=224)
     parser.add_argument('--dagger_ratio', action='store', type=float, help='dagger_ratio', default=None)
     parser.add_argument('--use_splitted', action='store_true', help='Use splitted dataset format (stage*/run_*)')
-    parser.add_argument('--use_composite', action='store_true', help='Use composite dataset format (randomly select one run per stage and concatenate)')
-    parser.add_argument('--splitted_root', action='store', type=str, help='Root directory for splitted dataset (training data)', default=None)
+    parser.add_argument('--splitted_root', action='store', type=str, help='Root directory for splitted dataset', default=None)
     parser.add_argument('--stage_embeddings_file', action='store', type=str, help='JSON file with stage embeddings', default=None)
     parser.add_argument('--stage_texts_file', action='store', type=str, help='JSON file with stage texts', default=None)
-    parser.add_argument('--val_splitted_root', action='store', type=str, help='Root directory for validation (splitted format). If unset, will split from training data.', default=None)
-    parser.add_argument('--sampling_strategy', action='store', type=str, choices=['balanced', 'random', 'sequential'], default='balanced', 
-                        help='Sampling strategy for composite dataset: balanced (default, ensures equal run usage), random (fully random), sequential (for validation)')
-    parser.add_argument('--max_combinations', action='store', type=int, default=None,
-                        help='Maximum number of run combinations to generate (only for composite dataset). If not set, use --n_repeats instead.')
-    parser.add_argument('--n_repeats', action='store', type=int, default=None,
-                        help='Number of times each run should be used. Automatically calculates max_combinations = n_repeats × min_runs_per_stage. '
-                             'Use this for intuitive control (e.g., --n_repeats 10 means each run used 10 times). '
-                             'Ignored if --max_combinations is set.')
+    parser.add_argument('--val_splitted_root', action='store', type=str, help='Root directory for validation (splitted format). If unset, reuse --splitted_root sequentially.', default=None)
     # Paired adjacent-stage training (concatenate two recordings)
     parser.add_argument('--use_paired_sequences', action='store', type=bool, default=False,
                         help='Use paired adjacent-stage sequences for training (splitted format only)')
@@ -436,38 +425,15 @@ if __name__ == "__main__":
     dagger_ratio = args.dagger_ratio
 
     # Data loading
-    if args.use_splitted or args.use_composite:
-        # Use splitted or composite dataset format
-        assert args.splitted_root is not None, "--splitted_root must be provided when --use_splitted or --use_composite is set"
-        assert args.stage_embeddings_file is not None, "--stage_embeddings_file must be provided when --use_splitted or --use_composite is set"
+    if args.use_splitted:
+        # Use splitted dataset format
+        assert args.splitted_root is not None, "--splitted_root must be provided when --use_splitted is set"
+        assert args.stage_embeddings_file is not None, "--stage_embeddings_file must be provided when --use_splitted is set"
         
         # Get camera names from task config or use default
         camera_names = args.camera_names
         
-        if args.use_composite:
-            # Use composite dataset format (select one run per stage and concatenate)
-            train_dataloader, val_dataloader, test_dataloader = load_composite_data(
-                root_dir=args.splitted_root,
-                camera_names=camera_names,
-                batch_size_train=args.batch_size,
-                batch_size_val=args.batch_size,
-                history_len=args.history_len,
-                prediction_offset=args.prediction_offset,
-                history_skip_frame=args.history_skip_frame,
-                random_crop=args.random_crop,
-                stage_embeddings_file=args.stage_embeddings_file,
-                stage_texts_file=args.stage_texts_file,
-                dagger_ratio=dagger_ratio,
-                train_subdir=None,  # root_dir is training directory directly
-                val_subdir=None,    # use val_root instead
-                val_root=args.val_splitted_root,  # Separate validation directory
-                use_augmentation=args.use_augmentation,
-                image_size=args.image_size,
-                sampling_strategy=args.sampling_strategy,
-                max_combinations=args.max_combinations,
-                n_repeats=args.n_repeats,
-            )
-        elif args.use_paired_sequences:
+        if args.use_paired_sequences:
             # Use paired adjacent-stage sequences for training; keep validation/test as None for now
             train_dataloader = load_paired_stage_sequences(
                 root_dir=args.splitted_root,
@@ -515,9 +481,9 @@ if __name__ == "__main__":
                 image_size=args.image_size,
             )
         
-        # Build model with splitted/composite format
+        # Build model with splitted format
         model = build_HighLevelModel(
-            dataset_dirs=[],  # Empty for splitted/composite format
+            dataset_dirs=[],  # Empty for splitted format
             history_len=args.history_len,
             device=device,
             stage_embeddings_file=args.stage_embeddings_file,
@@ -598,22 +564,11 @@ if __name__ == "__main__":
     logger.info(f"  Prediction Offset: {args.prediction_offset}")
     logger.info(f"  History Skip Frame: {args.history_skip_frame}")
     logger.info(f"  Use Splitted Dataset: {args.use_splitted}")
-    logger.info(f"  Use Composite Dataset: {args.use_composite}")
-    if args.use_composite:
-        logger.info(f"  Sampling Strategy: {args.sampling_strategy}")
-        if args.max_combinations is not None:
-            logger.info(f"  Max Combinations: {args.max_combinations}")
-        elif args.n_repeats is not None:
-            logger.info(f"  N Repeats: {args.n_repeats} (max_combinations will be auto-calculated)")
-        else:
-            logger.info(f"  Max Combinations: 50000 (default)")
     logger.info(f"  Use Data Augmentation: {args.use_augmentation}")
     if args.use_augmentation:
         logger.info(f"  Image Size: {args.image_size}")
-    if args.use_splitted or args.use_composite:
-        logger.info(f"  Training Root: {args.splitted_root}")
-        if args.val_splitted_root:
-            logger.info(f"  Validation Root: {args.val_splitted_root}")
+    if args.use_splitted:
+        logger.info(f"  Splitted Root: {args.splitted_root}")
         logger.info(f"  Stage Embeddings File: {args.stage_embeddings_file}")
     logger.info("=" * 80)
     # Also report dataset sizes
