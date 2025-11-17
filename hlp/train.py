@@ -587,7 +587,7 @@ if __name__ == "__main__":
         model = build_HighLevelModel(dataset_dirs, args.history_len, device)
     
     # Optimizer
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-2)
     
     # Learning rate scheduler with warmup and cosine annealing
     total_steps = args.num_epochs
