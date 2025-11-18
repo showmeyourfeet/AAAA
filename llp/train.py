@@ -302,13 +302,13 @@ def train_bc(
                 },
                 ckpt_path_epoch,
             )
-            prune_epoch = epoch - save_ckpt_every
-            if prune_epoch % 1000 != 0:
-                prune_path = os.path.join(
-                    ckpt_dir, f"policy_epoch_{prune_epoch}_seed_{seed}.ckpt"
-                )
-                if os.path.exists(prune_path):
-                    os.remove(prune_path)
+            # prune_epoch = epoch - save_ckpt_every
+            # if prune_epoch % 1000 != 0:
+            #     prune_path = os.path.join(
+            #         ckpt_dir, f"policy_epoch_{prune_epoch}_seed_{seed}.ckpt"
+            #     )
+            #     if os.path.exists(prune_path):
+            #         os.remove(prune_path)
 
     ckpt_path_final = os.path.join(ckpt_dir, "policy_last.ckpt")
     torch.save(

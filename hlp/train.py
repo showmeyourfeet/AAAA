@@ -861,14 +861,14 @@ if __name__ == "__main__":
 
             # Pruning: this removes the checkpoint save_ckpt_every epochs behind the current one
             # except for the ones at multiples of prune_freq epochs
-            prune_freq = 300
-            prune_epoch = epoch - save_ckpt_every
-            if prune_epoch % prune_freq != 0:
-                prune_path = os.path.join(ckpt_dir, f"epoch_{prune_epoch}.ckpt")
-                if os.path.exists(prune_path):
-                    os.remove(prune_path)
-                    if logger:
-                        logger.info(f"Pruned old checkpoint: {prune_path}")
+            # prune_freq = 300
+            # prune_epoch = epoch - save_ckpt_every
+            # if prune_epoch % prune_freq != 0:
+            #     prune_path = os.path.join(ckpt_dir, f"epoch_{prune_epoch}.ckpt")
+            #     if os.path.exists(prune_path):
+            #         os.remove(prune_path)
+            #         if logger:
+            #             logger.info(f"Pruned old checkpoint: {prune_path}")
 
     # Save final model
     final_ckpt_path = os.path.join(ckpt_dir, "final_model.ckpt")

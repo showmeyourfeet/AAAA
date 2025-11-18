@@ -285,7 +285,7 @@ class DETRVAE(nn.Module):
                 proprio_input,
                 self.additional_pos_embed.weight,
                 command_embedding=command_embedding_to_append,
-            )[0]
+            )[-1] # take the last layer output
         else:
             qpos = self.input_proj_robot_state(qpos)
             env_state = self.input_proj_env_state(env_state)
@@ -295,7 +295,7 @@ class DETRVAE(nn.Module):
                 None,
                 self.query_embed.weight,
                 self.pos.weight,
-            )[0]
+            )[-1] # take the last layer output
         a_hat = self.action_head(hs)
         is_pad_hat = self.is_pad_head(hs)
         return a_hat, is_pad_hat, [mu, logvar], probs, binaries
