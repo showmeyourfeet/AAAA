@@ -194,13 +194,39 @@ def train_bc(
         start_epoch = 0
 
     policy.cuda()
+    best_model_metric = config.get("best_model_metric", "total_loss")  # "total_loss" or "l1_loss"
     best_val = float("inf")
     best_ckpt_path = None
     
     # Restore best_val from checkpoint if available
-    if load_ckpt == "y" and checkpoint is not None and "best_val" in checkpoint:
-        best_val = checkpoint["best_val"]
-        print(f"Restored best_val: {best_val:.5f}")
+    # Try to restore the value that matches the current metric
+    if load_ckpt == "y" and checkpoint is not None:
+        if best_model_metric == "l1_loss":
+            # If using l1_loss metric, prefer best_val_l1 if available
+            # (checkpoint saved with total_loss metric may have best_val_l1 as reference)
+            if "best_val_l1" in checkpoint:
+                best_val = checkpoint["best_val_l1"]
+                print(f"Restored best_val (L1): {best_val:.5f}")
+            elif "best_val" in checkpoint:
+                # If best_val_l1 not available, use best_val (which might be l1 if saved with l1_loss metric)
+                best_val = checkpoint["best_val"]
+                if "best_val_total_loss" in checkpoint:
+                    print(f"Restored best_val (L1): {best_val:.5f} (Total: {checkpoint['best_val_total_loss']:.5f})")
+                else:
+                    print(f"Restored best_val (L1): {best_val:.5f}")
+        else:
+            # Using total_loss metric, use best_val directly
+            if "best_val" in checkpoint:
+                best_val = checkpoint["best_val"]
+                if "best_val_l1" in checkpoint:
+                    print(f"Restored best_val (Total): {best_val:.5f} (L1: {checkpoint['best_val_l1']:.5f})")
+                else:
+                    print(f"Restored best_val (Total): {best_val:.5f}")
+    
+    if logger:
+        logger.info(f"Best model selection metric: {best_model_metric}")
+    else:
+        print(f"Best model selection metric: {best_model_metric}")
     
     train_history: List[Dict[str, torch.Tensor]] = []
 
@@ -236,9 +262,14 @@ def train_bc(
             tqdm.write(msg)
         epoch_summary["lr"] = np.array(scheduler.get_last_lr()[0])
         if (epoch + 1) % log_every == 0:
-            summary_string = " ".join(
-                [f"{k}: {v.item():.5f}" for k, v in epoch_summary.items()]
-            )
+            summary_parts = []
+            for k, v in epoch_summary.items():
+                value = float(v.item()) if hasattr(v, "item") else float(v)
+                if k == "lr":
+                    summary_parts.append(f"{k}: {value:.5e}")
+                else:
+                    summary_parts.append(f"{k}: {value:.5f}")
+            summary_string = " ".join(summary_parts)
             if logger:
                 logger.info(summary_string)
             else:
@@ -247,32 +278,96 @@ def train_bc(
         if val_dataloader is not None:
             policy.eval()
             val_losses = []
+            val_l1_losses = []
             with torch.inference_mode():
                 val_bar = tqdm(val_dataloader, desc=f"Val {epoch}", leave=False)
                 for data in val_bar:
                     forward_dict = forward_pass(data, policy)
                     val_losses.append(forward_dict["loss"].item())
+                    if "l1" in forward_dict:
+                        val_l1_losses.append(forward_dict["l1"].item())
                     val_bar.set_postfix({"loss": f"{val_losses[-1]:.4f}"})
             val_loss = float(np.mean(val_losses)) if val_losses else float("inf")
             if logger:
                 logger.info(f"Val loss: {val_loss:.5f}")
             else:
                 tqdm.write(f"Val loss: {val_loss:.5f}")
-            if val_loss < best_val:
-                best_val = val_loss
-                best_ckpt_path = os.path.join(ckpt_dir, f"policy_best_seed_{seed}.ckpt")
-                torch.save(
-                    {
+            # Log val l1 loss if available
+            val_l1 = None
+            if len(val_l1_losses) > 0:
+                val_l1 = float(np.mean(val_l1_losses))
+                if logger:
+                    logger.info(f"Val l1: {val_l1:.5f}")
+                else:
+                    tqdm.write(f"Val l1: {val_l1:.5f}")
+            
+            # Select best model based on chosen metric
+            if best_model_metric == "l1_loss":
+                # Use l1 loss for best model selection
+                if val_l1 is None:
+                    if logger:
+                        logger.warning(f"best_model_metric is 'l1_loss' but no val l1 loss available. Falling back to total_loss for this epoch.")
+                    else:
+                        tqdm.write(f"Warning: best_model_metric is 'l1_loss' but no val l1 loss available. Falling back to total_loss for this epoch.")
+                    # Fall back to total loss for this epoch
+                    if val_loss < best_val:
+                        best_val = val_loss
+                        best_ckpt_path = os.path.join(ckpt_dir, f"policy_best_seed_{seed}.ckpt")
+                        save_dict = {
+                            "model_state_dict": policy.serialize(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "scheduler_state_dict": scheduler.state_dict(),
+                            "epoch": epoch,
+                            "best_val": best_val,
+                        }
+                        torch.save(save_dict, best_ckpt_path)
+                        if logger:
+                            logger.info(f"Saved best checkpoint (Total: {best_val:.5f}, no L1 available) to {best_ckpt_path}")
+                        else:
+                            tqdm.write(f"Saved best checkpoint (Total: {best_val:.5f}, no L1 available) to {best_ckpt_path}")
+                elif val_l1 < best_val:
+                    best_val = val_l1
+                    best_ckpt_path = os.path.join(ckpt_dir, f"policy_best_seed_{seed}.ckpt")
+                    torch.save(
+                        {
+                            "model_state_dict": policy.serialize(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "scheduler_state_dict": scheduler.state_dict(),
+                            "epoch": epoch,
+                            "best_val": best_val,
+                            "best_val_total_loss": val_loss,  # Also save total loss for reference
+                        },
+                        best_ckpt_path,
+                    )
+                    if logger:
+                        logger.info(f"Saved best checkpoint (L1: {best_val:.5f}, Total: {val_loss:.5f}) to {best_ckpt_path}")
+                    else:
+                        tqdm.write(f"Saved best checkpoint (L1: {best_val:.5f}, Total: {val_loss:.5f}) to {best_ckpt_path}")
+            else:
+                # Use total loss for best model selection (default)
+                if val_loss < best_val:
+                    best_val = val_loss
+                    best_ckpt_path = os.path.join(ckpt_dir, f"policy_best_seed_{seed}.ckpt")
+                    save_dict = {
                         "model_state_dict": policy.serialize(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "scheduler_state_dict": scheduler.state_dict(),
                         "epoch": epoch,
                         "best_val": best_val,
-                    },
-                    best_ckpt_path,
-                )
-                if logger:
-                    logger.info(f"Saved best checkpoint to {best_ckpt_path}")
+                    }
+                    if val_l1 is not None:
+                        save_dict["best_val_l1"] = val_l1  # Also save l1 loss for reference
+                    torch.save(save_dict, best_ckpt_path)
+                    if logger:
+                        if val_l1 is not None:
+                            logger.info(f"Saved best checkpoint (Total: {best_val:.5f}, L1: {val_l1:.5f}) to {best_ckpt_path}")
+                        else:
+                            logger.info(f"Saved best checkpoint (Total: {best_val:.5f}) to {best_ckpt_path}")
+                    else:
+                        if val_l1 is not None:
+                            tqdm.write(f"Saved best checkpoint (Total: {best_val:.5f}, L1: {val_l1:.5f}) to {best_ckpt_path}")
+                        else:
+                            tqdm.write(f"Saved best checkpoint (Total: {best_val:.5f}) to {best_ckpt_path}")
 
         # Save latest checkpoint every epoch (rolling backup)
         # This allows resuming from any epoch, not just multiples of 100
@@ -359,7 +454,7 @@ def main(args: Dict):
         if not splitted_root:
             raise ValueError("--splitted_root must be provided when --use_splitted is set")
         camera_names = args.get("camera_names", ["left_frame", "right_frame"])
-        max_episode_len = args.get("chunk_size", 10)
+        max_episode_len = args.get("chunk_size", 30)
         train_dataloader, stats, _ = load_splitted_data(
             root_dir=splitted_root,
             camera_names=camera_names,
@@ -460,6 +555,7 @@ def main(args: Dict):
         "seed": args["seed"],
         "policy_config": policy_config,
         "log_every": args.get("log_every", 1),
+        "best_model_metric": args.get("best_model_metric", "total_loss"),
     }
 
     train_bc(train_dataloader, config, val_dataloader=val_dataloader, logger=logger)
@@ -502,6 +598,15 @@ if __name__ == "__main__":
     # Image encoder training control
     parser.add_argument("--train_image_encoder", action="store_true", help="Enable training of the image encoder (default: frozen)")
     parser.add_argument("--lr_backbone", type=float, default=1e-5, help="Learning rate for image encoder backbone (only used if --train_image_encoder is set)")
+    
+    # Best model selection metric
+    parser.add_argument(
+        "--best_model_metric",
+        type=str,
+        default="total_loss",
+        choices=["total_loss", "l1_loss"],
+        help="Metric for selecting best model: 'total_loss' (default, l1 + kl_weight * kl) or 'l1_loss' (action prediction accuracy only)"
+    )
 
     args = parser.parse_args()
     main(vars(args))

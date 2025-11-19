@@ -47,6 +47,7 @@ class DETRVAE(nn.Module):
         camera_names,
         use_language=False,
         use_film=False,
+        shared_backbone=False,
         num_command=2,
         vq=False,
         vq_class=512,
@@ -65,6 +66,7 @@ class DETRVAE(nn.Module):
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         self.use_language = use_language
         self.use_film = use_film
+        self.shared_backbone = shared_backbone
         if use_language:
             self.lang_embed_proj = nn.Linear(768, hidden_dim)
         if backbones is not None:
@@ -261,10 +263,11 @@ class DETRVAE(nn.Module):
             all_cam_features = []
             all_cam_pos = []
             for cam_id, _ in enumerate(self.camera_names):
+                backbone_idx = 0 if self.shared_backbone else cam_id
                 if self.use_film:
-                    features, pos = self.backbones[cam_id](image[:, cam_id], command_embedding)
+                    features, pos = self.backbones[backbone_idx](image[:, cam_id], command_embedding)
                 else:
-                    features, pos = self.backbones[cam_id](image[:, cam_id])
+                    features, pos = self.backbones[backbone_idx](image[:, cam_id])
                 features = features[0]
                 pos = pos[0]
                 all_cam_features.append(self.input_proj(features))
@@ -319,9 +322,14 @@ def build_act_model(args) -> DETRVAE:
     state_dim = getattr(args, "state_dim", 20)
 
     backbones = []
-    for _ in args.camera_names:
-        backbone = build_backbone(args)
-        backbones.append(backbone)
+    share_backbone = not args.use_language and "film" not in args.backbone
+
+    if share_backbone:
+        backbones.append(build_backbone(args))
+    else:
+        for _ in args.camera_names:
+            backbone = build_backbone(args)
+            backbones.append(backbone)
 
     transformer = build_transformer(args)
 
@@ -346,6 +354,7 @@ def build_act_model(args) -> DETRVAE:
         vq=vq,
         vq_class=vq_class,
         vq_dim=vq_dim,
+        shared_backbone=share_backbone,
     )
 
     # Handle image encoder training control
