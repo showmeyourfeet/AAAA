@@ -14,7 +14,6 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 src_dir = os.path.dirname(current_dir)  # Go up one level from HighLevelModel/ to src/
 if src_dir not in sys.path:
     sys.path.insert(0, src_dir)
-# removed external aloha path dependency
 
 from tqdm import tqdm
 from PIL import Image, ImageDraw, ImageFont
@@ -22,10 +21,14 @@ from sklearn.manifold import TSNE
 from collections import OrderedDict
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 
-from hlp.dataset import load_merged_data, load_splitted_data, load_composite_data
-from llp.dataset import load_paired_stage_sequences, load_sequential_stage_sequences
+from hlp.dataset import (
+    load_merged_data,
+    load_splitted_data,
+    load_composite_data,
+    load_paired_stage_sequences,
+    load_sequential_stage_sequences,
+)
 from hlp.model import HighLevelModel
-# removed aloha memory_monitor dependency
 
 
 def calculate_hl_loss(logits, true_labels):
@@ -345,22 +348,29 @@ def load_candidate_texts_and_embeddings(dataset_dirs, device=torch.device("cuda"
                             text = f"stage_{stage_idx}"
                     candidate_texts.append(text)
         elif isinstance(entries, dict):
-            for stage_idx_str, embedding in entries.items():
+            # Filter and sort entries by stage index to ensure consistent order
+            # This is critical for the L1 distance loss function which assumes index corresponds to stage order
+            valid_entries = []
+            for k, v in entries.items():
                 try:
-                    stage_idx = int(stage_idx_str)
+                    idx = int(k)
+                    valid_entries.append((idx, str(k), v))
                 except (ValueError, TypeError):
-                    # Skip non-numeric keys (like 'model', 'encoder', etc.)
                     continue
-                
+            
+            # Sort by stage index
+            valid_entries.sort(key=lambda x: x[0])
+
+            for stage_idx, stage_idx_str, embedding in valid_entries:
                 embedding_tensor = torch.tensor(embedding).float().to(device).squeeze()
                 candidate_embeddings.append(embedding_tensor)
+                
                 if stage_texts_file and os.path.exists(stage_texts_file):
                     with open(stage_texts_file, 'r', encoding='utf-8') as f2:
                         texts_data = json.load(f2)
                     texts_entries = texts_data.get('stage_texts', texts_data)
                     if isinstance(texts_entries, dict):
                         # Try to get text by stage_idx (as int or str)
-                        # stage_idx is already 1-based from the file key, so use it directly
                         text = texts_entries.get(stage_idx_str, texts_entries.get(str(stage_idx), f"stage_{stage_idx}"))
                     else:
                         text = f"stage_{stage_idx}"

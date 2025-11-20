@@ -6,9 +6,12 @@ import torchvision.transforms as transforms
 import random
 
 # Image preprocessing for ImageNet-pretrained encoders (e.g., Swin Tiny)
+# NOTE: Currently dataset returns images of various sizes (e.g., 640x480 for cam_high),
+# so we need to resize to 224x224 here. If you want to optimize, consider resizing
+# in the dataset to 224x224 and removing the Resize here (only keep Normalize).
 image_transform = transforms.Compose(
     [
-        transforms.Resize((224, 224)),
+        transforms.Resize((224, 224)),  # Required: dataset images are not 224x224
         transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ]
 )

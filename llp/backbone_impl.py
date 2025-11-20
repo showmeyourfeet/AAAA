@@ -160,12 +160,16 @@ class Backbone(BackboneBase):
             name, backbone, train_backbone, num_channels, return_interm_layers
         )
         # Get image preprocessing function.
-        # self.preprocess = (
-        #     weights.transforms()
-        # )  # Use this to preprocess images the same way as the pretrained model (e.g., ResNet-18).
+        self.preprocess = (
+            weights.transforms()
+        )  # Use this to preprocess images the same way as the pretrained model (e.g., ResNet-18).
+        print("---------------- inside preprocess-----------")
+        print(self.preprocess)
+        import sys
+        sys.exit()
 
     def forward(self, tensor):
-        # tensor = self.preprocess(tensor)
+        tensor = self.preprocess(tensor)
         xs = self.body(tensor)
         return xs
 
@@ -226,9 +230,9 @@ class FilMedBackbone(torch.nn.Module):
             self.backbone.avgpool = nn.Sequential()  # remove average pool layer
             self.backbone.classifier = nn.Sequential()  # remove classification layer
         # Get image preprocessing function.
-        # self.preprocess = (
-        #     weights.transforms()
-        # )  # Use this to preprocess images the same way as the pretrained model (e.g., ResNet-18).
+        self.preprocess = (
+            weights.transforms()
+        )  # Use this to preprocess images the same way as the pretrained model (e.g., ResNet-18).
         # self.preprocess = transforms.Compose([ # Use this if you don't want to resize images to 224x224.
         #     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         # ])
@@ -236,7 +240,7 @@ class FilMedBackbone(torch.nn.Module):
     def forward(self, img_obs, language_embed):
         # img_obs shape: (batch_size, 3, H, W)
         img_obs = img_obs.float()  # cast to float type
-        # img_obs = self.preprocess(img_obs)
+        img_obs = self.preprocess(img_obs)
         out = self.backbone(
             img_obs, language_embed
         )  # shape (B, C_final * H_final * W_final) or (B, C_final, H_final, W_final)

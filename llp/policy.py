@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torchvision.transforms as transforms
 from torch.nn import functional as F
 
 from .model import build_act_model_and_optimizer
@@ -32,8 +31,6 @@ class ACTPolicy(nn.Module):
         vq_sample: torch.Tensor | None = None,
     ):
         env_state = None
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        image = normalize(image)
         if actions is not None:  # training time
             actions = actions[:, : self.num_queries]
             is_pad = is_pad[:, : self.num_queries]
