@@ -800,481 +800,481 @@ class DAggerSampler(Sampler[list[int]]):
         return self.num_batches
 
 
-# =========================
-# Paired adjacent-stage dataset (splitted)
-# =========================
+# # =========================
+# # Paired adjacent-stage dataset (splitted)
+# # =========================
 
-def _list_stage_runs(root_dir: str) -> dict[int, list[str]]:
-    """Scan splitted root to build {stage_index_1based: [run_paths...]}."""
-    stage_to_runs: dict[int, list[str]] = {}
-    for entry in sorted(os.listdir(root_dir)):
-        stage_path = os.path.join(root_dir, entry)
-        if not (entry.startswith("stage") and os.path.isdir(stage_path)):
-            continue
-        try:
-            stage_idx = int(entry[5:])  # 'stage12' -> 12
-        except ValueError:
-            continue
-        runs: list[str] = []
-        for run_dir in sorted(os.listdir(stage_path)):
-            run_path = os.path.join(stage_path, run_dir)
-            if run_dir.startswith("run") and os.path.isdir(run_path):
-                runs.append(run_path)
-        if runs:
-            stage_to_runs[stage_idx] = runs
-    if not stage_to_runs:
-        raise RuntimeError(f"No stage*/run_* found under {root_dir}")
-    return stage_to_runs
-
-
-def _count_frames_in_run(run_path: str, camera_names: Sequence[str]) -> int:
-    """Count available frames for a run by inspecting the first camera."""
-    if len(camera_names) == 0:
-        raise ValueError("camera_names must be non-empty")
-    cam_dir = os.path.join(run_path, camera_names[0])
-    files = sorted([f for f in os.listdir(cam_dir) if f.endswith("_full.jpg")])
-    if not files:
-        raise RuntimeError(f"No *_full.jpg under {cam_dir}")
-    return len(files)
+# def _list_stage_runs(root_dir: str) -> dict[int, list[str]]:
+#     """Scan splitted root to build {stage_index_1based: [run_paths...]}."""
+#     stage_to_runs: dict[int, list[str]] = {}
+#     for entry in sorted(os.listdir(root_dir)):
+#         stage_path = os.path.join(root_dir, entry)
+#         if not (entry.startswith("stage") and os.path.isdir(stage_path)):
+#             continue
+#         try:
+#             stage_idx = int(entry[5:])  # 'stage12' -> 12
+#         except ValueError:
+#             continue
+#         runs: list[str] = []
+#         for run_dir in sorted(os.listdir(stage_path)):
+#             run_path = os.path.join(stage_path, run_dir)
+#             if run_dir.startswith("run") and os.path.isdir(run_path):
+#                 runs.append(run_path)
+#         if runs:
+#             stage_to_runs[stage_idx] = runs
+#     if not stage_to_runs:
+#         raise RuntimeError(f"No stage*/run_* found under {root_dir}")
+#     return stage_to_runs
 
 
-def _collect_stage_embeddings(stage_embeddings_file: str | None) -> dict[int, list[float]]:
-    """Load stage embeddings json into {stage_1based: embedding_list}."""
-    if not stage_embeddings_file:
-        return {}
-    if not os.path.exists(stage_embeddings_file):
-        raise FileNotFoundError(f"Stage embeddings not found: {stage_embeddings_file}")
-    with open(stage_embeddings_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    entries = data.get("stage_embeddings", data)
-    out: dict[int, list[float]] = {}
-    if isinstance(entries, list):
-        for e in entries:
-            if "stage" in e and "embedding" in e:
-                try:
-                    out[int(e["stage"])] = e["embedding"]
-                except Exception:
-                    continue
-    elif isinstance(entries, dict):
-        for k, v in entries.items():
-            try:
-                out[int(k)] = v
-            except Exception:
-                continue
-    return out
-
-def _collect_stage_texts(stage_texts_file: str | None) -> dict[int, str]:
-    """Load stage texts from json. Supports either {'stage_texts': {...}} or 'stage_embeddings' entries with 'text'."""
-    if not stage_texts_file:
-        return {}
-    if not os.path.exists(stage_texts_file):
-        return {}
-    with open(stage_texts_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    # Direct dict form
-    texts_obj = data.get("stage_texts", None)
-    stage_texts: dict[int, str] = {}
-    if isinstance(texts_obj, dict):
-        for k, v in texts_obj.items():
-            try:
-                stage_texts[int(k)] = str(v)
-            except Exception:
-                continue
-    # Fallback: extract from stage_embeddings list/dict
-    entries = data.get("stage_embeddings", data)
-    if isinstance(entries, list):
-        for e in entries:
-            if "stage" in e and "text" in e:
-                try:
-                    stage_texts[int(e["stage"])] = str(e["text"])
-                except Exception:
-                    continue
-    elif isinstance(entries, dict):
-        # entries like {"1": {"text": "...", "embedding": [...]}, ...} or {"1": [..]} (no text)
-        for k, v in entries.items():
-            if isinstance(v, dict) and "text" in v:
-                try:
-                    stage_texts[int(k)] = str(v["text"])
-                except Exception:
-                    continue
-    return stage_texts
+# def _count_frames_in_run(run_path: str, camera_names: Sequence[str]) -> int:
+#     """Count available frames for a run by inspecting the first camera."""
+#     if len(camera_names) == 0:
+#         raise ValueError("camera_names must be non-empty")
+#     cam_dir = os.path.join(run_path, camera_names[0])
+#     files = sorted([f for f in os.listdir(cam_dir) if f.endswith("_full.jpg")])
+#     if not files:
+#         raise RuntimeError(f"No *_full.jpg under {cam_dir}")
+#     return len(files)
 
 
-class PairedStageSequenceDataset(torch.utils.data.Dataset):
-    """
-    Construct paired sequences by concatenating runs from adjacent stages (i, i+1).
-    Sampling keeps: random current_frame, build history with skip_frame, and target at offset.
+# def _collect_stage_embeddings(stage_embeddings_file: str | None) -> dict[int, list[float]]:
+#     """Load stage embeddings json into {stage_1based: embedding_list}."""
+#     if not stage_embeddings_file:
+#         return {}
+#     if not os.path.exists(stage_embeddings_file):
+#         raise FileNotFoundError(f"Stage embeddings not found: {stage_embeddings_file}")
+#     with open(stage_embeddings_file, "r", encoding="utf-8") as f:
+#         data = json.load(f)
+#     entries = data.get("stage_embeddings", data)
+#     out: dict[int, list[float]] = {}
+#     if isinstance(entries, list):
+#         for e in entries:
+#             if "stage" in e and "embedding" in e:
+#                 try:
+#                     out[int(e["stage"])] = e["embedding"]
+#                 except Exception:
+#                     continue
+#     elif isinstance(entries, dict):
+#         for k, v in entries.items():
+#             try:
+#                 out[int(k)] = v
+#             except Exception:
+#                 continue
+#     return out
 
-    Each item returns:
-      - image_sequence: (T, K, C, H, W) float tensor in [0,1]
-      - command_embedding: (768,) float tensor (zero if missing)
-      - command_text: str like 'stage_{j}'
-    """
-
-    def __init__(
-        self,
-        pairs: list[tuple[int, str, int, str]],  # [(stage_i, run_i_path, stage_j, run_j_path)]
-        camera_names: Sequence[str],
-        history_len: int,
-        skip_frame: int,
-        offset: int,
-        stage_embeddings: dict[int, list[float]] | None = None,
-        stage_texts: dict[int, str] | None = None,
-        use_augmentation: bool = False,
-        image_size: int = 224,
-    ) -> None:
-        super().__init__()
-        self.pairs = pairs
-        self.camera_names = list(camera_names)
-        self.history_len = history_len
-        self.skip_frame = skip_frame
-        self.offset = offset
-        self.stage_embeddings = stage_embeddings or {}
-        self.stage_texts = stage_texts or {}
-        self.use_augmentation = use_augmentation
-        self.image_size = image_size
-        self.to_tensor = transforms.ToTensor()
-        if self.use_augmentation:
-            self.image_preprocessor = ImagePreprocessor(
-                image_size=image_size, use_augmentation=True
-            )
-
-    def __len__(self) -> int:
-        return len(self.pairs)
-
-    def _list_cam_files(self, run_path: str, cam: str) -> list[str]:
-        cam_dir = os.path.join(run_path, cam)
-        files = sorted([f for f in os.listdir(cam_dir) if f.endswith("_full.jpg")])
-        if not files:
-            raise RuntimeError(f"No *_full.jpg under {cam_dir}")
-        return [os.path.join(cam_dir, f) for f in files]
-
-    def __getitem__(self, index: int):
-        stage_i, run_i, stage_j, run_j = self.pairs[index]
-
-        # Build file lists
-        cam_to_files_i = {cam: self._list_cam_files(run_i, cam) for cam in self.camera_names}
-        cam_to_files_j = {cam: self._list_cam_files(run_j, cam) for cam in self.camera_names}
-        len_i = len(next(iter(cam_to_files_i.values())))
-        len_j = len(next(iter(cam_to_files_j.values())))
-        max_pair_len = len_i + len_j
-
-        # Sample current and target within concatenated pair
-        min_start = self.history_len * self.skip_frame
-        max_start = max_pair_len - self.offset - 1
-        if max_start < min_start:
-            # Not enough timeline to sample; resample another index
-            # Simple fallback: clamp to earliest feasible configuration
-            curr = min_start
-        else:
-            curr = int(np.random.randint(min_start, max_start + 1))
-        target_ts = curr + self.offset
-
-        # Build history indices
-        hist_indices = list(range(curr - self.history_len * self.skip_frame, curr + 1, self.skip_frame))
-
-        # Load images for each camera and timestep
-        image_sequence_per_cam = []
-        for cam in self.camera_names:
-            frames = []
-            files_i = cam_to_files_i[cam]
-            files_j = cam_to_files_j[cam]
-            for ts in hist_indices:
-                if ts < len_i:
-                    path = files_i[min(ts, len_i - 1)]
-                else:
-                    idx = ts - len_i
-                    path = files_j[min(idx, len_j - 1)]
-                img = Image.open(path).convert("RGB")
-                if self.use_augmentation:
-                    img_np = np.array(img)
-                    img_np = self.image_preprocessor.augment_image(img_np, training=True)
-                    img = Image.fromarray(img_np)
-                frames.append(self.to_tensor(img))
-            # Stack per camera: (T, C, H, W)
-            image_sequence_per_cam.append(torch.stack(frames, dim=0))
-
-        # Stack cameras: (T, K, C, H, W)
-        image_sequence = torch.stack(image_sequence_per_cam, dim=1)
-
-        # Determine target stage by target_ts position
-        if target_ts < len_i:
-            stage_target = stage_i
-        else:
-            stage_target = stage_j
-        emb_list = self.stage_embeddings.get(stage_target, None)
-        if emb_list is None:
-            command_embedding = torch.zeros(768, dtype=torch.float32)
-        else:
-            command_embedding = torch.tensor(emb_list, dtype=torch.float32).squeeze()
-        command_text = self.stage_texts.get(stage_target, f"stage_{stage_target}")
-
-        return image_sequence, command_embedding, command_text
+# def _collect_stage_texts(stage_texts_file: str | None) -> dict[int, str]:
+#     """Load stage texts from json. Supports either {'stage_texts': {...}} or 'stage_embeddings' entries with 'text'."""
+#     if not stage_texts_file:
+#         return {}
+#     if not os.path.exists(stage_texts_file):
+#         return {}
+#     with open(stage_texts_file, "r", encoding="utf-8") as f:
+#         data = json.load(f)
+#     # Direct dict form
+#     texts_obj = data.get("stage_texts", None)
+#     stage_texts: dict[int, str] = {}
+#     if isinstance(texts_obj, dict):
+#         for k, v in texts_obj.items():
+#             try:
+#                 stage_texts[int(k)] = str(v)
+#             except Exception:
+#                 continue
+#     # Fallback: extract from stage_embeddings list/dict
+#     entries = data.get("stage_embeddings", data)
+#     if isinstance(entries, list):
+#         for e in entries:
+#             if "stage" in e and "text" in e:
+#                 try:
+#                     stage_texts[int(e["stage"])] = str(e["text"])
+#                 except Exception:
+#                     continue
+#     elif isinstance(entries, dict):
+#         # entries like {"1": {"text": "...", "embedding": [...]}, ...} or {"1": [..]} (no text)
+#         for k, v in entries.items():
+#             if isinstance(v, dict) and "text" in v:
+#                 try:
+#                     stage_texts[int(k)] = str(v["text"])
+#                 except Exception:
+#                     continue
+#     return stage_texts
 
 
-def load_paired_stage_sequences(
-    root_dir: str,
-    camera_names: Sequence[str],
-    batch_size: int,
-    history_len: int,
-    skip_frame: int,
-    offset: int,
-    stage_embeddings_file: str | None,
-    stage_texts_file: str | None = None,
-    max_run: int | None = None,
-    use_augmentation: bool = False,
-    image_size: int = 224,
-    rng_seed: int | None = None,
-):
-    """
-    Build a DataLoader that, per epoch, samples (max_stage-1) * max_run paired sequences:
-      - For each adjacent stage pair (i, i+1):
-          - Enumerate up to max_run runs from stage i, and match each with a unique random run from stage i+1.
-      - Sampling inside each item respects current+offset < max_pair_length.
-    """
-    stage_to_runs = _list_stage_runs(root_dir)
-    max_stage = max(stage_to_runs.keys())
-    stage_embeddings = _collect_stage_embeddings(stage_embeddings_file)
-    stage_texts = _collect_stage_texts(stage_texts_file)
+# class PairedStageSequenceDataset(torch.utils.data.Dataset):
+#     """
+#     Construct paired sequences by concatenating runs from adjacent stages (i, i+1).
+#     Sampling keeps: random current_frame, build history with skip_frame, and target at offset.
 
-    # Optional seed to vary pairing across epochs
-    if rng_seed is not None:
-        np.random.seed(rng_seed)
+#     Each item returns:
+#       - image_sequence: (T, K, C, H, W) float tensor in [0,1]
+#       - command_embedding: (768,) float tensor (zero if missing)
+#       - command_text: str like 'stage_{j}'
+#     """
 
-    pairs: list[tuple[int, str, int, str]] = []
-    for i in range(1, max_stage):
-        runs_i = stage_to_runs.get(i, [])
-        runs_j = stage_to_runs.get(i + 1, [])
-        if not runs_i or not runs_j:
-            print(f"[paired] skip stage pair ({i},{i+1}) due to missing runs: "
-                  f"runs_i={len(runs_i)}, runs_j={len(runs_j)}")
-            continue
-        # Determine per-pair quota
-        quota = len(runs_i)
-        if max_run is not None:
-            quota = min(quota, max_run)
-        # For uniqueness, shuffle stage i+1 runs and map 1-1 as much as possible
-        rng_perm = np.random.permutation(len(runs_j))
-        # If stage i has more than stage i+1, wrap around
-        assigned = 0
-        for idx_i in range(quota):
-            run_i = runs_i[idx_i % len(runs_i)]
-            idx_j = rng_perm[idx_i % len(runs_j)]
-            run_j = runs_j[idx_j]
-            # Ensure the concatenated pair has at least history_len*skip + offset + 1 frames
-            try:
-                len_i = _count_frames_in_run(run_i, camera_names)
-                len_j = _count_frames_in_run(run_j, camera_names)
-            except Exception as e:
-                print(f"[paired] skip pair: stage {i} run {os.path.basename(run_i)} "
-                      f"+ stage {i+1} run {os.path.basename(run_j)} due to error: {e}")
-                continue
-            required = history_len * skip_frame + offset + 1
-            if len_i + len_j < required:
-                print(f"[paired] skip pair (too short): stage {i} run {os.path.basename(run_i)} "
-                      f"(len={len_i}) + stage {i+1} run {os.path.basename(run_j)} (len={len_j}) "
-                      f"< required {required}")
-                continue
-            pairs.append((i, run_i, i + 1, run_j))
-            assigned += 1
-            if assigned >= quota:
-                break
+#     def __init__(
+#         self,
+#         pairs: list[tuple[int, str, int, str]],  # [(stage_i, run_i_path, stage_j, run_j_path)]
+#         camera_names: Sequence[str],
+#         history_len: int,
+#         skip_frame: int,
+#         offset: int,
+#         stage_embeddings: dict[int, list[float]] | None = None,
+#         stage_texts: dict[int, str] | None = None,
+#         use_augmentation: bool = False,
+#         image_size: int = 224,
+#     ) -> None:
+#         super().__init__()
+#         self.pairs = pairs
+#         self.camera_names = list(camera_names)
+#         self.history_len = history_len
+#         self.skip_frame = skip_frame
+#         self.offset = offset
+#         self.stage_embeddings = stage_embeddings or {}
+#         self.stage_texts = stage_texts or {}
+#         self.use_augmentation = use_augmentation
+#         self.image_size = image_size
+#         self.to_tensor = transforms.ToTensor()
+#         if self.use_augmentation:
+#             self.image_preprocessor = ImagePreprocessor(
+#                 image_size=image_size, use_augmentation=True
+#             )
 
-    dataset = PairedStageSequenceDataset(
-        pairs=pairs,
-        camera_names=camera_names,
-        history_len=history_len,
-        skip_frame=skip_frame,
-        offset=offset,
-        stage_embeddings=stage_embeddings,
-        stage_texts=stage_texts,
-        use_augmentation=use_augmentation,
-        image_size=image_size,
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        pin_memory=True,
-        num_workers=8,
-        prefetch_factor=8,
-        persistent_workers=True,
-    )
-    return loader
+#     def __len__(self) -> int:
+#         return len(self.pairs)
 
-class SequentialStageSequenceDataset(torch.utils.data.Dataset):
-    """
-    Concatenate runs across all stages for the same run name in ascending stage order:
-      stage1/run_X -> stage2/run_X -> ... -> stageN/run_X
-    Sampling uses random current_frame, history (skip_frame), and target at offset along the concatenated timeline.
-    """
-    def __init__(
-        self,
-        sequences: list[tuple[list[int], list[str]]],  # [( [stages...], [run_paths aligned...] )]
-        camera_names: Sequence[str],
-        history_len: int,
-        skip_frame: int,
-        offset: int,
-        stage_embeddings: dict[int, list[float]] | None = None,
-        stage_texts: dict[int, str] | None = None,
-        use_augmentation: bool = False,
-        image_size: int = 224,
-    ) -> None:
-        super().__init__()
-        self.sequences = sequences
-        self.camera_names = list(camera_names)
-        self.history_len = history_len
-        self.skip_frame = skip_frame
-        self.offset = offset
-        self.stage_embeddings = stage_embeddings or {}
-        self.stage_texts = stage_texts or {}
-        self.use_augmentation = use_augmentation
-        self.image_size = image_size
-        self.to_tensor = transforms.ToTensor()
-        if self.use_augmentation:
-            self.image_preprocessor = ImagePreprocessor(
-                image_size=image_size, use_augmentation=True
-            )
+#     def _list_cam_files(self, run_path: str, cam: str) -> list[str]:
+#         cam_dir = os.path.join(run_path, cam)
+#         files = sorted([f for f in os.listdir(cam_dir) if f.endswith("_full.jpg")])
+#         if not files:
+#             raise RuntimeError(f"No *_full.jpg under {cam_dir}")
+#         return [os.path.join(cam_dir, f) for f in files]
 
-    def __len__(self) -> int:
-        return len(self.sequences)
+#     def __getitem__(self, index: int):
+#         stage_i, run_i, stage_j, run_j = self.pairs[index]
 
-    def _list_cam_files(self, run_path: str, cam: str) -> list[str]:
-        cam_dir = os.path.join(run_path, cam)
-        files = sorted([f for f in os.listdir(cam_dir) if f.endswith("_full.jpg")])
-        if not files:
-            raise RuntimeError(f"No *_full.jpg under {cam_dir}")
-        return [os.path.join(cam_dir, f) for f in files]
+#         # Build file lists
+#         cam_to_files_i = {cam: self._list_cam_files(run_i, cam) for cam in self.camera_names}
+#         cam_to_files_j = {cam: self._list_cam_files(run_j, cam) for cam in self.camera_names}
+#         len_i = len(next(iter(cam_to_files_i.values())))
+#         len_j = len(next(iter(cam_to_files_j.values())))
+#         max_pair_len = len_i + len_j
 
-    def __getitem__(self, index: int):
-        stages, run_paths = self.sequences[index]
-        # Build camera file arrays for each segment
-        cam_files_per_stage = []
-        lengths = []
-        for run_path in run_paths:
-            cam_map = {cam: self._list_cam_files(run_path, cam) for cam in self.camera_names}
-            cam_files_per_stage.append(cam_map)
-            lengths.append(len(next(iter(cam_map.values()))))
-        cumulative = np.cumsum([0] + lengths)  # boundaries
-        total_len = cumulative[-1]
+#         # Sample current and target within concatenated pair
+#         min_start = self.history_len * self.skip_frame
+#         max_start = max_pair_len - self.offset - 1
+#         if max_start < min_start:
+#             # Not enough timeline to sample; resample another index
+#             # Simple fallback: clamp to earliest feasible configuration
+#             curr = min_start
+#         else:
+#             curr = int(np.random.randint(min_start, max_start + 1))
+#         target_ts = curr + self.offset
 
-        # Sample current within total timeline
-        min_start = self.history_len * self.skip_frame
-        max_start = total_len - self.offset - 1
-        if max_start < min_start:
-            curr = min_start
-        else:
-            curr = int(np.random.randint(min_start, max_start + 1))
-        target_ts = curr + self.offset
-        hist_indices = list(range(curr - self.history_len * self.skip_frame, curr + 1, self.skip_frame))
+#         # Build history indices
+#         hist_indices = list(range(curr - self.history_len * self.skip_frame, curr + 1, self.skip_frame))
 
-        # Build frames
-        image_sequence_per_cam = []
-        for cam in self.camera_names:
-            frames = []
-            for ts in hist_indices:
-                # find which stage segment ts falls into
-                seg_idx = int(np.searchsorted(cumulative, ts, side="right") - 1)
-                seg_offset = ts - cumulative[seg_idx]
-                files = cam_files_per_stage[seg_idx][cam]
-                path = files[min(seg_offset, len(files) - 1)]
-                img = Image.open(path).convert("RGB")
-                if self.use_augmentation:
-                    img_np = np.array(img)
-                    img_np = self.image_preprocessor.augment_image(img_np, training=True)
-                    img = Image.fromarray(img_np)
-                frames.append(self.to_tensor(img))
-            image_sequence_per_cam.append(torch.stack(frames, dim=0))
-        image_sequence = torch.stack(image_sequence_per_cam, dim=1)  # (T,K,C,H,W)
+#         # Load images for each camera and timestep
+#         image_sequence_per_cam = []
+#         for cam in self.camera_names:
+#             frames = []
+#             files_i = cam_to_files_i[cam]
+#             files_j = cam_to_files_j[cam]
+#             for ts in hist_indices:
+#                 if ts < len_i:
+#                     path = files_i[min(ts, len_i - 1)]
+#                 else:
+#                     idx = ts - len_i
+#                     path = files_j[min(idx, len_j - 1)]
+#                 img = Image.open(path).convert("RGB")
+#                 if self.use_augmentation:
+#                     img_np = np.array(img)
+#                     img_np = self.image_preprocessor.augment_image(img_np, training=True)
+#                     img = Image.fromarray(img_np)
+#                 frames.append(self.to_tensor(img))
+#             # Stack per camera: (T, C, H, W)
+#             image_sequence_per_cam.append(torch.stack(frames, dim=0))
 
-        # Determine target stage by target_ts
-        seg_idx_t = int(np.searchsorted(cumulative, target_ts, side="right") - 1)
-        stage_target = stages[seg_idx_t]
-        emb_list = self.stage_embeddings.get(stage_target, None)
-        if emb_list is None:
-            command_embedding = torch.zeros(768, dtype=torch.float32)
-        else:
-            command_embedding = torch.tensor(emb_list, dtype=torch.float32).squeeze()
-        command_text = self.stage_texts.get(stage_target, f"stage_{stage_target}")
-        return image_sequence, command_embedding, command_text
+#         # Stack cameras: (T, K, C, H, W)
+#         image_sequence = torch.stack(image_sequence_per_cam, dim=1)
 
-def load_sequential_stage_sequences(
-    root_dir: str,
-    camera_names: Sequence[str],
-    batch_size: int,
-    history_len: int,
-    skip_frame: int,
-    offset: int,
-    stage_embeddings_file: str | None,
-    stage_texts_file: str | None = None,
-    use_augmentation: bool = False,
-    image_size: int = 224,
-):
-    """
-    Build DataLoader where each sample is a sequence created by concatenating the same run name
-    across all stages in ascending order: stage1/run_X -> stage2/run_X -> ... -> stageN/run_X.
-    """
-    stage_to_runs = _list_stage_runs(root_dir)
-    max_stage = max(stage_to_runs.keys())
-    # Build mapping stage -> set of run names
-    stage_to_runnames: dict[int, set[str]] = {}
-    for s, run_paths in stage_to_runs.items():
-        names = set(os.path.basename(p) for p in run_paths)
-        stage_to_runnames[s] = names
-    # Find run names present in all stages
-    common_names = None
-    for s in range(1, max_stage + 1):
-        if s not in stage_to_runnames:
-            continue
-        if common_names is None:
-            common_names = set(stage_to_runnames[s])
-        else:
-            common_names &= stage_to_runnames[s]
-    if not common_names:
-        raise RuntimeError("No common run names found across all stages")
+#         # Determine target stage by target_ts position
+#         if target_ts < len_i:
+#             stage_target = stage_i
+#         else:
+#             stage_target = stage_j
+#         emb_list = self.stage_embeddings.get(stage_target, None)
+#         if emb_list is None:
+#             command_embedding = torch.zeros(768, dtype=torch.float32)
+#         else:
+#             command_embedding = torch.tensor(emb_list, dtype=torch.float32).squeeze()
+#         command_text = self.stage_texts.get(stage_target, f"stage_{stage_target}")
 
-    # Build sequences list
-    sequences: list[tuple[list[int], list[str]]] = []
-    for run_name in sorted(common_names):
-        stages_order = []
-        paths_order = []
-        ok = True
-        for s in range(1, max_stage + 1):
-            candidates = [p for p in stage_to_runs.get(s, []) if os.path.basename(p) == run_name]
-            if not candidates:
-                ok = False
-                break
-            stages_order.append(s)
-            paths_order.append(candidates[0])
-        if ok:
-            # Quick feasibility check: ensure total len allows some sampling
-            try:
-                total_len = sum(_count_frames_in_run(p, camera_names) for p in paths_order)
-            except Exception:
-                continue
-            if total_len >= history_len * skip_frame + offset + 1:
-                sequences.append((stages_order, paths_order))
+#         return image_sequence, command_embedding, command_text
 
-    stage_embeddings = _collect_stage_embeddings(stage_embeddings_file)
-    stage_texts = _collect_stage_texts(stage_texts_file)
-    dataset = SequentialStageSequenceDataset(
-        sequences=sequences,
-        camera_names=camera_names,
-        history_len=history_len,
-        skip_frame=skip_frame,
-        offset=offset,
-        stage_embeddings=stage_embeddings,
-        stage_texts=stage_texts,
-        use_augmentation=use_augmentation,
-        image_size=image_size,
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,  # deterministic order for validation
-        pin_memory=True,
-        num_workers=8,
-        prefetch_factor=8,
-        persistent_workers=True,
-    )
-    return loader
+
+# def load_paired_stage_sequences(
+#     root_dir: str,
+#     camera_names: Sequence[str],
+#     batch_size: int,
+#     history_len: int,
+#     skip_frame: int,
+#     offset: int,
+#     stage_embeddings_file: str | None,
+#     stage_texts_file: str | None = None,
+#     max_run: int | None = None,
+#     use_augmentation: bool = False,
+#     image_size: int = 224,
+#     rng_seed: int | None = None,
+# ):
+#     """
+#     Build a DataLoader that, per epoch, samples (max_stage-1) * max_run paired sequences:
+#       - For each adjacent stage pair (i, i+1):
+#           - Enumerate up to max_run runs from stage i, and match each with a unique random run from stage i+1.
+#       - Sampling inside each item respects current+offset < max_pair_length.
+#     """
+#     stage_to_runs = _list_stage_runs(root_dir)
+#     max_stage = max(stage_to_runs.keys())
+#     stage_embeddings = _collect_stage_embeddings(stage_embeddings_file)
+#     stage_texts = _collect_stage_texts(stage_texts_file)
+
+#     # Optional seed to vary pairing across epochs
+#     if rng_seed is not None:
+#         np.random.seed(rng_seed)
+
+#     pairs: list[tuple[int, str, int, str]] = []
+#     for i in range(1, max_stage):
+#         runs_i = stage_to_runs.get(i, [])
+#         runs_j = stage_to_runs.get(i + 1, [])
+#         if not runs_i or not runs_j:
+#             print(f"[paired] skip stage pair ({i},{i+1}) due to missing runs: "
+#                   f"runs_i={len(runs_i)}, runs_j={len(runs_j)}")
+#             continue
+#         # Determine per-pair quota
+#         quota = len(runs_i)
+#         if max_run is not None:
+#             quota = min(quota, max_run)
+#         # For uniqueness, shuffle stage i+1 runs and map 1-1 as much as possible
+#         rng_perm = np.random.permutation(len(runs_j))
+#         # If stage i has more than stage i+1, wrap around
+#         assigned = 0
+#         for idx_i in range(quota):
+#             run_i = runs_i[idx_i % len(runs_i)]
+#             idx_j = rng_perm[idx_i % len(runs_j)]
+#             run_j = runs_j[idx_j]
+#             # Ensure the concatenated pair has at least history_len*skip + offset + 1 frames
+#             try:
+#                 len_i = _count_frames_in_run(run_i, camera_names)
+#                 len_j = _count_frames_in_run(run_j, camera_names)
+#             except Exception as e:
+#                 print(f"[paired] skip pair: stage {i} run {os.path.basename(run_i)} "
+#                       f"+ stage {i+1} run {os.path.basename(run_j)} due to error: {e}")
+#                 continue
+#             required = history_len * skip_frame + offset + 1
+#             if len_i + len_j < required:
+#                 print(f"[paired] skip pair (too short): stage {i} run {os.path.basename(run_i)} "
+#                       f"(len={len_i}) + stage {i+1} run {os.path.basename(run_j)} (len={len_j}) "
+#                       f"< required {required}")
+#                 continue
+#             pairs.append((i, run_i, i + 1, run_j))
+#             assigned += 1
+#             if assigned >= quota:
+#                 break
+
+#     dataset = PairedStageSequenceDataset(
+#         pairs=pairs,
+#         camera_names=camera_names,
+#         history_len=history_len,
+#         skip_frame=skip_frame,
+#         offset=offset,
+#         stage_embeddings=stage_embeddings,
+#         stage_texts=stage_texts,
+#         use_augmentation=use_augmentation,
+#         image_size=image_size,
+#     )
+#     loader = DataLoader(
+#         dataset,
+#         batch_size=batch_size,
+#         shuffle=True,
+#         pin_memory=True,
+#         num_workers=8,
+#         prefetch_factor=8,
+#         persistent_workers=True,
+#     )
+#     return loader
+
+# class SequentialStageSequenceDataset(torch.utils.data.Dataset):
+#     """
+#     Concatenate runs across all stages for the same run name in ascending stage order:
+#       stage1/run_X -> stage2/run_X -> ... -> stageN/run_X
+#     Sampling uses random current_frame, history (skip_frame), and target at offset along the concatenated timeline.
+#     """
+#     def __init__(
+#         self,
+#         sequences: list[tuple[list[int], list[str]]],  # [( [stages...], [run_paths aligned...] )]
+#         camera_names: Sequence[str],
+#         history_len: int,
+#         skip_frame: int,
+#         offset: int,
+#         stage_embeddings: dict[int, list[float]] | None = None,
+#         stage_texts: dict[int, str] | None = None,
+#         use_augmentation: bool = False,
+#         image_size: int = 224,
+#     ) -> None:
+#         super().__init__()
+#         self.sequences = sequences
+#         self.camera_names = list(camera_names)
+#         self.history_len = history_len
+#         self.skip_frame = skip_frame
+#         self.offset = offset
+#         self.stage_embeddings = stage_embeddings or {}
+#         self.stage_texts = stage_texts or {}
+#         self.use_augmentation = use_augmentation
+#         self.image_size = image_size
+#         self.to_tensor = transforms.ToTensor()
+#         if self.use_augmentation:
+#             self.image_preprocessor = ImagePreprocessor(
+#                 image_size=image_size, use_augmentation=True
+#             )
+
+#     def __len__(self) -> int:
+#         return len(self.sequences)
+
+#     def _list_cam_files(self, run_path: str, cam: str) -> list[str]:
+#         cam_dir = os.path.join(run_path, cam)
+#         files = sorted([f for f in os.listdir(cam_dir) if f.endswith("_full.jpg")])
+#         if not files:
+#             raise RuntimeError(f"No *_full.jpg under {cam_dir}")
+#         return [os.path.join(cam_dir, f) for f in files]
+
+#     def __getitem__(self, index: int):
+#         stages, run_paths = self.sequences[index]
+#         # Build camera file arrays for each segment
+#         cam_files_per_stage = []
+#         lengths = []
+#         for run_path in run_paths:
+#             cam_map = {cam: self._list_cam_files(run_path, cam) for cam in self.camera_names}
+#             cam_files_per_stage.append(cam_map)
+#             lengths.append(len(next(iter(cam_map.values()))))
+#         cumulative = np.cumsum([0] + lengths)  # boundaries
+#         total_len = cumulative[-1]
+
+#         # Sample current within total timeline
+#         min_start = self.history_len * self.skip_frame
+#         max_start = total_len - self.offset - 1
+#         if max_start < min_start:
+#             curr = min_start
+#         else:
+#             curr = int(np.random.randint(min_start, max_start + 1))
+#         target_ts = curr + self.offset
+#         hist_indices = list(range(curr - self.history_len * self.skip_frame, curr + 1, self.skip_frame))
+
+#         # Build frames
+#         image_sequence_per_cam = []
+#         for cam in self.camera_names:
+#             frames = []
+#             for ts in hist_indices:
+#                 # find which stage segment ts falls into
+#                 seg_idx = int(np.searchsorted(cumulative, ts, side="right") - 1)
+#                 seg_offset = ts - cumulative[seg_idx]
+#                 files = cam_files_per_stage[seg_idx][cam]
+#                 path = files[min(seg_offset, len(files) - 1)]
+#                 img = Image.open(path).convert("RGB")
+#                 if self.use_augmentation:
+#                     img_np = np.array(img)
+#                     img_np = self.image_preprocessor.augment_image(img_np, training=True)
+#                     img = Image.fromarray(img_np)
+#                 frames.append(self.to_tensor(img))
+#             image_sequence_per_cam.append(torch.stack(frames, dim=0))
+#         image_sequence = torch.stack(image_sequence_per_cam, dim=1)  # (T,K,C,H,W)
+
+#         # Determine target stage by target_ts
+#         seg_idx_t = int(np.searchsorted(cumulative, target_ts, side="right") - 1)
+#         stage_target = stages[seg_idx_t]
+#         emb_list = self.stage_embeddings.get(stage_target, None)
+#         if emb_list is None:
+#             command_embedding = torch.zeros(768, dtype=torch.float32)
+#         else:
+#             command_embedding = torch.tensor(emb_list, dtype=torch.float32).squeeze()
+#         command_text = self.stage_texts.get(stage_target, f"stage_{stage_target}")
+#         return image_sequence, command_embedding, command_text
+
+# def load_sequential_stage_sequences(
+#     root_dir: str,
+#     camera_names: Sequence[str],
+#     batch_size: int,
+#     history_len: int,
+#     skip_frame: int,
+#     offset: int,
+#     stage_embeddings_file: str | None,
+#     stage_texts_file: str | None = None,
+#     use_augmentation: bool = False,
+#     image_size: int = 224,
+# ):
+#     """
+#     Build DataLoader where each sample is a sequence created by concatenating the same run name
+#     across all stages in ascending order: stage1/run_X -> stage2/run_X -> ... -> stageN/run_X.
+#     """
+#     stage_to_runs = _list_stage_runs(root_dir)
+#     max_stage = max(stage_to_runs.keys())
+#     # Build mapping stage -> set of run names
+#     stage_to_runnames: dict[int, set[str]] = {}
+#     for s, run_paths in stage_to_runs.items():
+#         names = set(os.path.basename(p) for p in run_paths)
+#         stage_to_runnames[s] = names
+#     # Find run names present in all stages
+#     common_names = None
+#     for s in range(1, max_stage + 1):
+#         if s not in stage_to_runnames:
+#             continue
+#         if common_names is None:
+#             common_names = set(stage_to_runnames[s])
+#         else:
+#             common_names &= stage_to_runnames[s]
+#     if not common_names:
+#         raise RuntimeError("No common run names found across all stages")
+
+#     # Build sequences list
+#     sequences: list[tuple[list[int], list[str]]] = []
+#     for run_name in sorted(common_names):
+#         stages_order = []
+#         paths_order = []
+#         ok = True
+#         for s in range(1, max_stage + 1):
+#             candidates = [p for p in stage_to_runs.get(s, []) if os.path.basename(p) == run_name]
+#             if not candidates:
+#                 ok = False
+#                 break
+#             stages_order.append(s)
+#             paths_order.append(candidates[0])
+#         if ok:
+#             # Quick feasibility check: ensure total len allows some sampling
+#             try:
+#                 total_len = sum(_count_frames_in_run(p, camera_names) for p in paths_order)
+#             except Exception:
+#                 continue
+#             if total_len >= history_len * skip_frame + offset + 1:
+#                 sequences.append((stages_order, paths_order))
+
+#     stage_embeddings = _collect_stage_embeddings(stage_embeddings_file)
+#     stage_texts = _collect_stage_texts(stage_texts_file)
+#     dataset = SequentialStageSequenceDataset(
+#         sequences=sequences,
+#         camera_names=camera_names,
+#         history_len=history_len,
+#         skip_frame=skip_frame,
+#         offset=offset,
+#         stage_embeddings=stage_embeddings,
+#         stage_texts=stage_texts,
+#         use_augmentation=use_augmentation,
+#         image_size=image_size,
+#     )
+#     loader = DataLoader(
+#         dataset,
+#         batch_size=batch_size,
+#         shuffle=False,  # deterministic order for validation
+#         pin_memory=True,
+#         num_workers=8,
+#         prefetch_factor=8,
+#         persistent_workers=True,
+#     )
+#     return loader
