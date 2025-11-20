@@ -295,6 +295,7 @@ class TransformerEncoderLayer(nn.Module):
         self.activation = _get_activation_fn(activation)
         self.normalize_before = normalize_before
 
+    @staticmethod
     def with_pos_embed(tensor: Tensor, pos: Optional[Tensor]) -> Tensor:
         return tensor if pos is None else tensor + pos
 
@@ -381,6 +382,7 @@ class TransformerDecoderLayer(nn.Module):
         self.activation = _get_activation_fn(activation)
         self.normalize_before = normalize_before
 
+    @staticmethod
     def with_pos_embed(tensor: Tensor, pos: Optional[Tensor]) -> Tensor:
         return tensor if pos is None else tensor + pos
 
