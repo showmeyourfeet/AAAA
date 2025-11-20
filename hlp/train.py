@@ -461,6 +461,8 @@ if __name__ == "__main__":
     parser.add_argument('--test_only', action='store_true', help='Test the model using the latest checkpoint and exit')
     parser.add_argument('--random_crop', action='store_true')
     parser.add_argument('--use_augmentation', action='store_true', help='Enable data augmentation during training')
+    parser.add_argument('--sync_sequence_augmentation', action='store_true',
+                        help='Sync augmentation across the history frames of a sample (SequenceDataset only)')
     parser.add_argument('--image_size', action='store', type=int, help='Image size for augmentation', default=224)
     parser.add_argument('--dagger_ratio', action='store', type=float, help='dagger_ratio', default=None)
     parser.add_argument('--use_splitted', action='store_true', help='Use splitted dataset format (stage*/run_*)')
@@ -533,6 +535,7 @@ if __name__ == "__main__":
                 sampling_strategy=args.sampling_strategy,
                 max_combinations=args.max_combinations,
                 n_repeats=args.n_repeats,
+                sync_sequence_augmentation=args.sync_sequence_augmentation,
             )
         elif args.use_paired_sequences:
             # Use paired adjacent-stage sequences for training; keep validation/test as None for now
@@ -611,6 +614,7 @@ if __name__ == "__main__":
             dagger_ratio=dagger_ratio,
             use_augmentation=args.use_augmentation,
             image_size=args.image_size,
+            sync_sequence_augmentation=args.sync_sequence_augmentation,
         )
 
         model = build_HighLevelModel(

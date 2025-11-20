@@ -635,6 +635,7 @@ class CompositeSequenceDataset(torch.utils.data.Dataset):
         sampling_strategy='balanced',  # 'balanced' or 'random' or 'sequential'
         max_combinations=None,  # Maximum number of combinations (if None, use n_repeats)
         n_repeats=None,  # Number of times each run should be used (alternative to max_combinations)
+        sync_sequence_augmentation: bool = False,
     ):
         super().__init__()
         self.root_dir = root_dir
@@ -649,6 +650,7 @@ class CompositeSequenceDataset(torch.utils.data.Dataset):
         self.training = training
         self.image_size = image_size
         self.sampling_strategy = sampling_strategy
+        self.sync_sequence_augmentation = sync_sequence_augmentation
         
         # Initialize ImagePreprocessor if augmentation is enabled
         if self.use_augmentation:
@@ -1017,6 +1019,7 @@ class CompositeSequenceDataset(torch.utils.data.Dataset):
         # Load image sequence for history frames
         # Need to map global timesteps to local timesteps within each run
         image_sequence = []
+        sequence_replay = None
         for ts in range(start_ts, curr_ts + 1, self.history_skip_frame):
             # Find which stage/run this timestep belongs to
             run_idx = None
@@ -1064,9 +1067,17 @@ class CompositeSequenceDataset(torch.utils.data.Dataset):
             
             # Apply data augmentation if enabled (synchronized across cameras)
             if self.use_augmentation:
-                current_ts_images = self.image_preprocessor.augment_images(
-                    current_ts_images, self.training
-                )
+                if self.sync_sequence_augmentation:
+                    current_ts_images, sequence_replay = self.image_preprocessor.augment_images(
+                        current_ts_images,
+                        self.training,
+                        replay=sequence_replay,
+                        return_replay=True,
+                    )
+                else:
+                    current_ts_images = self.image_preprocessor.augment_images(
+                        current_ts_images, self.training
+                    )
             
             # Convert to tensor format (C, H, W) in [0, 1]
             current_ts_tensors = [self.to_tensor(img) for img in current_ts_images]
@@ -1308,6 +1319,7 @@ def load_composite_data(
     sampling_strategy='balanced',  # 'balanced' or 'random' or 'sequential'
     max_combinations=None,  # Maximum number of combinations (if None, use n_repeats)
     n_repeats=None,  # Number of times each run should be used (alternative to max_combinations)
+    sync_sequence_augmentation: bool = False,
 ):
     """
     Load composite dataset for HighLevelModel training.
@@ -1425,6 +1437,7 @@ def load_composite_data(
         sampling_strategy=sampling_strategy,
         max_combinations=max_combinations,
         n_repeats=n_repeats,
+        sync_sequence_augmentation=sync_sequence_augmentation,
     )
     
     print(f"Training dataset: {len(train_dataset)} samples from {train_root_dir}")
@@ -1448,6 +1461,7 @@ def load_composite_data(
             sampling_strategy='sequential',  # Always use sequential for validation
             max_combinations=None,  # Not used for sequential
             n_repeats=None,  # Not used for sequential
+            sync_sequence_augmentation=False,
         )
         print(f"Validation dataset: {len(val_dataset)} samples from {val_root_dir}")
     else:
