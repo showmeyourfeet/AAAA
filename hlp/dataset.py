@@ -21,7 +21,12 @@ class ImagePreprocessor:
     
     Based on the ImagePreprocessor from srt-h/utils.py, adapted for HighLevelModel training.
     """
-    def __init__(self, image_size: int = 224, use_augmentation: bool = True, normalize: bool = False):
+    def __init__(
+        self,
+        image_size: int = 224,
+        use_augmentation: bool = True,
+        normalize: bool = False,
+    ):
         self.image_size = image_size
         self.use_augmentation = use_augmentation
         self.normalize = normalize
@@ -65,23 +70,53 @@ class ImagePreprocessor:
             return augmented['image']
         return image_np
 
-    def augment_images(self, images: list[np.ndarray], training: bool) -> list[np.ndarray]:
-        """Apply consistent augmentation to a list of numpy array images."""
-        if not training or not self.use_augmentation or self.albumentations_transform is None:
-            return images
-        
-        if not images:
-            return []
+    def augment_images(
+        self,
+        images: list[np.ndarray],
+        training: bool,
+        replay: dict | None = None,
+        return_replay: bool = False,
+    ) -> list[np.ndarray] | tuple[list[np.ndarray], dict | None]:
+        """Apply consistent augmentation to a list of numpy array images.
 
-        # Augment first image to generate parameters
-        augmented_0 = self.albumentations_transform(image=images[0])
-        results = [augmented_0['image']]
-        
-        # Replay for the rest to ensure geometric/color consistency
-        for img in images[1:]:
-            augmented = A.ReplayCompose.replay(augmented_0['replay'], image=img)
-            results.append(augmented['image'])
-            
+        Args:
+            images: List of images (one per camera for a timestep).
+            training: Whether we are in training mode.
+            replay: Optional pretrained replay dict. If provided, reuse exact
+                augmentation parameters (used for sequence-level synchronization).
+            return_replay: If True, also return the replay dict used.
+        """
+        if (
+            not training
+            or not self.use_augmentation
+            or self.albumentations_transform is None
+            or not images
+        ):
+            if return_replay:
+                return images, replay
+            return images
+
+        start_index = 0
+        if replay is None:
+            augmented_0 = self.albumentations_transform(image=images[0])
+            replay = augmented_0.get("replay")
+            if replay is None:
+                results = [augmented_0["image"]]
+                for img in images[1:]:
+                    results.append(self.albumentations_transform(image=img)["image"])
+                if return_replay:
+                    return results, None
+                return results
+            results = [augmented_0["image"]]
+            start_index = 1
+        else:
+            results = []
+
+        for img in images[start_index:]:
+            augmented = A.ReplayCompose.replay(replay, image=img)
+            results.append(augmented["image"])
+        if return_replay:
+            return results, replay
         return results
 
     def process(self, image: Image.Image, training: bool = False) -> torch.Tensor:
@@ -115,6 +150,7 @@ class SequenceDataset(torch.utils.data.Dataset):
         use_augmentation=False,
         training=True,
         image_size=224,
+        sync_sequence_augmentation: bool = False,
     ):
         super().__init__()
         self.episode_ids = episode_ids if len(episode_ids) > 0 else [0]
@@ -127,6 +163,7 @@ class SequenceDataset(torch.utils.data.Dataset):
         self.use_augmentation = use_augmentation
         self.training = training
         self.image_size = image_size
+        self.sync_sequence_augmentation = sync_sequence_augmentation
         
         # Initialize ImagePreprocessor if augmentation is enabled
         if self.use_augmentation:
@@ -186,6 +223,7 @@ class SequenceDataset(torch.utils.data.Dataset):
 
             # Construct the image sequences for the desired timesteps
             image_sequence = []
+            sequence_replay = None
             for ts in range(start_ts, curr_ts + 1, self.history_skip_frame):
                 current_ts_images = []
                 for cam_name in self.camera_names:
@@ -202,9 +240,17 @@ class SequenceDataset(torch.utils.data.Dataset):
                 
                 # Apply data augmentation if enabled (synchronized across cameras)
                 if self.use_augmentation:
-                    current_ts_images = self.image_preprocessor.augment_images(
-                        current_ts_images, self.training
-                    )
+                    if self.sync_sequence_augmentation:
+                        current_ts_images, sequence_replay = self.image_preprocessor.augment_images(
+                            current_ts_images,
+                            self.training,
+                            replay=sequence_replay,
+                            return_replay=True,
+                        )
+                    else:
+                        current_ts_images = self.image_preprocessor.augment_images(
+                            current_ts_images, self.training
+                        )
                 
                 all_cam_images = np.stack(current_ts_images, axis=0)
                 image_sequence.append(all_cam_images)
@@ -230,6 +276,7 @@ def load_merged_data(
     dagger_ratio=None,
     use_augmentation=False,
     image_size=224,
+    sync_sequence_augmentation=False,
 ):
     assert len(dataset_dirs) == len(
         num_episodes_list
@@ -277,6 +324,7 @@ def load_merged_data(
             use_augmentation=use_augmentation,
             training=True,
             image_size=image_size,
+            sync_sequence_augmentation=sync_sequence_augmentation,
         )
         for dataset_dir in dataset_dirs
     ]
@@ -292,6 +340,7 @@ def load_merged_data(
             use_augmentation=use_augmentation,
             training=False,
             image_size=image_size,
+            sync_sequence_augmentation=sync_sequence_augmentation,
         )
         for dataset_dir in dataset_dirs
     ]
@@ -307,6 +356,7 @@ def load_merged_data(
             use_augmentation=use_augmentation,
             training=False,  # Test mode, no augmentation
             image_size=image_size,
+            sync_sequence_augmentation=sync_sequence_augmentation,
         )
         for dataset_dir in dataset_dirs
     ]
@@ -387,6 +437,7 @@ class SplittedSequenceDataset(torch.utils.data.Dataset):
         use_augmentation=False,
         training=True,
         image_size=224,
+        sync_sequence_augmentation: bool = False,
     ):
         super().__init__()
         self.root_dir = root_dir
@@ -400,6 +451,7 @@ class SplittedSequenceDataset(torch.utils.data.Dataset):
         self.use_augmentation = use_augmentation
         self.training = training
         self.image_size = image_size
+        self.sync_sequence_augmentation = sync_sequence_augmentation
         
         # Initialize ImagePreprocessor if augmentation is enabled
         if self.use_augmentation:

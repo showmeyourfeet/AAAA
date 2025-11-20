@@ -42,19 +42,32 @@ class ImagePreprocessor:
 
         # Define Albumentations enhancement process
         if use_augmentation and ALBUMENTATIONS_AVAILABLE:
-            self.albumentations_transform = A.Compose([
-                # Use multiple enhancement methods
-                # A.OneOf([
-                #     A.Rotate(limit=[-10, 10], p=0.5),
-                #     A.Affine(rotate=[-10, 10],scale=[0.9, 1.1], translate_percent=[-0.1, 0.1], shear=[-10, 10], p=0.8),
-                # ], p=0.5),
-                A.OneOf([
-                    A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.8),
-                    A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=0.8),
-                    A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.8),
-                ], p=0.5),
-                A.CoarseDropout(num_holes_range=[1, 3], hole_height_range=[0.1, 0.2], hole_width_range=[0.1, 0.2], p=0.5)
-            ])
+            # Color-only augmentation to avoid geometric mismatch between cameras.
+            self.albumentations_transform = A.ReplayCompose(
+                [
+                    A.OneOf(
+                        [
+                            A.RandomBrightnessContrast(
+                                brightness_limit=0.2, contrast_limit=0.2, p=0.8
+                            ),
+                            A.HueSaturationValue(
+                                hue_shift_limit=20,
+                                sat_shift_limit=30,
+                                val_shift_limit=20,
+                                p=0.8,
+                            ),
+                            A.ColorJitter(
+                                brightness=0.2,
+                                contrast=0.2,
+                                saturation=0.2,
+                                hue=0.1,
+                                p=0.8,
+                            ),
+                        ],
+                        p=0.9,
+                    )
+                ]
+            )
         else:
             # Evaluation: no augmentation or albumentations not available
             self.albumentations_transform = None
@@ -69,12 +82,33 @@ class ImagePreprocessor:
             self.normalize_transform = None
 
     def augment_image(self, image_np: np.ndarray, training: bool) -> np.ndarray:
-        """Apply augmentation to numpy array image."""
-        if training and self.use_augmentation and self.albumentations_transform is not None:
-            # Apply Albumentations enhancement
-            augmented = self.albumentations_transform(image=image_np)
-            return augmented['image']
-        return image_np
+        """Apply augmentation to a single numpy array image."""
+        augmented = self.augment_images([image_np], training)
+        return augmented[0]
+
+    def augment_images(self, images: list[np.ndarray], training: bool) -> list[np.ndarray]:
+        """Apply consistent augmentation with replay support across multiple cameras."""
+        if (
+            not training
+            or not self.use_augmentation
+            or self.albumentations_transform is None
+            or not images
+        ):
+            return images
+
+        augmented0 = self.albumentations_transform(image=images[0])
+        replay = augmented0.get("replay")
+        if replay is None:
+            # Fallback to independent augmentation if replay is unexpectedly missing.
+            return [augmented0["image"]] + [
+                self.albumentations_transform(image=img)["image"] for img in images[1:]
+            ]
+
+        results = [augmented0["image"]]
+        for img in images[1:]:
+            augmented = A.ReplayCompose.replay(replay, image=img)
+            results.append(augmented["image"])
+        return results
 
     def process(self, image: Image.Image, training: bool = False) -> torch.Tensor:
         """Process a single PIL image with optional augmentation and normalization."""
@@ -230,12 +264,15 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 if CROP_TOP and cam_name == "cam_high":
                     image = crop_resize(image)
                 image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                
-                # Apply data augmentation if enabled
-                if self.use_augmentation:
-                    image = self.image_preprocessor.augment_image(image, self.training)
-                
                 image_dict[cam_name] = image
+
+            if self.use_augmentation and image_dict:
+                ordered_images = [image_dict[cam] for cam in self.camera_names]
+                augmented_images = self.image_preprocessor.augment_images(
+                    ordered_images, self.training
+                )
+                for cam_name, aug_img in zip(self.camera_names, augmented_images):
+                    image_dict[cam_name] = aug_img
 
             all_cam_images = [image_dict[cam_name] for cam_name in self.camera_names]
             all_cam_images = np.stack(all_cam_images, axis=0)
@@ -469,7 +506,7 @@ class SplittedEpisodicDataset(torch.utils.data.Dataset):
 
         qpos = qpos_np[start_ts]
 
-        all_cam_images = []
+        current_images = []
         for cam in self.camera_names:
             cam_dir = os.path.join(run_path, cam)
             files = sorted(
@@ -481,15 +518,14 @@ class SplittedEpisodicDataset(torch.utils.data.Dataset):
                 )
             idx = min(start_ts, len(files) - 1)
             img = Image.open(os.path.join(cam_dir, files[idx])).convert("RGB")
-            
-            # Apply data augmentation if enabled
-            if self.use_augmentation:
-                img_np = np.array(img)
-                img_np = self.image_preprocessor.augment_image(img_np, self.training)
-                img = Image.fromarray(img_np)
-            
-            img_t = self.to_tensor(img)
-            all_cam_images.append(img_t)
+            current_images.append(np.array(img))
+
+        if self.use_augmentation and current_images:
+            current_images = self.image_preprocessor.augment_images(
+                current_images, self.training
+            )
+
+        all_cam_images = [self.to_tensor(img_np) for img_np in current_images]
 
         image_data = torch.stack(all_cam_images, dim=0)
 
