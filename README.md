@@ -22,6 +22,10 @@ This project implements a two-tiered policy for controlling a surgical robot. It
 │   └── utils.py
 ```
 
+## Quick Start
+
+TODO: Add quick start instructions here.
+
 ## High-Level Policy
 
 The high-level policy takes in images from multiple cameras and determines the overall goal or command (e.g., "move to the bag"). It uses a Transformer-based model (`HighLevelModel`) to process image sequences and predict the correct command from a predefined set.
@@ -31,7 +35,7 @@ The high-level policy takes in images from multiple cameras and determines the o
 To train the high-level policy, run the following command:
 
 ```bash
-python hlp/train.py --splitted_root /home/beta/projs/pys/AutoSurgical-Algorithms/srt-h/splitted_datasets/training_datasets  --val_splitted_root /home/beta/projs/pys/AutoSurgical-Algorithms/srt-h/splitted_datasets/validation_datasets --stage_embeddings_file /home/beta/projs/pys/AutoSurgical-Algorithms/srt-h/splitted_datasets/stage_embeddings_distilbert.json  --stage_texts_file /home/beta/projs/pys/AutoSurgical-Algorithms/srt-h/splitted_datasets/stage_embeddings_distilbert.json   --ckpt_dir ./hlp/ckpts --batch_size 16 --num_epochs 1000 --lr 1e-5 --seed 0 --gpu 0  --history_len 4 --history_skip_frame 10  --prediction_offset 15 --use_composite --n_repeats 10 --use_augmentation
+python hlp/train.py --splitted_root ./splitted_datasets/training_datasets  --val_splitted_root ./splitted_datasets/validation_datasets --stage_embeddings_file ./splitted_datasets/stage_embeddings_distilbert.json  --stage_texts_file ./splitted_datasets/stage_embeddings_distilbert.json   --ckpt_dir ./hlp/ckpts --batch_size 16 --num_epochs 1000 --lr 1e-5 --seed 0 --gpu 0  --history_len 4 --history_skip_frame 10  --prediction_offset 15 --use_composite --n_repeats 10 --use_augmentation
 ```
 
 ## Low-Level Policy
@@ -43,7 +47,7 @@ The low-level policy takes the high-level command and the current robot state (i
 To train the low-level policy, run the following command:
 
 ```bash
-python llp/train.py --splitted_root /home/beta/projs/pys/AutoSurgical-Algorithms/srt-h/splitted_datasets/training_datasets --val_splitted_root /home/beta/projs/pys/AutoSurgical-Algorithms/srt-h/splitted_datasets/validation_datasets --stage_embeddings_file /home/beta/projs/pys/AutoSurgical-Algorithms/srt-h/splitted_datasets/stage_embeddings_distilbert.json --ckpt_dir ./llp/ckpts --batch_size 16 --seed 42 --num_epochs 1500 --lr 1e-4 --chunk_size 30 --hidden_dim 512 --dim_feedforward 3200 --kl_weight 80 --image_encoder efficientnet_b3film --use_language --language_encoder distilbert --use_splitted --no_encoder --use_augmentation
+python llp/train.py --splitted_root ./splitted_datasets/training_datasets --val_splitted_root ./splitted_datasets/validation_datasets --stage_embeddings_file ./splitted_datasets/stage_embeddings_distilbert.json --ckpt_dir ./llp/ckpts --batch_size 16 --seed 42 --num_epochs 1500 --lr 1e-4 --chunk_size 30 --hidden_dim 512 --dim_feedforward 3200 --kl_weight 80 --image_encoder efficientnet_b3film --use_language --language_encoder distilbert --use_splitted --no_encoder --use_augmentation
 ```
 
 ## Key Technologies
@@ -51,4 +55,9 @@ python llp/train.py --splitted_root /home/beta/projs/pys/AutoSurgical-Algorithms
 *   PyTorch
 *   Transformers
 *   ResNet and EfficientNet
-*   FiLM (Feature-wise Linear Modulation)
+*   Reinforcement Learning
+*   Imitation Learning
+
+## Results
+
+TODO: Add results here.

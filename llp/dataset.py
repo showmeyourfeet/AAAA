@@ -44,10 +44,10 @@ class ImagePreprocessor:
         if use_augmentation and ALBUMENTATIONS_AVAILABLE:
             self.albumentations_transform = A.Compose([
                 # Use multiple enhancement methods
-                A.OneOf([
-                    A.Rotate(limit=[-10, 10], p=0.5),
-                    A.Affine(rotate=[-10, 10],scale=[0.9, 1.1], translate_percent=[-0.1, 0.1], shear=[-10, 10], p=0.8),
-                ], p=0.5),
+                # A.OneOf([
+                #     A.Rotate(limit=[-10, 10], p=0.5),
+                #     A.Affine(rotate=[-10, 10],scale=[0.9, 1.1], translate_percent=[-0.1, 0.1], shear=[-10, 10], p=0.8),
+                # ], p=0.5),
                 A.OneOf([
                     A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.8),
                     A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=0.8),
