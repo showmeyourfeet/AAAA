@@ -163,10 +163,10 @@ class Backbone(BackboneBase):
         self.preprocess = (
             weights.transforms()
         )  # Use this to preprocess images the same way as the pretrained model (e.g., ResNet-18).
-        print("---------------- inside preprocess-----------")
-        print(self.preprocess)
-        import sys
-        sys.exit()
+        # print("---------------- inside preprocess-----------")
+        # print(self.preprocess)
+        # import sys
+        # sys.exit()
 
     def forward(self, tensor):
         tensor = self.preprocess(tensor)

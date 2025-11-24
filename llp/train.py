@@ -170,7 +170,8 @@ def train_bc(
 
     policy = make_policy(policy_config)
     optimizer = make_optimizer(policy)
-    scheduler = make_scheduler(optimizer, num_epochs)
+    constant_lr = config.get("constant_lr", False)
+    scheduler = None if constant_lr else make_scheduler(optimizer, num_epochs)
 
     if load_ckpt == "y" and checkpoint is not None:
         print(f"Loading checkpoint from {ckpt_path}")
@@ -187,7 +188,9 @@ def train_bc(
             }
         loading_status = policy.deserialize(model_state_dict)
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        sched_state = checkpoint.get("scheduler_state_dict")
+        if scheduler is not None and sched_state is not None:
+            scheduler.load_state_dict(sched_state)
         start_epoch = checkpoint["epoch"] + 1
         print(loading_status)
     else:
@@ -249,7 +252,8 @@ def train_bc(
                         "loss": f"{loss.item():.4f}",
                     }
                 )
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
         e = epoch - start_epoch
         epoch_summary = compute_dict_mean(
             train_history[(batch_idx + 1) * e : (batch_idx + 1) * (e + 1)]
@@ -260,7 +264,8 @@ def train_bc(
             logger.info(msg)
         else:
             tqdm.write(msg)
-        epoch_summary["lr"] = np.array(scheduler.get_last_lr()[0])
+        if scheduler is not None:
+            epoch_summary["lr"] = np.array(scheduler.get_last_lr()[0])
         if (epoch + 1) % log_every == 0:
             summary_parts = []
             for k, v in epoch_summary.items():
@@ -305,10 +310,11 @@ def train_bc(
             if best_model_metric == "l1_loss":
                 # Use l1 loss for best model selection
                 if val_l1 is None:
+                    msg_warn = "best_model_metric is 'l1_loss' but no val l1 loss available. Falling back to total_loss for this epoch."
                     if logger:
-                        logger.warning(f"best_model_metric is 'l1_loss' but no val l1 loss available. Falling back to total_loss for this epoch.")
+                        logger.warning(msg_warn)
                     else:
-                        tqdm.write(f"Warning: best_model_metric is 'l1_loss' but no val l1 loss available. Falling back to total_loss for this epoch.")
+                        tqdm.write(f"Warning: {msg_warn}")
                     # Fall back to total loss for this epoch
                     if val_loss < best_val:
                         best_val = val_loss
@@ -351,10 +357,11 @@ def train_bc(
                     save_dict = {
                         "model_state_dict": policy.serialize(),
                         "optimizer_state_dict": optimizer.state_dict(),
-                        "scheduler_state_dict": scheduler.state_dict(),
                         "epoch": epoch,
                         "best_val": best_val,
                     }
+                    if scheduler is not None:
+                        save_dict["scheduler_state_dict"] = scheduler.state_dict()
                     if val_l1 is not None:
                         save_dict["best_val_l1"] = val_l1  # Also save l1 loss for reference
                     torch.save(save_dict, best_ckpt_path)
@@ -372,31 +379,29 @@ def train_bc(
         # Save latest checkpoint every epoch (rolling backup)
         # This allows resuming from any epoch, not just multiples of 100
         latest_ckpt_path = os.path.join(ckpt_dir, f"policy_latest_seed_{seed}.ckpt")
-        torch.save(
-            {
-                "model_state_dict": policy.serialize(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "epoch": epoch,
-                "best_val": best_val,
-            },
-            latest_ckpt_path,
-        )
+        latest_payload = {
+            "model_state_dict": policy.serialize(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "epoch": epoch,
+            "best_val": best_val,
+        }
+        if scheduler is not None:
+            latest_payload["scheduler_state_dict"] = scheduler.state_dict()
+        torch.save(latest_payload, latest_ckpt_path)
 
         save_ckpt_every = 100
         if epoch % save_ckpt_every == 0 and epoch > 0:
             ckpt_path_epoch = os.path.join(
                 ckpt_dir, f"policy_epoch_{epoch}_seed_{seed}.ckpt"
             )
-            torch.save(
-                {
-                    "model_state_dict": policy.serialize(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "epoch": epoch,
-                },
-                ckpt_path_epoch,
-            )
+            epoch_payload = {
+                "model_state_dict": policy.serialize(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "epoch": epoch,
+            }
+            if scheduler is not None:
+                epoch_payload["scheduler_state_dict"] = scheduler.state_dict()
+            torch.save(epoch_payload, ckpt_path_epoch)
             # prune_epoch = epoch - save_ckpt_every
             # if prune_epoch % 1000 != 0:
             #     prune_path = os.path.join(
@@ -406,15 +411,14 @@ def train_bc(
             #         os.remove(prune_path)
 
     ckpt_path_final = os.path.join(ckpt_dir, "policy_last.ckpt")
-    torch.save(
-        {
-            "model_state_dict": policy.serialize(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "epoch": epoch,
-        },
-        ckpt_path_final,
-    )
+    final_payload = {
+        "model_state_dict": policy.serialize(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "epoch": epoch,
+    }
+    if scheduler is not None:
+        final_payload["scheduler_state_dict"] = scheduler.state_dict()
+    torch.save(final_payload, ckpt_path_final)
     if logger:
         logger.info(f"Saved final checkpoint to {ckpt_path_final}")
 
@@ -440,6 +444,7 @@ def main(args: Dict):
 
     use_language = args["use_language"]
     language_encoder = args["language_encoder"]
+    use_state = not args.get("no_state", False)
 
     dataset_dirs: List[str] = []
     num_episodes_list: List[int] = []
@@ -464,6 +469,8 @@ def main(args: Dict):
             stage_embeddings_file=stage_embeddings_file,
             use_augmentation=args.get("use_augmentation", False),
             image_size=args.get("image_size", 224),
+            use_episodic_sampling=args.get("use_episodic_sampling", False),
+            use_state=use_state,
         )
         val_dataloader = None
         val_root = args.get("val_splitted_root")
@@ -488,6 +495,8 @@ def main(args: Dict):
                 image_size=args.get("image_size", 224),
                 use_augmentation=False,  # No augmentation for validation
                 training=False,
+                use_episodic_sampling=args.get("use_episodic_sampling", False),
+                use_state=use_state,
             )
             val_dataloader = torch.utils.data.DataLoader(
                 val_dataset,
@@ -520,9 +529,11 @@ def main(args: Dict):
             policy_class="ACT",
             use_augmentation=args.get("use_augmentation", False),
             image_size=args.get("image_size", 224),
+            use_state=use_state,
         )
         val_dataloader = None
 
+    stats["use_state"] = use_state
     stats_path = os.path.join(ckpt_dir, "dataset_stats.pkl")
     with open(stats_path, "wb") as f:
         pickle.dump(stats, f)
@@ -534,6 +545,7 @@ def main(args: Dict):
         "hidden_dim": args["hidden_dim"],
         "dim_feedforward": args["dim_feedforward"],
         "lr_backbone": args.get("lr_backbone", 1e-5),
+        "weight_decay": args.get("weight_decay", 1e-4),
         "backbone": args["image_encoder"],
         "enc_layers": 4,
         "dec_layers": 7,
@@ -547,6 +559,7 @@ def main(args: Dict):
         "vq_class": args.get("vq_class", 512),
         "vq_dim": args.get("vq_dim", 32),
         "train_image_encoder": args.get("train_image_encoder", False),
+        "use_state": use_state,
     }
 
     config = {
@@ -556,6 +569,7 @@ def main(args: Dict):
         "policy_config": policy_config,
         "log_every": args.get("log_every", 1),
         "best_model_metric": args.get("best_model_metric", "total_loss"),
+        "constant_lr": args.get("constant_lr", False),
     }
 
     train_bc(train_dataloader, config, val_dataloader=val_dataloader, logger=logger)
@@ -575,6 +589,7 @@ if __name__ == "__main__":
     parser.add_argument("--dim_feedforward", type=int, default=3200)
     parser.add_argument("--image_encoder", type=str, default="efficientnet_b3film")
     parser.add_argument("--multi_gpu", action="store_true")
+    parser.add_argument("--no_state", action="store_true", help="Disable qpos/state inputs throughout training/inference pipeline")
     parser.add_argument("--no_encoder", action="store_true", help="Disable VAE encoder, use zero latent vector instead")
     parser.add_argument("--vq", action="store_true", help="Use Vector Quantization instead of standard VAE")
     parser.add_argument("--vq_class", type=int, default=512, help="Number of VQ codebook classes")
@@ -591,6 +606,7 @@ if __name__ == "__main__":
     parser.add_argument("--camera_names", nargs="*", default=["left_frame", "right_frame"])
     parser.add_argument("--use_augmentation", action="store_true", help="Enable data augmentation for images")
     parser.add_argument("--image_size", type=int, default=224, help="Image size for augmentation")
+    parser.add_argument("--use_episodic_sampling", action="store_true", help="Use episodic sampling mode (similar to EpisodicDataset): traverse run IDs, randomly sample stage, then start_ts. Default: single random mode (traverse all stage/run, randomly sample start_ts)")
 
     parser.add_argument("--task_config", type=json.loads, default=None)
     parser.add_argument("--log_every", type=int, default=1)
@@ -598,6 +614,7 @@ if __name__ == "__main__":
     # Image encoder training control
     parser.add_argument("--train_image_encoder", action="store_true", help="Enable training of the image encoder (default: frozen)")
     parser.add_argument("--lr_backbone", type=float, default=1e-5, help="Learning rate for image encoder backbone (only used if --train_image_encoder is set)")
+    parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for AdamW optimizer")
     
     # Best model selection metric
     parser.add_argument(
@@ -607,6 +624,7 @@ if __name__ == "__main__":
         choices=["total_loss", "l1_loss"],
         help="Metric for selecting best model: 'total_loss' (default, l1 + kl_weight * kl) or 'l1_loss' (action prediction accuracy only)"
     )
+    parser.add_argument("--constant_lr", action="store_true", help="Disable learning rate scheduler and keep LR constant")
 
     args = parser.parse_args()
     main(vars(args))

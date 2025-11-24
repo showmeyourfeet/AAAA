@@ -30,6 +30,19 @@ CROP_TOP = True
 FILTER_MISTAKES = True
 
 
+def _infer_state_dim_from_stats(norm_stats: Dict[str, np.ndarray]) -> int:
+    """Infer qpos/state dimension from normalization stats."""
+    for key in ("example_qpos", "qpos_mean", "state_mean"):
+        value = norm_stats.get(key)
+        if value is not None:
+            arr = np.asarray(value).reshape(-1)
+            return int(arr.shape[0])
+    action_mean = norm_stats.get("action_mean")
+    if action_mean is not None:
+        return int(np.asarray(action_mean).reshape(-1).shape[0])
+    raise ValueError("Unable to infer state dimension from normalization stats.")
+
+
 class ImagePreprocessor:
     """Image preprocessor with data augmentation support.
     
@@ -137,7 +150,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
         dataset_dir: str,
         camera_names: Sequence[str],
         norm_stats: Dict[str, np.ndarray],
-        max_len: int | None = None,
+        max_len: int,
         command_list: Sequence[str] | None = None,
         use_language: bool = False,
         language_encoder: str | None = None,
@@ -145,6 +158,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
         use_augmentation: bool = False,
         image_size: int = 224,
         training: bool = True,
+        use_state: bool = True,
     ) -> None:
         super().__init__()
         episode_ids = list(episode_ids)
@@ -162,6 +176,9 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.image_size = image_size
         self.training = training
         self.transformations = None
+        self.use_state = use_state
+        self.state_dim = _infer_state_dim_from_stats(norm_stats)
+        self._zero_state = torch.zeros(self.state_dim, dtype=torch.float32)
 
         # Initialize ImagePreprocessor if augmentation is enabled
         if self.use_augmentation:
@@ -254,7 +271,10 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 start_ts = np.random.choice(original_action_shape[0])
                 end_ts = original_action_shape[0] - 1
 
-            qpos = root["/observations/qpos"][start_ts]
+            if self.use_state:
+                qpos = root["/observations/qpos"][start_ts]
+            else:
+                qpos = None
 
             image_dict = {}
             for cam_name in self.camera_names:
@@ -324,7 +344,14 @@ class EpisodicDataset(torch.utils.data.Dataset):
 
             action_data = torch.from_numpy(padded_action).float()
             is_pad = torch.from_numpy(is_pad).bool()
-            qpos_data = torch.from_numpy(qpos).float()
+            if self.use_state and qpos is not None:
+                qpos_data = torch.from_numpy(qpos).float()
+                qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats[
+                    "qpos_std"
+                ]
+                qpos_data = qpos_data.float()
+            else:
+                qpos_data = self._zero_state.clone()
 
             if self.policy_class == "Diffusion":
                 action_data = (
@@ -338,10 +365,6 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 action_data = (
                     action_data - self.norm_stats["action_mean"]
                 ) / self.norm_stats["action_std"]
-
-            qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats[
-                "qpos_std"
-            ]
 
             if self.use_language:
                 assert command_embedding is not None
@@ -392,19 +415,26 @@ def get_norm_stats(
 
 
 class SplittedEpisodicDataset(torch.utils.data.Dataset):
-    """Dataset adapter for stage/run-style datasets."""
+    """Dataset adapter for stage/run-style datasets.
+    
+    Supports two sampling modes:
+    1. Single random (default): Traverse all stage/run combinations, randomly sample start_ts
+    2. Episodic sampling: Traverse run IDs (episodes), randomly sample stage (segment), then start_ts
+    """
 
     def __init__(
         self,
         root_dir: str,
         camera_names: Sequence[str],
         norm_stats: Dict[str, np.ndarray],
-        max_len: int,
+        max_len: int | None = None,
         use_language: bool = False,
         stage_embeddings: Dict[int, Sequence[float]] | None = None,
         image_size: int = 224,
         use_augmentation: bool = False,
         training: bool = True,
+        use_episodic_sampling: bool = False,
+        use_state: bool = True,
     ) -> None:
         super().__init__()
         self.root_dir = root_dir
@@ -416,6 +446,10 @@ class SplittedEpisodicDataset(torch.utils.data.Dataset):
         self.image_size = image_size
         self.use_augmentation = use_augmentation
         self.training = training
+        self.use_episodic_sampling = use_episodic_sampling
+        self.use_state = use_state
+        self.state_dim = _infer_state_dim_from_stats(norm_stats)
+        self._zero_state = torch.zeros(self.state_dim, dtype=torch.float32)
         
         # Initialize ImagePreprocessor if augmentation is enabled
         if self.use_augmentation:
@@ -424,7 +458,8 @@ class SplittedEpisodicDataset(torch.utils.data.Dataset):
                 use_augmentation=use_augmentation
             )
 
-        self.runs: list[Tuple[int, str]] = []
+        # Collect all runs
+        all_runs: list[Tuple[int, str]] = []
         for stage_dir in sorted(os.listdir(root_dir)):
             stage_path = os.path.join(root_dir, stage_dir)
             if not (stage_dir.startswith("stage") and os.path.isdir(stage_path)):
@@ -436,15 +471,51 @@ class SplittedEpisodicDataset(torch.utils.data.Dataset):
             for run_dir in sorted(os.listdir(stage_path)):
                 run_path = os.path.join(stage_path, run_dir)
                 if run_dir.startswith("run") and os.path.isdir(run_path):
-                    self.runs.append((stage_idx, run_path))
+                    all_runs.append((stage_idx, run_path))
 
-        if len(self.runs) == 0:
+        if len(all_runs) == 0:
             print(f"[SplittedEpisodicDataset] No runs found under {root_dir}")
+
+        if self.use_episodic_sampling:
+            # Group runs by run ID (episode level)
+            # Extract run_id from run_path, e.g., "stage1/run_001" -> run_id = 1
+            self.runs_by_episode: Dict[int, list[Tuple[int, str]]] = {}
+            for stage_idx, run_path in all_runs:
+                # Extract run number from path like "stage1/run_001" or "stage1/run001"
+                run_dir = os.path.basename(run_path)
+                # Try to extract number from "run_001", "run001", "run_1", "run1", etc.
+                match = re.search(r"run[_\s]*(\d+)", run_dir, re.IGNORECASE)
+                if match:
+                    run_id = int(match.group(1))
+                    if run_id not in self.runs_by_episode:
+                        self.runs_by_episode[run_id] = []
+                    self.runs_by_episode[run_id].append((stage_idx, run_path))
+            
+            # Sort by stage_idx within each episode
+            for run_id in self.runs_by_episode:
+                self.runs_by_episode[run_id].sort(key=lambda x: x[0])
+            
+            # Episode IDs are the run IDs
+            self.episode_ids = sorted(self.runs_by_episode.keys())
+            if len(self.episode_ids) == 0:
+                print(f"[SplittedEpisodicDataset] Warning: No valid run IDs found. Falling back to single random mode.")
+                self.use_episodic_sampling = False
+                self.runs = all_runs
+            else:
+                print(f"[SplittedEpisodicDataset] Episodic sampling mode: {len(self.episode_ids)} episodes (run IDs)")
+        else:
+            # Single random mode: flat list of all stage/run combinations
+            self.runs = all_runs
+            self.runs_by_episode = None
+            self.episode_ids = None
 
         self.to_tensor = transforms.ToTensor()
 
     def __len__(self) -> int:
-        return len(self.runs)
+        if self.use_episodic_sampling:
+            return len(self.episode_ids)
+        else:
+            return len(self.runs)
 
     def _parse_run(self, run_path: str):
         data_file = os.path.join(run_path, "data.txt")
@@ -486,25 +557,40 @@ class SplittedEpisodicDataset(torch.utils.data.Dataset):
         return labels, np.stack(actions) if actions else None, np.stack(qpos) if qpos else None
 
     def __getitem__(self, index: int):
-        stage_idx, run_path = self.runs[index]
+        if self.use_episodic_sampling:
+            # Episodic sampling mode: similar to EpisodicDataset
+            # 1. Get episode (run_id) from index
+            run_id = self.episode_ids[index]
+            # 2. Randomly select a stage (segment) from this episode
+            available_stages = self.runs_by_episode[run_id]
+            if len(available_stages) == 0:
+                raise ValueError(f"No stages found for run_id {run_id}")
+            stage_idx, run_path = random.choice(available_stages)
+        else:
+            # Single random mode: directly get stage/run from index
+            stage_idx, run_path = self.runs[index]
+        
         labels, actions_np, qpos_np = self._parse_run(run_path)
 
         if actions_np is None or len(actions_np) < 2:
-            actions_np = np.zeros(
-                (self.max_len, self.norm_stats["action_mean"].shape[0]),
-                dtype=np.float32,
-            )
-            qpos_np = np.zeros(
-                (self.max_len, self.norm_stats["qpos_mean"].shape[0]),
-                dtype=np.float32,
-            )
-            start_ts, end_ts = 0, min(self.max_len - 1, actions_np.shape[0] - 1)
+            act_dim = self.norm_stats["action_mean"].shape[0]
+            qpos_dim = self.norm_stats["qpos_mean"].shape[0]
+            actions_np = np.zeros((self.max_len, act_dim), dtype=np.float32)
+            qpos_np = np.zeros((self.max_len, qpos_dim), dtype=np.float32)
+            T = self.max_len
         else:
             T = actions_np.shape[0]
-            start_ts = np.random.randint(0, max(1, T - 1))
-            end_ts = min(T - 1, start_ts + self.max_len - 1)
 
-        qpos = qpos_np[start_ts]
+        # 3. Randomly select start_ts within the selected stage/run
+        start_ts = np.random.randint(0, T)
+        chunk_len = min(self.max_len, T - start_ts)
+        end_ts = start_ts + max(chunk_len - 1, 0)
+        pad_length = self.max_len
+
+        if self.use_state and qpos_np is not None:
+            qpos = qpos_np[start_ts]
+        else:
+            qpos = None
 
         current_images = []
         for cam in self.camera_names:
@@ -531,11 +617,9 @@ class SplittedEpisodicDataset(torch.utils.data.Dataset):
 
         action_slice = actions_np[start_ts : end_ts + 1]
         action_len = action_slice.shape[0]
-        padded_action = np.zeros(
-            (self.max_len, action_slice.shape[1]), dtype=np.float32
-        )
+        padded_action = np.zeros((pad_length, action_slice.shape[1]), dtype=np.float32)
         padded_action[:action_len] = action_slice
-        is_pad = np.zeros(self.max_len, dtype=np.bool_)
+        is_pad = np.zeros(pad_length, dtype=np.bool_)
         is_pad[action_len:] = True
 
         action_data = torch.from_numpy(padded_action).float()
@@ -543,10 +627,13 @@ class SplittedEpisodicDataset(torch.utils.data.Dataset):
             action_data - torch.from_numpy(self.norm_stats["action_mean"]).float()
         ) / torch.from_numpy(self.norm_stats["action_std"]).float()
 
-        qpos_data = torch.from_numpy(qpos).float()
-        qpos_data = (
-            qpos_data - torch.from_numpy(self.norm_stats["qpos_mean"]).float()
-        ) / torch.from_numpy(self.norm_stats["qpos_std"]).float()
+        if self.use_state and qpos is not None:
+            qpos_data = torch.from_numpy(qpos).float()
+            qpos_data = (
+                qpos_data - torch.from_numpy(self.norm_stats["qpos_mean"]).float()
+            ) / torch.from_numpy(self.norm_stats["qpos_std"]).float()
+        else:
+            qpos_data = self._zero_state.clone()
         is_pad = torch.from_numpy(is_pad).bool()
 
         if self.use_language:
@@ -622,6 +709,8 @@ def load_splitted_data(
     stage_embeddings_file: str | None = None,
     use_augmentation: bool = False,
     image_size: int = 224,
+    use_episodic_sampling: bool = False,
+    use_state: bool = True,
 ):
     stage_embeddings = None
     if use_language and stage_embeddings_file and os.path.exists(stage_embeddings_file):
@@ -645,6 +734,8 @@ def load_splitted_data(
         image_size=image_size,
         use_augmentation=use_augmentation,
         training=True,
+        use_episodic_sampling=use_episodic_sampling,
+        use_state=use_state,
     )
     train_dataloader = DataLoader(
         dataset,
@@ -671,6 +762,7 @@ def load_merged_data(
     policy_class: str | None = None,
     use_augmentation: bool = False,
     image_size: int = 224,
+    use_state: bool = True,
 ):
     if dagger_ratio is not None:
         assert 0 <= dagger_ratio <= 1, "dagger_ratio must be between 0 and 1"
@@ -728,6 +820,7 @@ def load_merged_data(
             use_augmentation=use_augmentation,
             image_size=image_size,
             training=True,
+            use_state=use_state,
         )
         for dataset_dir in dataset_dirs
     ]
