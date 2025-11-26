@@ -159,12 +159,12 @@ class Transformer(nn.Module):
             additional_pos_embed = additional_pos_embed.unsqueeze(1).repeat(1, bs, 1)
             pos_embed = torch.cat([additional_pos_embed, pos_embed], axis=0)
 
+            special_inputs = [latent_input]
+            if proprio_input is not None:
+                special_inputs.append(proprio_input)
             if command_embedding is not None:
-                addition_input = torch.stack(
-                    [latent_input, proprio_input, command_embedding], axis=0
-                )
-            else:
-                addition_input = torch.stack([latent_input, proprio_input], axis=0)
+                special_inputs.append(command_embedding)
+            addition_input = torch.stack(special_inputs, axis=0)
 
             src = torch.cat([addition_input, src], axis=0)
 
