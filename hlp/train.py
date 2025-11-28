@@ -489,6 +489,8 @@ if __name__ == "__main__":
     parser.add_argument('--camera_names', nargs='+', type=str, default=['left_frame','right_frame'], help='Camera names')
     # Image encoder training control
     parser.add_argument('--train_image_encoder', action='store_true', help='Enable training of the image encoder (default: frozen)')
+    parser.add_argument('--save_ckpt_every', type=int, default=100,
+                        help='Interval size for saving the best checkpoint within each interval [i*n, (i+1)*n) based on val loss (default: 100)')
 
     args = parser.parse_args()
 
@@ -768,7 +770,12 @@ if __name__ == "__main__":
         exit()
 
     # Start training from loaded or initial state
-    
+    save_ckpt_every = args.save_ckpt_every
+    interval_best_val = float('inf')
+    interval_best_epoch = -1
+    interval_best_ckpt_path = None
+    current_interval_idx = None
+
     logger.info(f"Starting training from epoch {latest_idx} to {args.num_epochs}")
     
     pbar_epochs = tqdm(range(latest_idx, args.num_epochs), desc="Epochs", leave=True)
@@ -817,14 +824,10 @@ if __name__ == "__main__":
 
         # Logging in unified format (compatible with llp/train.py)
         if logger:
-            # Main training loss line
-            logger.info(f"Train loss: {train_loss:.5f}")
-            
-            # Detailed metrics line with learning rate
-            logger.info(f"loss: {train_loss:.5f} lr: {current_lr:.5e}")
-            
+            logger.info(f"Epoch {epoch}: Train loss: {train_loss:.5f}")
+            logger.info(f"epoch: {epoch} loss: {train_loss:.5f} lr: {current_lr:.5e}")
             if val_loss is not None:
-                logger.info(f"Val loss: {val_loss:.5f}")
+                logger.info(f"Epoch {epoch}: Val loss: {val_loss:.5f}")
         else:
             tqdm.write(f"Train loss: {train_loss:.5f}" + 
                       (f", Val loss: {val_loss:.5f}" if val_loss is not None else ""))
@@ -846,6 +849,48 @@ if __name__ == "__main__":
             }, best_ckpt_path)
             logger.info(f"✓ New best model! Epoch {epoch}: Val loss = {best_val_loss:.5f} -> {best_ckpt_path}")
 
+        # Interval-based best checkpoint saving (based on val_loss)
+        if val_loss is not None:
+            this_interval_idx = epoch // save_ckpt_every
+            if current_interval_idx is None or this_interval_idx != current_interval_idx:
+                interval_best_val = float('inf')
+                interval_best_epoch = -1
+                if interval_best_ckpt_path and os.path.exists(interval_best_ckpt_path):
+                    # keep the best checkpoint from previous interval; no deletion
+                    pass
+                interval_best_ckpt_path = None
+                current_interval_idx = this_interval_idx
+
+            if val_loss < interval_best_val:
+                interval_best_val = val_loss
+                if interval_best_ckpt_path and os.path.exists(interval_best_ckpt_path):
+                    os.remove(interval_best_ckpt_path)
+                    if logger:
+                        logger.info(f"Deleted old interval checkpoint: {interval_best_ckpt_path}")
+                interval_best_epoch = epoch
+                interval_start = this_interval_idx * save_ckpt_every
+                interval_end = (this_interval_idx + 1) * save_ckpt_every
+                interval_best_ckpt_path = os.path.join(
+                    ckpt_dir, f"interval_{this_interval_idx}_epoch_{epoch}_best.ckpt"
+                )
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'epoch': epoch,
+                    'val_loss': val_loss,
+                }, interval_best_ckpt_path)
+                if logger:
+                    logger.info(
+                        f"Saved interval [{interval_start}-{interval_end}) best checkpoint "
+                        f"(epoch {epoch}, val_loss: {val_loss:.5f}) to {interval_best_ckpt_path}"
+                    )
+                else:
+                    tqdm.write(
+                        f"Saved interval [{interval_start}-{interval_end}) best checkpoint "
+                        f"(epoch {epoch}, val_loss: {val_loss:.5f})"
+                    )
+
         # Save latest checkpoint every epoch (rolling backup)
         # This allows resuming from any epoch, not just multiples of 100
         latest_ckpt_path = os.path.join(ckpt_dir, "latest_checkpoint.ckpt")
@@ -859,7 +904,6 @@ if __name__ == "__main__":
         }, latest_ckpt_path)
 
         # Save a checkpoint every 100 epochs
-        save_ckpt_every = 100
         if epoch % save_ckpt_every == 0 and epoch > 0:
             ckpt_path = os.path.join(ckpt_dir, f"epoch_{epoch}.ckpt")
             torch.save({

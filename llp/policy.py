@@ -57,7 +57,15 @@ class ACTPolicy(nn.Module):
                 loss_dict["vq_discrepancy"] = F.l1_loss(probs, binaries, reduction="mean")
             
             all_l1 = F.l1_loss(actions, a_hat, reduction="none")
-            l1 = (all_l1 * ~is_pad.unsqueeze(-1)).mean()
+
+            # l1 = (all_l1 * ~is_pad.unsqueeze(-1)).mean()
+            mask = (~is_pad).unsqueeze(-1) # [batch, seq, 1]
+            # valid should count all valid action dimensions, not just time steps
+            # mask.sum() gives number of valid time steps, but each time step has action_dim elements
+            action_dim = actions.shape[-1]
+            valid = mask.sum() * action_dim  # total number of valid (non-padded) action elements
+            l1 = (all_l1 * mask).sum() / valid.clamp(min=1) 
+
             loss_dict["l1"] = l1
             loss_dict["kl"] = total_kld[0]
             loss_dict["loss"] = loss_dict["l1"] + loss_dict["kl"] * self.kl_weight

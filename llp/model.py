@@ -311,7 +311,7 @@ class DETRVAE(nn.Module):
             if self.use_state:
                 if self.input_proj_robot_state is None or self.input_proj_robot_state.in_features != qpos.shape[-1]:
                     self.input_proj_robot_state = nn.Linear(qpos.shape[-1], self.hidden_dim).to(qpos.device)
-            proprio_input = self.input_proj_robot_state(qpos)
+                proprio_input = self.input_proj_robot_state(qpos)
             src = torch.cat(all_cam_features, axis=3)
             pos = torch.cat(all_cam_pos, axis=3)
             command_embedding_to_append = command_embedding_proj if self.use_language else None

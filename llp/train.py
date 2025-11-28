@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import logging
 import os
@@ -27,6 +28,8 @@ try:
         detach_dict,
         is_multi_gpu_checkpoint,
         set_seed,
+        load_data,
+        load_data_srt,
     )
 except ImportError:
     # When run as a script: python path/to/act_refactor/train.py
@@ -45,6 +48,8 @@ except ImportError:
         detach_dict,
         is_multi_gpu_checkpoint,
         set_seed,
+        load_data,
+        load_data_srt,
     )
 
 
@@ -67,6 +72,31 @@ def infer_state_dim_from_checkpoint(model_state_dict: Dict[str, torch.Tensor]):
             if len(weight_shape) == 2:
                 return weight_shape[0]
     return None
+
+
+def count_parameters(model: torch.nn.Module):
+    """
+    Count the number of parameters in a model.
+    
+    Returns:
+        tuple: (total_params, trainable_params, non_trainable_params)
+    """
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    non_trainable_params = total_params - trainable_params
+    return total_params, trainable_params, non_trainable_params
+
+
+def format_number(num: int) -> str:
+    """Format large numbers with K, M, B suffixes."""
+    if num >= 1_000_000_000:
+        return f"{num / 1_000_000_000:.2f}B"
+    elif num >= 1_000_000:
+        return f"{num / 1_000_000:.2f}M"
+    elif num >= 1_000:
+        return f"{num / 1_000:.2f}K"
+    else:
+        return str(num)
 
 
 def make_policy(policy_config: Dict) -> ACTPolicy:
@@ -101,17 +131,17 @@ def make_scheduler(optimizer: torch.optim.Optimizer, num_steps: int) -> LambdaLR
     )
 
 
-def forward_pass(data, policy: ACTPolicy):
+def forward_pass(data, policy: ACTPolicy, device: torch.device):
     if len(data) == 5:
         image_data, qpos_data, action_data, is_pad, command_embedding = data
-        command_embedding = command_embedding.cuda()
+        command_embedding = command_embedding.to(device)
     else:
         image_data, qpos_data, action_data, is_pad = data
         command_embedding = None
-    image_data = image_data.cuda()
-    qpos_data = qpos_data.cuda()
-    action_data = action_data.cuda()
-    is_pad = is_pad.cuda()
+    image_data = image_data.to(device)
+    qpos_data = qpos_data.to(device)
+    action_data = action_data.to(device)
+    is_pad = is_pad.to(device)
     return policy(qpos_data, image_data, action_data, is_pad, command_embedding)
 
 
@@ -125,6 +155,7 @@ def train_bc(
     ckpt_dir = config["ckpt_dir"]
     seed = config["seed"]
     log_every = config.get("log_every", 1)
+    device = config.get("device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
     policy_config = config["policy_config"]
 
@@ -196,7 +227,37 @@ def train_bc(
     else:
         start_epoch = 0
 
-    policy.cuda()
+    policy.to(device)
+    
+    # Print model parameter count
+    total_params, trainable_params, non_trainable_params = count_parameters(policy)
+    param_info = (
+        f"Model Parameters:\n"
+        f"  Total: {total_params:,} ({format_number(total_params)})\n"
+        f"  Trainable: {trainable_params:,} ({format_number(trainable_params)})\n"
+        f"  Non-trainable: {non_trainable_params:,} ({format_number(non_trainable_params)})"
+    )
+    if logger:
+        logger.info(param_info)
+    else:
+        print(param_info)
+    
+    # Print optimizer parameter groups info
+    optimizer_info_parts = ["Optimizer Parameter Groups:"]
+    for i, param_group in enumerate(optimizer.param_groups):
+        group_params = sum(p.numel() for p in param_group['params'])
+        lr = param_group.get('lr', 'N/A')
+        weight_decay = param_group.get('weight_decay', 'N/A')
+        optimizer_info_parts.append(
+            f"  Group {i}: {group_params:,} params ({format_number(group_params)}), "
+            f"lr={lr}, weight_decay={weight_decay}"
+        )
+    optimizer_info = "\n".join(optimizer_info_parts)
+    if logger:
+        logger.info(optimizer_info)
+    else:
+        print(optimizer_info)
+    
     best_model_metric = config.get("best_model_metric", "total_loss")  # "total_loss" or "l1_loss"
     best_val = float("inf")
     best_ckpt_path = None
@@ -231,6 +292,18 @@ def train_bc(
     else:
         print(f"Best model selection metric: {best_model_metric}")
     
+    # Interval-based checkpoint tracking
+    save_ckpt_every = config.get("save_ckpt_every", 100)
+    disable_latest_checkpoint = config.get("disable_latest_checkpoint", False)
+    interval_best_val_l1 = float("inf")
+    interval_best_epoch = -1
+    current_interval_start = start_epoch
+    # Store best model state in GPU memory (will be written at interval end)
+    interval_best_state = None
+    interval_best_interval_idx = -1
+    # Store global best model state in GPU memory (will be written at training end)
+    global_best_state = None
+    
     train_history: List[Dict[str, torch.Tensor]] = []
 
     epoch_bar = trange(start_epoch, num_epochs, desc="Epochs", leave=True)
@@ -239,12 +312,15 @@ def train_bc(
         optimizer.zero_grad()
         batch_bar = tqdm(train_dataloader, desc=f"Train {epoch}", leave=False)
         for batch_idx, data in enumerate(batch_bar):
-            forward_dict = forward_pass(data, policy)
+            forward_dict = forward_pass(data, policy, device)
             loss = forward_dict["loss"]
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
-            train_history.append(detach_dict(forward_dict))
+            # Record epoch in training history for traceability
+            history_entry = detach_dict(forward_dict)
+            history_entry["epoch"] = torch.tensor(epoch, dtype=torch.long)
+            train_history.append(history_entry)
             if "l1" in forward_dict:
                 batch_bar.set_postfix(
                     {
@@ -272,6 +348,9 @@ def train_bc(
                 value = float(v.item()) if hasattr(v, "item") else float(v)
                 if k == "lr":
                     summary_parts.append(f"{k}: {value:.5e}")
+                elif k == "epoch":
+                    # epoch should be displayed as integer
+                    summary_parts.append(f"{k}: {int(value)}")
                 else:
                     summary_parts.append(f"{k}: {value:.5f}")
             summary_string = " ".join(summary_parts)
@@ -287,7 +366,7 @@ def train_bc(
             with torch.inference_mode():
                 val_bar = tqdm(val_dataloader, desc=f"Val {epoch}", leave=False)
                 for data in val_bar:
-                    forward_dict = forward_pass(data, policy)
+                    forward_dict = forward_pass(data, policy, device)
                     val_losses.append(forward_dict["loss"].item())
                     if "l1" in forward_dict:
                         val_l1_losses.append(forward_dict["l1"].item())
@@ -307,6 +386,7 @@ def train_bc(
                     tqdm.write(f"Val l1: {val_l1:.5f}")
             
             # Select best model based on chosen metric
+            # Store best model state in GPU memory (will be written at training end)
             if best_model_metric == "l1_loss":
                 # Use l1 loss for best model selection
                 if val_l1 is None:
@@ -318,98 +398,207 @@ def train_bc(
                     # Fall back to total loss for this epoch
                     if val_loss < best_val:
                         best_val = val_loss
-                        best_ckpt_path = os.path.join(ckpt_dir, f"policy_best_seed_{seed}.ckpt")
-                        save_dict = {
+                        global_best_state = {
                             "model_state_dict": policy.serialize(),
                             "optimizer_state_dict": optimizer.state_dict(),
-                            "scheduler_state_dict": scheduler.state_dict(),
+                            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
                             "epoch": epoch,
                             "best_val": best_val,
                         }
-                        torch.save(save_dict, best_ckpt_path)
                         if logger:
-                            logger.info(f"Saved best checkpoint (Total: {best_val:.5f}, no L1 available) to {best_ckpt_path}")
+                            logger.info(f"New best model (Total: {best_val:.5f}, no L1 available) - stored in GPU memory")
                         else:
-                            tqdm.write(f"Saved best checkpoint (Total: {best_val:.5f}, no L1 available) to {best_ckpt_path}")
+                            tqdm.write(f"New best model (Total: {best_val:.5f}, no L1 available) - stored in GPU memory")
                 elif val_l1 < best_val:
                     best_val = val_l1
-                    best_ckpt_path = os.path.join(ckpt_dir, f"policy_best_seed_{seed}.ckpt")
-                    torch.save(
-                        {
-                            "model_state_dict": policy.serialize(),
-                            "optimizer_state_dict": optimizer.state_dict(),
-                            "scheduler_state_dict": scheduler.state_dict(),
-                            "epoch": epoch,
-                            "best_val": best_val,
-                            "best_val_total_loss": val_loss,  # Also save total loss for reference
-                        },
-                        best_ckpt_path,
-                    )
+                    global_best_state = {
+                        "model_state_dict": policy.serialize(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+                        "epoch": epoch,
+                        "best_val": best_val,
+                        "best_val_total_loss": val_loss,  # Also save total loss for reference
+                    }
                     if logger:
-                        logger.info(f"Saved best checkpoint (L1: {best_val:.5f}, Total: {val_loss:.5f}) to {best_ckpt_path}")
+                        logger.info(f"New best model (L1: {best_val:.5f}, Total: {val_loss:.5f}) - stored in GPU memory")
                     else:
-                        tqdm.write(f"Saved best checkpoint (L1: {best_val:.5f}, Total: {val_loss:.5f}) to {best_ckpt_path}")
+                        tqdm.write(f"New best model (L1: {best_val:.5f}, Total: {val_loss:.5f}) - stored in GPU memory")
             else:
                 # Use total loss for best model selection (default)
                 if val_loss < best_val:
                     best_val = val_loss
-                    best_ckpt_path = os.path.join(ckpt_dir, f"policy_best_seed_{seed}.ckpt")
-                    save_dict = {
+                    global_best_state = {
                         "model_state_dict": policy.serialize(),
                         "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
                         "epoch": epoch,
                         "best_val": best_val,
                     }
-                    if scheduler is not None:
-                        save_dict["scheduler_state_dict"] = scheduler.state_dict()
                     if val_l1 is not None:
-                        save_dict["best_val_l1"] = val_l1  # Also save l1 loss for reference
-                    torch.save(save_dict, best_ckpt_path)
+                        global_best_state["best_val_l1"] = val_l1  # Also save l1 loss for reference
                     if logger:
                         if val_l1 is not None:
-                            logger.info(f"Saved best checkpoint (Total: {best_val:.5f}, L1: {val_l1:.5f}) to {best_ckpt_path}")
+                            logger.info(f"New best model (Total: {best_val:.5f}, L1: {val_l1:.5f}) - stored in GPU memory")
                         else:
-                            logger.info(f"Saved best checkpoint (Total: {best_val:.5f}) to {best_ckpt_path}")
+                            logger.info(f"New best model (Total: {best_val:.5f}) - stored in GPU memory")
                     else:
                         if val_l1 is not None:
-                            tqdm.write(f"Saved best checkpoint (Total: {best_val:.5f}, L1: {val_l1:.5f}) to {best_ckpt_path}")
+                            tqdm.write(f"New best model (Total: {best_val:.5f}, L1: {val_l1:.5f}) - stored in GPU memory")
                         else:
-                            tqdm.write(f"Saved best checkpoint (Total: {best_val:.5f}) to {best_ckpt_path}")
+                            tqdm.write(f"New best model (Total: {best_val:.5f}) - stored in GPU memory")
 
-        # Save latest checkpoint every epoch (rolling backup)
-        # This allows resuming from any epoch, not just multiples of 100
-        latest_ckpt_path = os.path.join(ckpt_dir, f"policy_latest_seed_{seed}.ckpt")
-        latest_payload = {
-            "model_state_dict": policy.serialize(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "epoch": epoch,
-            "best_val": best_val,
-        }
-        if scheduler is not None:
-            latest_payload["scheduler_state_dict"] = scheduler.state_dict()
-        torch.save(latest_payload, latest_ckpt_path)
-
-        save_ckpt_every = 100
-        if epoch % save_ckpt_every == 0 and epoch > 0:
-            ckpt_path_epoch = os.path.join(
-                ckpt_dir, f"policy_epoch_{epoch}_seed_{seed}.ckpt"
-            )
-            epoch_payload = {
+        # Save latest checkpoint every epoch (rolling backup) - optional
+        # This allows resuming from any epoch, not just multiples of save_ckpt_every
+        if not disable_latest_checkpoint:
+            latest_ckpt_path = os.path.join(ckpt_dir, f"policy_latest_seed_{seed}.ckpt")
+            latest_payload = {
                 "model_state_dict": policy.serialize(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "epoch": epoch,
+                "best_val": best_val,
             }
             if scheduler is not None:
-                epoch_payload["scheduler_state_dict"] = scheduler.state_dict()
-            torch.save(epoch_payload, ckpt_path_epoch)
-            # prune_epoch = epoch - save_ckpt_every
-            # if prune_epoch % 1000 != 0:
-            #     prune_path = os.path.join(
-            #         ckpt_dir, f"policy_epoch_{prune_epoch}_seed_{seed}.ckpt"
-            #     )
-            #     if os.path.exists(prune_path):
-            #         os.remove(prune_path)
+                latest_payload["scheduler_state_dict"] = scheduler.state_dict()
+            torch.save(latest_payload, latest_ckpt_path)
 
+        # Interval-based best checkpoint saving: store best model in GPU memory,
+        # write to disk only at interval end to reduce IO pressure
+        # Check if we've entered a new interval
+        current_interval_idx = (epoch - start_epoch) // save_ckpt_every
+        interval_start_epoch = start_epoch + current_interval_idx * save_ckpt_every
+        
+        if interval_start_epoch > current_interval_start:
+            # We've entered a new interval, write previous interval's best checkpoint to disk
+            if interval_best_state is not None and interval_best_epoch >= 0:
+                prev_interval_start = start_epoch + interval_best_interval_idx * save_ckpt_every
+                prev_interval_end = start_epoch + (interval_best_interval_idx + 1) * save_ckpt_every
+                prev_ckpt_path = os.path.join(
+                    ckpt_dir, f"policy_interval_{interval_best_interval_idx}_epoch_{interval_best_epoch}_best_seed_{seed}.ckpt"
+                )
+                # Prepare payload for saving (copy state dicts to avoid reference issues)
+                save_payload = {
+                    "model_state_dict": interval_best_state["model_state_dict"],
+                    "optimizer_state_dict": interval_best_state["optimizer_state_dict"],
+                    "epoch": interval_best_state["epoch"],
+                    "val_l1": interval_best_state.get("val_l1"),
+                    "val_loss": interval_best_state.get("val_loss"),
+                }
+                if interval_best_state.get("scheduler_state_dict") is not None:
+                    save_payload["scheduler_state_dict"] = interval_best_state["scheduler_state_dict"]
+                torch.save(save_payload, prev_ckpt_path)
+                val_l1_str = f"{interval_best_state.get('val_l1', 'N/A'):.5f}" if interval_best_state.get("val_l1") is not None else "N/A"
+                if logger:
+                    logger.info(
+                        f"Saved interval [{prev_interval_start}-{prev_interval_end}) "
+                        f"best checkpoint (epoch {interval_best_epoch}, val_l1: {val_l1_str}, val_loss: {interval_best_state.get('val_loss', 'N/A'):.5f}) "
+                        f"to {prev_ckpt_path}"
+                    )
+                else:
+                    tqdm.write(
+                        f"Saved interval [{prev_interval_start}-{prev_interval_end}) "
+                        f"best checkpoint (epoch {interval_best_epoch}, val_l1: {val_l1_str}, val_loss: {interval_best_state.get('val_loss', 'N/A'):.5f})"
+                    )
+            
+            # Reset for new interval
+            interval_best_val_l1 = float("inf")
+            interval_best_epoch = -1
+            interval_best_state = None
+            interval_best_interval_idx = -1
+            current_interval_start = interval_start_epoch
+        
+        # Update best checkpoint in current interval if validation is available
+        # Store state in GPU memory, will be written at interval end
+        if val_dataloader is not None:
+            # Use val_l1 if available, otherwise fall back to val_loss
+            current_val_metric = val_l1 if val_l1 is not None else val_loss
+            
+            if current_val_metric < interval_best_val_l1:
+                interval_best_val_l1 = current_val_metric
+                interval_best_epoch = epoch
+                interval_best_interval_idx = current_interval_idx
+                # Store best model state in GPU memory
+                interval_best_state = {
+                    "model_state_dict": policy.serialize(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+                    "epoch": epoch,
+                    "val_l1": val_l1 if val_l1 is not None else None,
+                    "val_loss": val_loss,
+                }
+                val_l1_str = f"{val_l1:.5f}" if val_l1 is not None else "N/A"
+                if logger:
+                    logger.info(
+                        f"New interval [{start_epoch + current_interval_idx * save_ckpt_every}-{start_epoch + (current_interval_idx + 1) * save_ckpt_every}) "
+                        f"best model (epoch {epoch}, val_l1: {val_l1_str}, val_loss: {val_loss:.5f}) - stored in GPU memory"
+                    )
+                else:
+                    tqdm.write(
+                        f"New interval [{start_epoch + current_interval_idx * save_ckpt_every}-{start_epoch + (current_interval_idx + 1) * save_ckpt_every}) "
+                        f"best model (epoch {epoch}, val_l1: {val_l1_str}, val_loss: {val_loss:.5f}) - stored in GPU memory"
+                    )
+
+    # Write the last interval's best checkpoint if it exists
+    if interval_best_state is not None and interval_best_epoch >= 0:
+        last_interval_start = start_epoch + interval_best_interval_idx * save_ckpt_every
+        last_interval_end = start_epoch + (interval_best_interval_idx + 1) * save_ckpt_every
+        last_ckpt_path = os.path.join(
+            ckpt_dir, f"policy_interval_{interval_best_interval_idx}_epoch_{interval_best_epoch}_best_seed_{seed}.ckpt"
+        )
+        save_payload = {
+            "model_state_dict": interval_best_state["model_state_dict"],
+            "optimizer_state_dict": interval_best_state["optimizer_state_dict"],
+            "epoch": interval_best_state["epoch"],
+            "val_l1": interval_best_state.get("val_l1"),
+            "val_loss": interval_best_state.get("val_loss"),
+        }
+        if interval_best_state.get("scheduler_state_dict") is not None:
+            save_payload["scheduler_state_dict"] = interval_best_state["scheduler_state_dict"]
+        torch.save(save_payload, last_ckpt_path)
+        val_l1_str = f"{interval_best_state.get('val_l1', 'N/A'):.5f}" if interval_best_state.get("val_l1") is not None else "N/A"
+        if logger:
+            logger.info(
+                f"Saved final interval [{last_interval_start}-{last_interval_end}) "
+                f"best checkpoint (epoch {interval_best_epoch}, val_l1: {val_l1_str}, val_loss: {interval_best_state.get('val_loss', 'N/A'):.5f}) "
+                f"to {last_ckpt_path}"
+            )
+        else:
+            tqdm.write(
+                f"Saved final interval [{last_interval_start}-{last_interval_end}) "
+                f"best checkpoint (epoch {interval_best_epoch}, val_l1: {val_l1_str}, val_loss: {interval_best_state.get('val_loss', 'N/A'):.5f})"
+            )
+    
+    # Write global best model checkpoint if it exists
+    if global_best_state is not None:
+        best_ckpt_path = os.path.join(ckpt_dir, f"policy_best_seed_{seed}.ckpt")
+        save_payload = {
+            "model_state_dict": global_best_state["model_state_dict"],
+            "optimizer_state_dict": global_best_state["optimizer_state_dict"],
+            "epoch": global_best_state["epoch"],
+            "best_val": global_best_state["best_val"],
+        }
+        if global_best_state.get("scheduler_state_dict") is not None:
+            save_payload["scheduler_state_dict"] = global_best_state["scheduler_state_dict"]
+        if "best_val_total_loss" in global_best_state:
+            save_payload["best_val_total_loss"] = global_best_state["best_val_total_loss"]
+        if "best_val_l1" in global_best_state:
+            save_payload["best_val_l1"] = global_best_state["best_val_l1"]
+        torch.save(save_payload, best_ckpt_path)
+        if logger:
+            if "best_val_total_loss" in global_best_state:
+                logger.info(f"Saved global best checkpoint (L1: {global_best_state['best_val']:.5f}, Total: {global_best_state['best_val_total_loss']:.5f}) to {best_ckpt_path}")
+            elif "best_val_l1" in global_best_state:
+                logger.info(f"Saved global best checkpoint (Total: {global_best_state['best_val']:.5f}, L1: {global_best_state['best_val_l1']:.5f}) to {best_ckpt_path}")
+            else:
+                logger.info(f"Saved global best checkpoint (Total: {global_best_state['best_val']:.5f}) to {best_ckpt_path}")
+        else:
+            if "best_val_total_loss" in global_best_state:
+                tqdm.write(f"Saved global best checkpoint (L1: {global_best_state['best_val']:.5f}, Total: {global_best_state['best_val_total_loss']:.5f}) to {best_ckpt_path}")
+            elif "best_val_l1" in global_best_state:
+                tqdm.write(f"Saved global best checkpoint (Total: {global_best_state['best_val']:.5f}, L1: {global_best_state['best_val_l1']:.5f}) to {best_ckpt_path}")
+            else:
+                tqdm.write(f"Saved global best checkpoint (Total: {global_best_state['best_val']:.5f}) to {best_ckpt_path}")
+    
+    # Save final checkpoint (last epoch state)
     ckpt_path_final = os.path.join(ckpt_dir, "policy_last.ckpt")
     final_payload = {
         "model_state_dict": policy.serialize(),
@@ -426,6 +615,17 @@ def train_bc(
 def main(args: Dict):
     set_seed(args["seed"])
 
+    # Setup device
+    gpu_id = args.get("gpu", None)
+    if gpu_id is not None:
+        if not torch.cuda.is_available():
+            raise ValueError(f"CUDA is not available, but --gpu {gpu_id} was specified")
+        if gpu_id < 0 or gpu_id >= torch.cuda.device_count():
+            raise ValueError(f"Invalid GPU ID {gpu_id}. Available GPUs: 0-{torch.cuda.device_count() - 1}")
+        device = torch.device(f"cuda:{gpu_id}")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     ckpt_dir = args["ckpt_dir"]
     os.makedirs(ckpt_dir, exist_ok=True)
 
@@ -441,6 +641,11 @@ def main(args: Dict):
         fh.setLevel(logging.INFO)
         fh.setFormatter(formatter)
         logger.addHandler(fh)
+    
+    # Log device information
+    logger.info(f"Using device: {device}")
+    if device.type == "cuda":
+        logger.info(f"GPU {device.index}: {torch.cuda.get_device_name(device.index)}")
 
     use_language = args["use_language"]
     language_encoder = args["language_encoder"]
@@ -455,7 +660,66 @@ def main(args: Dict):
     splitted_root = args.get("splitted_root")
     stage_embeddings_file = args.get("stage_embeddings_file")
 
-    if use_splitted:
+    # Simple HDF5 episodic dataset interface (EpisodicDataset / SRTDataset in llp.utils)
+    dataset_dir = args.get("dataset_dir")
+    num_episodes = args.get("num_episodes")
+    hdf5_use_srt = args.get("hdf5_use_srt", False)
+    val_batch_size = args.get("val_batch_size") or args["batch_size"]
+    train_ratio = args.get("train_ratio", 0.8)
+
+    if dataset_dir is not None:
+        # Auto-detect num_episodes if not provided
+        if num_episodes is None:
+            # Find all episode_*.hdf5 files and get the maximum episode ID
+            episode_files = glob.glob(os.path.join(dataset_dir, "episode_*.hdf5"))
+            if not episode_files:
+                raise ValueError(f"No episode_*.hdf5 files found in {dataset_dir}")
+            # Extract episode IDs and find max
+            episode_ids = []
+            for f in episode_files:
+                try:
+                    # Extract number from "episode_123.hdf5"
+                    basename = os.path.basename(f)
+                    ep_id = int(basename.split("_")[1].split(".")[0])
+                    episode_ids.append(ep_id)
+                except (ValueError, IndexError):
+                    continue
+            if not episode_ids:
+                raise ValueError(f"Could not parse episode IDs from files in {dataset_dir}")
+            # num_episodes should be max_id + 1 (assuming IDs start from 0)
+            num_episodes = max(episode_ids) + 1
+            if logger:
+                logger.info(f"Auto-detected num_episodes={num_episodes} from {dataset_dir}")
+            else:
+                print(f"Auto-detected num_episodes={num_episodes} from {dataset_dir}")
+        
+        # Directly load from a directory of episode_*.hdf5 files
+        camera_names = args.get("camera_names", ["left_frame", "right_frame"])
+        if hdf5_use_srt:
+            train_dataloader, val_dataloader, stats, _ = load_data_srt(
+                dataset_dir=dataset_dir,
+                num_episodes=num_episodes,
+                camera_names=camera_names,
+                batch_size_train=args["batch_size"],
+                batch_size_val=val_batch_size,
+                use_augmentation=args.get("use_augmentation", False),
+                augment_same_on_all=True,
+                train_ratio=train_ratio,
+            )
+        else:
+            train_dataloader, val_dataloader, stats, _ = load_data(
+                dataset_dir=dataset_dir,
+                num_episodes=num_episodes,
+                camera_names=camera_names,
+                batch_size_train=args["batch_size"],
+                batch_size_val=val_batch_size,
+                train_ratio=train_ratio,
+            )
+        # For simple episodic datasets we don't use explicit max_episode_len here;
+        # chunk_size still controls the number of queries.
+        max_episode_len = args.get("chunk_size", 30)
+
+    elif use_splitted:
         if not splitted_root:
             raise ValueError("--splitted_root must be provided when --use_splitted is set")
         camera_names = args.get("camera_names", ["left_frame", "right_frame"])
@@ -570,6 +834,9 @@ def main(args: Dict):
         "log_every": args.get("log_every", 1),
         "best_model_metric": args.get("best_model_metric", "total_loss"),
         "constant_lr": args.get("constant_lr", False),
+        "save_ckpt_every": args.get("save_ckpt_every", 20),
+        "disable_latest_checkpoint": args.get("disable_latest_checkpoint", False),
+        "device": device,
     }
 
     train_bc(train_dataloader, config, val_dataloader=val_dataloader, logger=logger)
@@ -588,6 +855,7 @@ if __name__ == "__main__":
     parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--dim_feedforward", type=int, default=3200)
     parser.add_argument("--image_encoder", type=str, default="efficientnet_b3film")
+    parser.add_argument("--gpu", type=int, default=None, help="GPU ID to use (default: auto-select first available GPU, or CPU if no GPU available)")
     parser.add_argument("--multi_gpu", action="store_true")
     parser.add_argument("--no_state", action="store_true", help="Disable qpos/state inputs throughout training/inference pipeline")
     parser.add_argument("--no_encoder", action="store_true", help="Disable VAE encoder, use zero latent vector instead")
@@ -625,6 +893,15 @@ if __name__ == "__main__":
         help="Metric for selecting best model: 'total_loss' (default, l1 + kl_weight * kl) or 'l1_loss' (action prediction accuracy only)"
     )
     parser.add_argument("--constant_lr", action="store_true", help="Disable learning rate scheduler and keep LR constant")
+    parser.add_argument("--save_ckpt_every", type=int, default=20, help="Interval size for saving best checkpoint within each interval [i*n, (i+1)*n) based on val l1 loss (default: 100)")
+    parser.add_argument("--disable_latest_checkpoint", action="store_true", help="Disable saving latest checkpoint every epoch to reduce disk IO (interval and global best models are still saved)")
+
+    # Simple HDF5 episodic dataset options (EpisodicDataset / SRTDataset in llp.utils)
+    parser.add_argument("--dataset_dir", type=str, help="Directory containing episode_*.hdf5 files")
+    parser.add_argument("--num_episodes", type=int, default=None, help="Number of episodes in dataset_dir (default: auto-detect from max episode ID)")
+    parser.add_argument("--train_ratio", type=float, default=0.8, help="Ratio of training data (default: 0.8)")
+    parser.add_argument("--val_batch_size", type=int, help="Validation batch size (default: same as --batch_size)")
+    parser.add_argument("--hdf5_use_srt", action="store_true", help="Use SRTDataset with Albumentations instead of plain EpisodicDataset")
 
     args = parser.parse_args()
     main(vars(args))
