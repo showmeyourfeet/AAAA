@@ -158,6 +158,67 @@ DEBUG_SAVE_CROPS = False
 DEBUG_SAVE_DIR = "debug_crops"
 
 
+# Dataset file integrity cache (module-level)
+_DATASET_FILE_PARTITIONS: Dict[str, Dict[str, list]] = {}
+
+
+def _extract_episode_id(filename: str) -> int | None:
+    """Return the episode id encoded in an episode_<id>.hdf5 filename."""
+    if not filename.startswith("episode_") or not filename.endswith(".hdf5"):
+        return None
+    try:
+        return int(filename.split("_", 1)[1].rsplit(".", 1)[0])
+    except (IndexError, ValueError):
+        return None
+
+
+def _scan_episode_files(dataset_dir: str) -> Dict[str, list]:
+    """Scan dataset directory, caching valid and corrupted episode file paths."""
+    valid_ids: list[int] = []
+    valid_files: list[str] = []
+    corrupted_files: list[str] = []
+    corrupted_ids: list[int] = []
+
+    if not os.path.isdir(dataset_dir):
+        raise FileNotFoundError(f"Dataset directory does not exist: {dataset_dir}")
+
+    for fname in sorted(os.listdir(dataset_dir)):
+        episode_id = _extract_episode_id(fname)
+        if episode_id is None:
+            continue
+        fpath = os.path.join(dataset_dir, fname)
+        try:
+            with h5py.File(fpath, "r"):
+                pass
+        except (OSError, IOError):
+            corrupted_files.append(fpath)
+            corrupted_ids.append(episode_id)
+            continue
+        valid_ids.append(episode_id)
+        valid_files.append(fpath)
+
+    return {
+        "valid_ids": valid_ids,
+        "valid_files": valid_files,
+        "corrupted_ids": corrupted_ids,
+        "corrupted_files": corrupted_files,
+    }
+
+
+def get_episode_file_partitions(dataset_dir: str, refresh: bool = False) -> Dict[str, list]:
+    """Return cached valid/corrupted episode file lists for a dataset directory."""
+    cache = _DATASET_FILE_PARTITIONS.get(dataset_dir)
+    if cache is None or refresh:
+        cache = _scan_episode_files(dataset_dir)
+        _DATASET_FILE_PARTITIONS[dataset_dir] = cache
+        if cache["corrupted_files"]:
+            print(
+                f"[llp.utils] Detected {len(cache['corrupted_files'])} corrupted episode "
+                f"files under {dataset_dir}; they will be skipped during training."
+            )
+    return cache
+
+
 class EpisodicDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -602,11 +663,25 @@ def get_norm_stats_with_valid_len(dataset_dir, num_episodes, real_ids=None):
 
 def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, train_ratio=0.8):
     print(f"\nData from: {dataset_dir}\n")
+    partitions = get_episode_file_partitions(dataset_dir)
+    real_ids = partitions["valid_ids"]
+    num_available = len(real_ids)
+    if num_available == 0:
+        raise RuntimeError(
+            f"No valid episode files found in {dataset_dir}. "
+            "Check dataset integrity."
+        )
+    if num_episodes != num_available:
+        print(
+            f"[llp.utils] Requested {num_episodes} episodes but only "
+            f"{num_available} valid episodes are available; proceeding with the "
+            "valid subset."
+        )
+    num_episodes = num_available
     # obtain train test split
     shuffled_indices = np.random.permutation(num_episodes)
     train_indices = shuffled_indices[: int(train_ratio * num_episodes)]
     val_indices = shuffled_indices[int(train_ratio * num_episodes) :]
-    real_ids = [int(i.split("_")[1].split(".")[0]) for i in os.listdir(dataset_dir)]
     real_train_ids = [real_ids[i] for i in train_indices]
     real_val_ids = [real_ids[i] for i in val_indices]
 
@@ -762,11 +837,25 @@ def load_data_srt(
 ):
     """Same as load_data but using SRTDataset and optional augmentation."""
     print(f"\nData from: {dataset_dir}\n")
+    partitions = get_episode_file_partitions(dataset_dir)
+    real_ids = partitions["valid_ids"]
+    num_available = len(real_ids)
+    if num_available == 0:
+        raise RuntimeError(
+            f"No valid episode files found in {dataset_dir}. "
+            "Check dataset integrity."
+        )
+    if num_episodes != num_available:
+        print(
+            f"[llp.utils] Requested {num_episodes} episodes but only "
+            f"{num_available} valid episodes are available; proceeding with the "
+            "valid subset."
+        )
+    num_episodes = num_available
     # obtain train test split
     shuffled_indices = np.random.permutation(num_episodes)
     train_indices = shuffled_indices[: int(train_ratio * num_episodes)]
     val_indices = shuffled_indices[int(train_ratio * num_episodes) :]
-    real_ids = [int(i.split("_")[1].split(".")[0]) for i in os.listdir(dataset_dir)]
     real_train_ids = [real_ids[i] for i in train_indices]
     real_val_ids = [real_ids[i] for i in val_indices]
 
