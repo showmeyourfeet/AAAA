@@ -153,8 +153,7 @@ class HighLevelModel(nn.Module):
 
         return cosine_similarities
 
-    @staticmethod
-    def create_sinusoidal_embeddings(d_model, max_len):
+    def create_sinusoidal_embeddings(self, d_model, max_len):
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(

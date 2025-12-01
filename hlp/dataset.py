@@ -5,6 +5,8 @@ import h5py
 import cv2
 import json
 import re
+import math
+from bisect import bisect_left, bisect_right
 from torch.utils.data import DataLoader, ConcatDataset
 from PIL import Image
 from torchvision import transforms
@@ -261,6 +263,437 @@ class SequenceDataset(torch.utils.data.Dataset):
             image_sequence = image_sequence / 255.0
 
         return image_sequence, command_embedding, command_gt
+
+
+class AnnotationStageDataset(torch.utils.data.Dataset):
+    """
+    Dataset that samples frame histories from run directories that contain:
+      - `frames/` (all jpg files named by millisecond timestamps)
+      - `annotations.json` describing stage segments with `start_ms` / `end_ms`.
+
+    Sampling strategy matches `SequenceDataset`: pick a valid current frame,
+    build history via `history_len` / `history_skip_frame`, and label the target
+    frame (current + `prediction_offset`) by locating the stage that contains
+    the target timestamp. Stage metadata (embeddings + texts) can be supplied
+    through `stage_embeddings_file` / `stage_texts_file`. Use `drop_initial_frames`
+    to discard the first N frames of every run when the capture has unusable
+    leading data.
+    """
+
+    def __init__(
+        self,
+        dataset_dir: str,
+        run_ids: Sequence[int | str] | None = None,
+        history_len: int = 5,
+        prediction_offset: int = 10,
+        history_skip_frame: int = 1,
+        use_augmentation: bool = False,
+        training: bool = True,
+        image_size: int = 224,
+        sync_sequence_augmentation: bool = False,
+        stage_embeddings_file: str | None = None,
+        stage_texts_file: str | None = None,
+        drop_initial_frames: int = 1,
+    ) -> None:
+        super().__init__()
+        self.dataset_dir = dataset_dir
+        self.history_len = history_len
+        self.prediction_offset = prediction_offset
+        self.history_skip_frame = history_skip_frame
+        self.use_augmentation = use_augmentation
+        self.training = training
+        self.image_size = image_size
+        self.sync_sequence_augmentation = sync_sequence_augmentation
+        self.drop_initial_frames = max(drop_initial_frames, 0)
+        self.required_history = self.history_len * self.history_skip_frame
+
+        if self.use_augmentation:
+            self.image_preprocessor = ImagePreprocessor(
+                image_size=image_size,
+                use_augmentation=use_augmentation,
+            )
+
+        self.stage_embeddings, self.stage_texts = self._load_stage_metadata(
+            stage_embeddings_file, stage_texts_file
+        )
+        self.embedding_dim = (
+            len(next(iter(self.stage_embeddings.values())))
+            if self.stage_embeddings
+            else 0
+        )
+
+        self.runs = self._build_run_records(run_ids)
+        if not self.runs:
+            raise ValueError(
+                "No valid runs found. "
+                "Check that frames and annotations exist and align correctly."
+            )
+
+    def __len__(self) -> int:
+        # Match SequenceDataset semantics: one sample per run per epoch
+        return len(self.runs)
+
+    def __getitem__(self, index: int):
+        run_idx = index % len(self.runs)
+        run_rec = self.runs[run_idx]
+
+        total_frames = len(run_rec["frames"])
+        try:
+            curr_idx = np.random.randint(
+                self.required_history,
+                total_frames - self.prediction_offset,
+            )
+            target_idx = curr_idx + self.prediction_offset
+            hist_start = curr_idx - self.required_history
+        except ValueError:
+            # 当前 run 太短，换一个 run 重试
+            return self.__getitem__((index + 1) % len(self))
+        history_indices = range(
+            hist_start, curr_idx + 1, self.history_skip_frame
+        )
+
+        image_sequence = []
+        sequence_replay = None
+        for frame_idx in history_indices:
+            _timestamp, frame_path = run_rec["frames"][frame_idx]
+            current_ts_images = []
+            img_bgr = cv2.imread(frame_path, cv2.IMREAD_COLOR)
+            if img_bgr is None:
+                raise RuntimeError(f"Failed to load frame: {frame_path}")
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            current_ts_images.append(img_rgb)
+
+            if self.use_augmentation:
+                if self.sync_sequence_augmentation:
+                    current_ts_images, sequence_replay = self.image_preprocessor.augment_images(
+                        current_ts_images,
+                        self.training,
+                        replay=sequence_replay,
+                        return_replay=True,
+                    )
+                else:
+                    current_ts_images = self.image_preprocessor.augment_images(
+                        current_ts_images, self.training
+                    )
+
+            all_cam_images = np.stack(current_ts_images, axis=0)
+            image_sequence.append(all_cam_images)
+
+        image_sequence = np.array(image_sequence)
+        image_sequence = torch.tensor(image_sequence, dtype=torch.float32)
+        image_sequence = torch.einsum("t k h w c -> t k c h w", image_sequence)
+        image_sequence = image_sequence / 255.0
+
+        target_stage = self._stage_for_index(run_rec, target_idx)
+        if target_stage is None:
+            # 若 target 帧没有落在任何标注段内，则尝试换下一个 run
+            try:
+                return self.__getitem__((index + 1) % len(self))
+            except RecursionError:
+                print(
+                    f"RecursionError: Could not find stage for run {os.path.basename(run_rec['run_dir'])} "
+                    f"and target_idx {target_idx}."
+                )
+                raise
+
+        stage_id = target_stage["stage_id"]
+        stage_name = target_stage["stage_name"]
+        command_embedding = self._embedding_for_stage(stage_id)
+
+        return image_sequence, command_embedding, stage_name
+
+    # --------------------------------------------------------------------- #
+    # Internal helpers
+    # --------------------------------------------------------------------- #
+
+    def _normalize_run_name(self, run_id: int | str) -> str:
+        if isinstance(run_id, int):
+            return f"run_{run_id:03d}"
+        run_str = str(run_id)
+        if not run_str.startswith("run_"):
+            return f"run_{run_str}"
+        return run_str
+
+    def _discover_runs(self) -> list[str]:
+        runs = []
+        for entry in sorted(os.listdir(self.dataset_dir)):
+            candidate = os.path.join(self.dataset_dir, entry)
+            if os.path.isdir(candidate) and entry.startswith("run_"):
+                runs.append(candidate)
+        return runs
+
+    def _build_run_records(self, run_ids: Sequence[int | str] | None):
+        if run_ids:
+            run_dirs = []
+            for run_id in run_ids:
+                name = self._normalize_run_name(run_id)
+                path = os.path.join(self.dataset_dir, name)
+                if os.path.isdir(path):
+                    run_dirs.append(path)
+            if not run_dirs:
+                raise ValueError(
+                    f"No matching runs found under {self.dataset_dir} "
+                    f"for ids: {run_ids}"
+                )
+        else:
+            run_dirs = self._discover_runs()
+        records = []
+        for path in run_dirs:
+            frames = self._load_frames(path)
+            if not frames:
+                continue
+            timestamps = [ts for ts, _ in frames]
+            stages = self._load_stage_segments(path, timestamps)
+            if not stages:
+                continue
+            records.append(
+                {
+                    "run_dir": path,
+                    "frames": frames,
+                    "timestamps": timestamps,
+                    "stages": stages,
+                }
+            )
+        return records
+
+    def _build_sampling_space(self):
+        sampling = []
+        for idx, run_rec in enumerate(self.runs):
+            total_frames = len(run_rec["frames"])
+            max_curr_global = total_frames - self.prediction_offset - 1
+            if max_curr_global <= self.required_history:
+                continue
+            for stage in run_rec["stages"]:
+                min_curr = max(stage["start_idx"], self.required_history)
+                max_curr = min(stage["end_idx"] - 1, max_curr_global)
+                if min_curr > max_curr:
+                    continue
+                sampling.append(
+                    {
+                        "run_index": idx,
+                        "stage": stage,
+                        "min_curr": min_curr,
+                        "max_curr": max_curr,
+                    }
+                )
+        return sampling
+
+    def _load_frames(self, run_dir: str):
+        frames_dir = os.path.join(run_dir, "frames")
+        if not os.path.isdir(frames_dir):
+            return []
+        frames = []
+        for file_name in os.listdir(frames_dir):
+            if not file_name.lower().endswith((".jpg", ".jpeg", ".png")):
+                continue
+            stem = os.path.splitext(file_name)[0]
+            try:
+                timestamp = int(stem)
+            except ValueError:
+                continue
+            frames.append((timestamp, os.path.join(frames_dir, file_name)))
+        frames.sort(key=lambda item: item[0])
+        if self.drop_initial_frames > 0 and len(frames) > self.drop_initial_frames:
+            frames = frames[self.drop_initial_frames :]
+        return frames
+
+    def _load_stage_segments(self, run_dir: str, timestamps: list[int]):
+        ann_path = os.path.join(run_dir, "annotations.json")
+        if not os.path.exists(ann_path):
+            return []
+        with open(ann_path, "r", encoding="utf-8") as f:
+            ann_data = json.load(f)
+        stage_lookup = {
+            int(stage["id"]): stage.get("name", f"stage_{stage['id']}")
+            for stage in ann_data.get("stages", [])
+            if "id" in stage
+        }
+        segments = []
+        for entry in ann_data.get("annotations", []):
+            if "start_ms" not in entry or "end_ms" not in entry:
+                continue
+            stage_id = int(entry.get("stage_id", -1))
+            start_ms = int(entry["start_ms"])
+            end_ms = int(entry["end_ms"])
+            start_idx = bisect_left(timestamps, start_ms)
+            end_idx = bisect_right(timestamps, end_ms)
+            if end_idx - start_idx <= 0:
+                continue
+            segments.append(
+                {
+                    "stage_id": stage_id,
+                    "stage_name": entry.get(
+                        "stage_name",
+                        stage_lookup.get(
+                            stage_id,
+                            self.stage_texts.get(
+                                stage_id, f"stage_{stage_id}"
+                            ),
+                        ),
+                    ),
+                    "start_idx": start_idx,
+                    "end_idx": end_idx,
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                }
+            )
+        return sorted(segments, key=lambda seg: seg["start_idx"])
+
+    def _load_stage_metadata(
+        self,
+        embeddings_file: str | None,
+        texts_file: str | None,
+    ):
+        stage_embeddings = _collect_stage_embeddings(embeddings_file)
+        # Prefer explicit texts file; fallback to embeddings file if it also stores text
+        text_source = texts_file or embeddings_file
+        stage_texts = _collect_stage_texts(text_source)
+        return stage_embeddings, stage_texts
+
+    def _stage_for_index(self, run_rec, frame_idx: int):
+        for stage in run_rec["stages"]:
+            if stage["start_idx"] <= frame_idx < stage["end_idx"]:
+                return stage
+        return None
+
+    def _embedding_for_stage(self, stage_id: int):
+        emb = self.stage_embeddings.get(stage_id)
+        if emb is None:
+            if self.embedding_dim == 0:
+                return torch.zeros(0, dtype=torch.float32)
+            return torch.zeros(self.embedding_dim, dtype=torch.float32)
+        return torch.tensor(emb, dtype=torch.float32).squeeze()
+
+
+def load_annotation_data(
+    root_dir: str,
+    batch_size_train: int,
+    batch_size_val: int,
+    history_len: int = 5,
+    prediction_offset: int = 10,
+    history_skip_frame: int = 1,
+    stage_embeddings_file: str | None = None,
+    stage_texts_file: str | None = None,
+    use_augmentation: bool = False,
+    image_size: int = 224,
+    drop_initial_frames: int = 1,
+    train_ratio: float = 0.9,
+    val_ratio: float = 0.1,
+    seed: int = 0,
+):
+    """
+    Build train/val/test DataLoaders for annotation-based runs:
+    root_dir/run_xxx/{frames/, annotations.json}.
+    """
+    # Discover available runs
+    all_runs = [
+        d
+        for d in sorted(os.listdir(root_dir))
+        if d.startswith("run_") and os.path.isdir(os.path.join(root_dir, d))
+    ]
+    if not all_runs:
+        raise ValueError(f"No run_* directories found under {root_dir}")
+
+    # Deterministic split
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(len(all_runs))
+    all_runs = [all_runs[i] for i in perm]
+
+    n_total = len(all_runs)
+
+    # Use rounding for splits, with safeguards to ensure non-empty train
+    # and optional non-empty val if val_ratio > 0.
+    if val_ratio > 0 and n_total >= 2:
+        n_val = int(round(val_ratio * n_total))
+        if n_val == 0:
+            n_val = 1
+    else:
+        n_val = 0
+
+    remaining = max(0, n_total - n_val)
+    if train_ratio > 0 and remaining >= 1:
+        n_train = int(round(train_ratio * n_total))
+        if n_train == 0:
+            n_train = 1
+        if n_train > remaining:
+            n_train = remaining
+    else:
+        n_train = remaining
+
+    # Ensure total does not exceed n_total
+    if n_train + n_val > n_total:
+        # Prefer to keep at least 1 train sample
+        overflow = n_train + n_val - n_total
+        reduce_val = min(overflow, max(0, n_val - 1))
+        n_val -= reduce_val
+        overflow -= reduce_val
+        if overflow > 0:
+            n_train = max(1, n_train - overflow)
+
+    n_test = max(0, n_total - n_train - n_val)
+    train_runs = all_runs[:n_train]
+    val_runs = all_runs[n_train : n_train + n_val]
+    test_runs = all_runs[n_train + n_val :] if n_test > 0 else []
+
+    def _build_dataset(run_ids, training: bool, aug: bool):
+        return AnnotationStageDataset(
+            dataset_dir=root_dir,
+            run_ids=run_ids if run_ids else None,
+            history_len=history_len,
+            prediction_offset=prediction_offset,
+            history_skip_frame=history_skip_frame,
+            use_augmentation=aug,
+            training=training,
+            image_size=image_size,
+            sync_sequence_augmentation=False,
+            stage_embeddings_file=stage_embeddings_file,
+            stage_texts_file=stage_texts_file,
+            drop_initial_frames=drop_initial_frames,
+        )
+
+    train_dataset = _build_dataset(train_runs, training=True, aug=use_augmentation)
+    val_dataset = _build_dataset(val_runs, training=False, aug=False) if val_runs else None
+    # Build test dataset only if we have dedicated test runs
+    test_dataset = (
+        _build_dataset(test_runs, training=False, aug=False) if test_runs else None
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size_train,
+        shuffle=True,
+        pin_memory=True,
+        num_workers=8,
+        prefetch_factor=8,
+        persistent_workers=True,
+    )
+    val_loader = (
+        DataLoader(
+            val_dataset,
+            batch_size=batch_size_val,
+            shuffle=False,
+            pin_memory=True,
+            num_workers=4,
+            prefetch_factor=4,
+            persistent_workers=True,
+        )
+        if val_dataset is not None
+        else None
+    )
+    if test_dataset is not None:
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=1,
+            shuffle=False,
+            pin_memory=True,
+            num_workers=4,
+            prefetch_factor=2,
+            persistent_workers=True,
+        )
+    else:
+        test_loader = None
+
+    return train_loader, val_loader, test_loader
 
 
 def load_merged_data(

@@ -27,6 +27,8 @@ from hlp.dataset import (
     load_composite_data,
     load_paired_stage_sequences,
     load_sequential_stage_sequences,
+    AnnotationStageDataset,
+    load_annotation_data,
 )
 from hlp.model import HighLevelModel
 
@@ -487,6 +489,11 @@ if __name__ == "__main__":
     # traditional format replacements
     parser.add_argument('--dataset_dirs', nargs='+', type=str, help='List of dataset directories (traditional format)')
     parser.add_argument('--camera_names', nargs='+', type=str, default=['left_frame','right_frame'], help='Camera names')
+    # Annotation-based continuous runs (run_XXX with annotations.json)
+    parser.add_argument('--use_annotation_dataset', action='store_true',
+                        help='Use annotation-based dataset format (run_xx/frames + annotations.json)')
+    parser.add_argument('--annotation_root', type=str, default=None,
+                        help='Root directory containing run_*/ with frames/ and annotations.json')
     # Image encoder training control
     parser.add_argument('--train_image_encoder', action='store_true', help='Enable training of the image encoder (default: frozen)')
     parser.add_argument('--save_ckpt_every', type=int, default=100,
@@ -507,7 +514,39 @@ if __name__ == "__main__":
     dagger_ratio = args.dagger_ratio
 
     # Data loading
-    if args.use_splitted or args.use_composite:
+    if args.use_annotation_dataset:
+        # New annotation-format dataset: example_datasets/run_XXX with annotations.json
+        assert args.annotation_root is not None, "--annotation_root must be provided when --use_annotation_dataset is set"
+        assert not args.use_splitted and not args.use_composite, "--use_annotation_dataset is mutually exclusive with --use_splitted/--use_composite"
+
+        train_dataloader, val_dataloader, test_dataloader = load_annotation_data(
+            root_dir=args.annotation_root,
+            batch_size_train=args.batch_size,
+            batch_size_val=args.batch_size,
+            history_len=args.history_len,
+            prediction_offset=args.prediction_offset,
+            history_skip_frame=args.history_skip_frame,
+            stage_embeddings_file=args.stage_embeddings_file,
+            stage_texts_file=args.stage_texts_file,
+            use_augmentation=args.use_augmentation,
+            image_size=args.image_size,
+            drop_initial_frames=1,
+            train_ratio=0.85,
+            val_ratio=0.15,
+            seed=args.seed,
+        )
+
+        # Build model with stage-level candidate texts/embeddings
+        model = build_HighLevelModel(
+            dataset_dirs=[],  # not used in annotation mode
+            history_len=args.history_len,
+            device=device,
+            stage_embeddings_file=args.stage_embeddings_file,
+            stage_texts_file=args.stage_texts_file,
+            train_image_encoder=args.train_image_encoder,
+        )
+
+    elif args.use_splitted or args.use_composite:
         # Use splitted or composite dataset format
         assert args.splitted_root is not None, "--splitted_root must be provided when --use_splitted or --use_composite is set"
         assert args.stage_embeddings_file is not None, "--stage_embeddings_file must be provided when --use_splitted or --use_composite is set"
@@ -766,7 +805,10 @@ if __name__ == "__main__":
         os.makedirs(predictions_dir)
 
     if args.test_only:
-        test(model, test_dataloader, device, latest_idx)
+        if 'test_dataloader' in locals() and test_dataloader is not None:
+            test(model, test_dataloader, device, latest_idx)
+        else:
+            logger.info("test_only is set but no test_dataloader is available; exiting.")
         exit()
 
     # Start training from loaded or initial state
@@ -796,8 +838,13 @@ if __name__ == "__main__":
                 image_size=args.image_size,
                 rng_seed=int(args.seed + epoch),
             )
-        # Test the model and log success rate every 200 epochs
-        if epoch % 200 == 0 and (epoch > 0 or dagger_ratio is not None):
+        # Test the model and log success rate every 200 epochs (if test_dataloader is available)
+        if (
+            epoch % 200 == 0
+            and (epoch > 0 or dagger_ratio is not None)
+            and 'test_dataloader' in locals()
+            and test_dataloader is not None
+        ):
             test_success_rate = test(model, test_dataloader, device, epoch)
             if logger:
                 logger.info(f"Epoch {epoch}: Test Success Rate = {test_success_rate * 100:.2f}%")

@@ -7,6 +7,7 @@ from collections import OrderedDict
 import torch
 import torch.nn.functional as F
 import torchvision
+from torchvision import transforms
 from torch import nn
 from torchvision.models._utils import IntermediateLayerGetter
 from typing import Dict, List
@@ -32,6 +33,7 @@ from ._efficientnet import (
 from ._resnet import film_resnet18, film_resnet34, film_resnet50
 
 from .DETRTransformer import build_position_encoding
+from .misc import NestedTensor, is_main_process
 
 
 class FrozenBatchNorm2d(torch.nn.Module):
@@ -58,9 +60,9 @@ class FrozenBatchNorm2d(torch.nn.Module):
         strict,
         missing_keys,
         unexpected_keys,
-        error_msgs,
+        error_msgs
     ):
-        num_batches_tracked_key = prefix + "num_batches_tracked"
+        num_batches_tracked_key = prefix + 'num_batches_tracked'
         if num_batches_tracked_key in state_dict:
             del state_dict[num_batches_tracked_key]
 
@@ -71,7 +73,7 @@ class FrozenBatchNorm2d(torch.nn.Module):
             strict,
             missing_keys,
             unexpected_keys,
-            error_msgs,
+            error_msgs
         )
 
     def forward(self, x):
@@ -94,7 +96,7 @@ class BackboneBase(nn.Module):
         backbone: nn.Module,
         train_backbone: bool,
         num_channels: int,
-        return_interm_layers: bool,
+        return_interm_layers: bool
     ):
         super().__init__()
         # The IntermediateLayerGetter logic below removes the last few layers in the CNNs (e.g., average pooling and classification layer)
@@ -160,9 +162,14 @@ class Backbone(BackboneBase):
             name, backbone, train_backbone, num_channels, return_interm_layers
         )
         # Get image preprocessing function.
-        self.preprocess = (
-            weights.transforms()
-        )  # Use this to preprocess images the same way as the pretrained model (e.g., ResNet-18).
+        # self.preprocess = (
+        #     weights.transforms()
+        # )  # Use this to preprocess images the same way as the pretrained model (e.g., ResNet-18).
+        
+        self.preprocess = transforms.Compose([ 
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ]) # Use this if you don't want to resize images to 224x224.
+        
         # print("---------------- inside preprocess-----------")
         # print(self.preprocess)
         # import sys
@@ -178,9 +185,9 @@ class Joiner(nn.Sequential):
     def __init__(self, backbone, position_embedding):
         super().__init__(backbone, position_embedding)
 
-    def forward(self, tensor_list):
+    def forward(self, tensor_list: NestedTensor):
         xs = self[0](tensor_list)
-        out: List[torch.Tensor] = []
+        out: List[NestedTensor] = []
         pos = []
         for name, x in xs.items():
             out.append(x)
@@ -230,12 +237,13 @@ class FilMedBackbone(torch.nn.Module):
             self.backbone.avgpool = nn.Sequential()  # remove average pool layer
             self.backbone.classifier = nn.Sequential()  # remove classification layer
         # Get image preprocessing function.
-        self.preprocess = (
-            weights.transforms()
-        )  # Use this to preprocess images the same way as the pretrained model (e.g., ResNet-18).
-        # self.preprocess = transforms.Compose([ # Use this if you don't want to resize images to 224x224.
-        #     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-        # ])
+        # self.preprocess = (
+        #     weights.transforms()
+        # )  # Use this to preprocess images the same way as the pretrained model (e.g., ResNet-18).
+
+        self.preprocess = transforms.Compose([ 
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ]) # Use this if you don't want to resize images to 224x224.
 
     def forward(self, img_obs, language_embed):
         # img_obs shape: (batch_size, 3, H, W)

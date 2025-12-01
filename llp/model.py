@@ -17,25 +17,30 @@ from .DETRTransformer import (
 from .backbone_impl import build_backbone, FilMedBackbone, FrozenBatchNorm2d
 
 
-def reparametrize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+def reparametrize(mu, logvar):
     std = logvar.div(2).exp()
     eps = Variable(std.data.new(std.size()).normal_())
     return mu + std * eps
 
 
-def get_sinusoid_encoding_table(n_position: int, d_hid: int) -> torch.Tensor:
-    def get_position_angle_vec(position: int):
-        return [position / np.power(10000, 2 * (hid_j // 2) / d_hid) for hid_j in range(d_hid)]
+def get_sinusoid_encoding_table(n_position, d_hid):
+    def get_position_angle_vec(position):
+        return [
+            position / np.power(10000, 2 * (hid_j // 2) / d_hid)
+            for hid_j in range(d_hid)
+        ]
 
-    sinusoid_table = np.array([get_position_angle_vec(pos_i) for pos_i in range(n_position)])
-    sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])
-    sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])
+    sinusoid_table = np.array(
+        [get_position_angle_vec(pos_i) for pos_i in range(n_position)]
+    )
+    sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])  # dim 2i
+    sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])  # dim 2i+1
 
     return torch.FloatTensor(sinusoid_table).unsqueeze(0)
 
 
 class DETRVAE(nn.Module):
-    """Variant of DETR used for ACT."""
+    """This is the DETR module that performs object detection"""
 
     def __init__(
         self,
@@ -47,8 +52,8 @@ class DETRVAE(nn.Module):
         camera_names,
         use_language=False,
         use_film=False,
-        shared_backbone=False,
         num_command=2,
+        shared_backbone=False,
         vq=False,
         vq_class=512,
         vq_dim=32,
@@ -59,20 +64,24 @@ class DETRVAE(nn.Module):
         self.camera_names = camera_names
         self.transformer = transformer
         self.encoder = encoder
-        self.vq, self.vq_class, self.vq_dim = vq, vq_class, vq_dim
-        self.use_state = use_state
-        self.state_dim = state_dim
         self.hidden_dim = hidden_dim = transformer.d_model
         self.action_head = nn.Linear(hidden_dim, state_dim)
         self.is_pad_head = nn.Linear(hidden_dim, 1)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         self.use_language = use_language
         self.use_film = use_film
+        self.vq, self.vq_class, self.vq_dim = vq, vq_class, vq_dim
+        self.use_state = use_state
+        self.state_dim = state_dim
         self.shared_backbone = shared_backbone
         if use_language:
-            self.lang_embed_proj = nn.Linear(768, hidden_dim)
+            self.lang_embed_proj = nn.Linear(
+                768, hidden_dim
+            )
         if backbones is not None:
-            self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)
+            self.input_proj = nn.Conv2d(
+                backbones[0].num_channels, hidden_dim, kernel_size=1
+            )
             self.backbones = nn.ModuleList(backbones)
             self.input_proj_robot_state = (
                 nn.Linear(20, hidden_dim) if self.use_state else None
@@ -88,7 +97,9 @@ class DETRVAE(nn.Module):
         # encoder extra parameters
         self.latent_dim = 32  # final size of latent z
         self.cls_embed = nn.Embedding(1, hidden_dim)  # extra cls token embedding
-        self.encoder_action_proj = nn.Linear(20, hidden_dim)  # project action to embedding
+        self.encoder_action_proj = nn.Linear(
+            20, hidden_dim
+        )  # project action to embedding
         self.encoder_joint_proj = (
             nn.Linear(20, hidden_dim) if self.use_state else None  # project qpos to embedding
         )
@@ -102,7 +113,7 @@ class DETRVAE(nn.Module):
         self.register_buffer(
             "pos_table",
             get_sinusoid_encoding_table(1 + (1 if self.use_state else 0) + num_queries, hidden_dim),
-            persistent=False,
+            # persistent=False,
         )
 
         # decoder extra parameters
@@ -123,7 +134,9 @@ class DETRVAE(nn.Module):
             pos_embed_dim += 1
         else:
             self.command_pos_id = None
-        self.additional_pos_embed = nn.Embedding(pos_embed_dim, hidden_dim)
+        self.additional_pos_embed = nn.Embedding(
+            pos_embed_dim, hidden_dim
+        )
 
     def _get_additional_pos_embed(
         self, include_proprio: bool, include_command: bool
@@ -203,7 +216,9 @@ class DETRVAE(nn.Module):
                 pos_embed = pos_embed.permute(1, 0, 2)  # (seq+2, 1, hidden_dim)
                 
                 # Query model
-                encoder_output = self.encoder(encoder_input, pos=pos_embed, src_key_padding_mask=is_pad)
+                encoder_output = self.encoder(
+                    encoder_input, pos=pos_embed, src_key_padding_mask=is_pad
+                )
                 encoder_output = encoder_output[0]  # take cls output only
                 latent_info = self.latent_proj(encoder_output)
                 

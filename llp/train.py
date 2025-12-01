@@ -200,6 +200,15 @@ def train_bc(
                     policy_config["state_dim"] = ckpt_state_dim
 
     policy = make_policy(policy_config)
+
+    print("---------------------------")
+    print(f"Shared backbone: {policy.model.shared_backbone}")
+    print("---------------------------")
+
+    import sys
+    sys.exit()
+
+    
     optimizer = make_optimizer(policy)
     constant_lr = config.get("constant_lr", False)
     scheduler = None if constant_lr else make_scheduler(optimizer, num_epochs)
