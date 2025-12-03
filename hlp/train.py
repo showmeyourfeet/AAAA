@@ -494,6 +494,8 @@ if __name__ == "__main__":
                         help='Use annotation-based dataset format (run_xx/frames + annotations.json)')
     parser.add_argument('--annotation_root', type=str, default=None,
                         help='Root directory containing run_*/ with frames/ and annotations.json')
+    parser.add_argument('--traverse_full_trajectory', action='store_true',
+                        help='For annotation dataset: traverse full trajectories deterministically instead of random sampling')
     # Image encoder training control
     parser.add_argument('--train_image_encoder', action='store_true', help='Enable training of the image encoder (default: frozen)')
     parser.add_argument('--save_ckpt_every', type=int, default=100,
@@ -526,6 +528,7 @@ if __name__ == "__main__":
             history_len=args.history_len,
             prediction_offset=args.prediction_offset,
             history_skip_frame=args.history_skip_frame,
+            traverse_full_trajectory=args.traverse_full_trajectory,
             stage_embeddings_file=args.stage_embeddings_file,
             stage_texts_file=args.stage_texts_file,
             use_augmentation=args.use_augmentation,

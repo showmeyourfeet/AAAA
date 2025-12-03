@@ -287,6 +287,7 @@ class AnnotationStageDataset(torch.utils.data.Dataset):
         history_len: int = 5,
         prediction_offset: int = 10,
         history_skip_frame: int = 1,
+        traverse_full_trajectory: bool = False,
         use_augmentation: bool = False,
         training: bool = True,
         image_size: int = 224,
@@ -300,6 +301,7 @@ class AnnotationStageDataset(torch.utils.data.Dataset):
         self.history_len = history_len
         self.prediction_offset = prediction_offset
         self.history_skip_frame = history_skip_frame
+        self.traverse_full_trajectory = traverse_full_trajectory
         self.use_augmentation = use_augmentation
         self.training = training
         self.image_size = image_size
@@ -323,6 +325,11 @@ class AnnotationStageDataset(torch.utils.data.Dataset):
         )
 
         self.runs = self._build_run_records(run_ids)
+        # Pre-compute full-trajectory indices if needed
+        self._full_traj_index: list[tuple[int, int]] = []
+        if self.traverse_full_trajectory:
+            self._full_traj_index = self._build_full_trajectory_index()
+
         if not self.runs:
             raise ValueError(
                 "No valid runs found. "
@@ -330,24 +337,39 @@ class AnnotationStageDataset(torch.utils.data.Dataset):
             )
 
     def __len__(self) -> int:
+        if self.traverse_full_trajectory:
+            # One sample per valid timestep across all runs
+            return len(self._full_traj_index)
         # Match SequenceDataset semantics: one sample per run per epoch
         return len(self.runs)
 
     def __getitem__(self, index: int):
-        run_idx = index % len(self.runs)
-        run_rec = self.runs[run_idx]
-
-        total_frames = len(run_rec["frames"])
-        try:
-            curr_idx = np.random.randint(
-                self.required_history,
-                total_frames - self.prediction_offset,
-            )
+        if self.traverse_full_trajectory:
+            if not self._full_traj_index:
+                raise ValueError(
+                    "No valid indices for full-trajectory traversal. "
+                    "Check that runs have enough frames for the given history_len and prediction_offset."
+                )
+            sample_idx = index % len(self._full_traj_index)
+            run_idx, curr_idx = self._full_traj_index[sample_idx]
+            run_rec = self.runs[run_idx]
             target_idx = curr_idx + self.prediction_offset
             hist_start = curr_idx - self.required_history
-        except ValueError:
-            # 当前 run 太短，换一个 run 重试
-            return self.__getitem__((index + 1) % len(self))
+        else:
+            run_idx = index % len(self.runs)
+            run_rec = self.runs[run_idx]
+
+            total_frames = len(run_rec["frames"])
+            try:
+                curr_idx = np.random.randint(
+                    self.required_history,
+                    total_frames - self.prediction_offset,
+                )
+                target_idx = curr_idx + self.prediction_offset
+                hist_start = curr_idx - self.required_history
+            except ValueError:
+                # 当前 run 太短，换一个 run 重试
+                return self.__getitem__((index + 1) % len(self))
         history_indices = range(
             hist_start, curr_idx + 1, self.history_skip_frame
         )
@@ -478,6 +500,28 @@ class AnnotationStageDataset(torch.utils.data.Dataset):
                 )
         return sampling
 
+    def _build_full_trajectory_index(self) -> list[tuple[int, int]]:
+        """
+        Build a flattened list of (run_index, curr_idx) pairs that
+        traverse each trajectory from:
+          curr_idx in [required_history + 1, total_frames - prediction_offset - 1]
+        This matches the user's requirement:
+          start_ts 从 history_len * history_skip_frame + 1
+          一直到 total_len - prediction_offset - 1，遍历整条轨迹.
+        """
+        index: list[tuple[int, int]] = []
+        for run_idx, run_rec in enumerate(self.runs):
+            total_frames = len(run_rec["frames"])
+            # 下界: 至少有完整的历史（包含 curr_idx == required_history）
+            start_curr = self.required_history
+            # 上界: 目标帧 + offset 不能越界
+            end_curr = total_frames - self.prediction_offset - 1
+            if end_curr < start_curr:
+                continue
+            for curr_idx in range(start_curr, end_curr + 1):
+                index.append((run_idx, curr_idx))
+        return index
+
     def _load_frames(self, run_dir: str):
         frames_dir = os.path.join(run_dir, "frames")
         if not os.path.isdir(frames_dir):
@@ -572,6 +616,7 @@ def load_annotation_data(
     history_len: int = 5,
     prediction_offset: int = 10,
     history_skip_frame: int = 1,
+    traverse_full_trajectory: bool = False,
     stage_embeddings_file: str | None = None,
     stage_texts_file: str | None = None,
     use_augmentation: bool = False,
@@ -642,6 +687,7 @@ def load_annotation_data(
             history_len=history_len,
             prediction_offset=prediction_offset,
             history_skip_frame=history_skip_frame,
+            traverse_full_trajectory=traverse_full_trajectory,
             use_augmentation=aug,
             training=training,
             image_size=image_size,
