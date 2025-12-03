@@ -617,6 +617,8 @@ def load_annotation_data(
     prediction_offset: int = 10,
     history_skip_frame: int = 1,
     traverse_full_trajectory: bool = False,
+    num_workers_train: int = 0,
+    num_workers_val: int = 0,
     stage_embeddings_file: str | None = None,
     stage_texts_file: str | None = None,
     use_augmentation: bool = False,
@@ -709,9 +711,7 @@ def load_annotation_data(
         batch_size=batch_size_train,
         shuffle=True,
         pin_memory=True,
-        num_workers=8,
-        prefetch_factor=8,
-        persistent_workers=True,
+        num_workers=num_workers_train,
     )
     val_loader = (
         DataLoader(
@@ -719,9 +719,7 @@ def load_annotation_data(
             batch_size=batch_size_val,
             shuffle=False,
             pin_memory=True,
-            num_workers=4,
-            prefetch_factor=4,
-            persistent_workers=True,
+            num_workers=num_workers_val,
         )
         if val_dataset is not None
         else None

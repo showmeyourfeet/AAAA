@@ -496,6 +496,10 @@ if __name__ == "__main__":
                         help='Root directory containing run_*/ with frames/ and annotations.json')
     parser.add_argument('--traverse_full_trajectory', action='store_true',
                         help='For annotation dataset: traverse full trajectories deterministically instead of random sampling')
+    parser.add_argument('--num_workers_train', type=int, default=0,
+                        help='Number of DataLoader workers for training (annotation dataset). 0 = no multiprocessing (safer on WSL).')
+    parser.add_argument('--num_workers_val', type=int, default=0,
+                        help='Number of DataLoader workers for validation (annotation dataset). 0 = no multiprocessing (safer on WSL).')
     # Image encoder training control
     parser.add_argument('--train_image_encoder', action='store_true', help='Enable training of the image encoder (default: frozen)')
     parser.add_argument('--save_ckpt_every', type=int, default=100,
@@ -529,6 +533,8 @@ if __name__ == "__main__":
             prediction_offset=args.prediction_offset,
             history_skip_frame=args.history_skip_frame,
             traverse_full_trajectory=args.traverse_full_trajectory,
+            num_workers_train=args.num_workers_train,
+            num_workers_val=args.num_workers_val,
             stage_embeddings_file=args.stage_embeddings_file,
             stage_texts_file=args.stage_texts_file,
             use_augmentation=args.use_augmentation,
