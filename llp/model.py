@@ -48,6 +48,7 @@ class DETRVAE(nn.Module):
         transformer,
         encoder,
         state_dim,
+        action_dim,
         num_queries,
         camera_names,
         use_language=False,
@@ -73,6 +74,7 @@ class DETRVAE(nn.Module):
         self.vq, self.vq_class, self.vq_dim = vq, vq_class, vq_dim
         self.use_state = use_state
         self.state_dim = state_dim
+        self.action_dim = action_dim
         self.shared_backbone = shared_backbone
         if use_language:
             self.lang_embed_proj = nn.Linear(
@@ -84,11 +86,11 @@ class DETRVAE(nn.Module):
             )
             self.backbones = nn.ModuleList(backbones)
             self.input_proj_robot_state = (
-                nn.Linear(20, hidden_dim) if self.use_state else None
+                nn.Linear(state_dim, hidden_dim) if self.use_state else None
             )
         else:
             self.input_proj_robot_state = (
-                nn.Linear(20, hidden_dim) if self.use_state else None
+                nn.Linear(state_dim, hidden_dim) if self.use_state else None
             )
             self.input_proj_env_state = nn.Linear(10, hidden_dim)
             self.pos = torch.nn.Embedding(2, hidden_dim)
@@ -98,10 +100,10 @@ class DETRVAE(nn.Module):
         self.latent_dim = 32  # final size of latent z
         self.cls_embed = nn.Embedding(1, hidden_dim)  # extra cls token embedding
         self.encoder_action_proj = nn.Linear(
-            20, hidden_dim
+            action_dim, hidden_dim
         )  # project action to embedding
         self.encoder_joint_proj = (
-            nn.Linear(20, hidden_dim) if self.use_state else None  # project qpos to embedding
+            nn.Linear(state_dim, hidden_dim) if self.use_state else None  # project qpos to embedding
         )
         
         print(f"Use VQ: {self.vq}, {self.vq_class}, {self.vq_dim}")
@@ -381,7 +383,7 @@ def build_encoder(args) -> TransformerEncoder:
 
 def build_act_model(args) -> DETRVAE:
     state_dim = getattr(args, "state_dim", 20)
-
+    action_dim = getattr(args, "action_dim", 20)
     backbones = []
     share_backbone = not args.use_language and "film" not in args.backbone
 
@@ -461,6 +463,7 @@ def get_args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--masks", action="store_true")
     parser.add_argument("--use_language", action="store_true")
     parser.add_argument("--state_dim", default=20, type=int)
+    parser.add_argument("--action_dim", default=20, type=int)
     parser.add_argument("--multi_gpu", action="store_true")
     parser.add_argument("--eval", action="store_true")
     parser.add_argument("--no_encoder", action="store_true", help="Disable VAE encoder, use zero latent vector instead")

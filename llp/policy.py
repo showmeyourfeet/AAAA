@@ -111,6 +111,21 @@ class ACTPolicy(nn.Module):
         Returns:
             NamedTuple with missing_keys and unexpected_keys
         """
+        # Handle pos_table size mismatch due to different use_state/num_queries config
+        # pos_table is deterministically computed from config, so we can safely skip loading
+        # if sizes don't match (the model will use its own freshly computed pos_table)
+        pos_table_key = "model.pos_table"
+        if pos_table_key in model_dict:
+            ckpt_shape = model_dict[pos_table_key].shape
+            model_shape = self.model.pos_table.shape
+            if ckpt_shape != model_shape:
+                print(
+                    f"Warning: pos_table shape mismatch - checkpoint {ckpt_shape} vs "
+                    f"model {model_shape}. This usually means use_state or num_queries "
+                    f"(chunk_size) differs between training and inference. "
+                    f"Using model's computed pos_table instead."
+                )
+                del model_dict[pos_table_key]
         return self.load_state_dict(model_dict, strict=strict)
 
 

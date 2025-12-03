@@ -62,7 +62,7 @@ class FrozenBatchNorm2d(torch.nn.Module):
         unexpected_keys,
         error_msgs
     ):
-        num_batches_tracked_key = prefix + 'num_batches_tracked'
+        num_batches_tracked_key = prefix + "num_batches_tracked"
         if num_batches_tracked_key in state_dict:
             del state_dict[num_batches_tracked_key]
 
