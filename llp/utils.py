@@ -226,6 +226,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
         dataset_dir,
         camera_names,
         norm_stats,
+        repitition_factor = 1,
         real_ids=None,
         is_cut: bool = False,
     ):
@@ -237,19 +238,21 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.is_sim = None
         self.real_ids = real_ids
         self.is_cut = is_cut  # cut bottom of image or not
+        self.repitition_factor = repitition_factor
         if len(self.episode_ids) > 0:
             # initialize self.is_sim
             _ = self.__getitem__(0)
 
     def __len__(self):
-        return len(self.episode_ids)
+        return len(self.episode_ids)*self.repitition_factor
 
     def __getitem__(self, index):
+        original_index = index % len(self.episode_ids)
         sample_full_episode = False  # hardcode
         if self.real_ids is not None:
-            episode_id = self.real_ids[index]
+            episode_id = self.real_ids[original_index]
         else:
-            episode_id = self.episode_ids[index]
+            episode_id = self.episode_ids[original_index]
         dataset_path = os.path.join(self.dataset_dir, f"episode_{episode_id}.hdf5")
         with h5py.File(dataset_path, "r") as root:
             # is_sim = root.attrs['sim']  # original format
@@ -420,145 +423,6 @@ class EpisodicDataset(torch.utils.data.Dataset):
                     saved = False
 
 
-class SRTDataset(torch.utils.data.Dataset):
-    """A copy of EpisodicDataset with Albumentations-based image augmentation."""
-
-    def __init__(
-        self,
-        episode_ids,
-        dataset_dir,
-        camera_names,
-        norm_stats,
-        real_ids=None,
-        augment: bool = False,
-        augment_same_on_all: bool = True,
-    ):
-        super(SRTDataset, self).__init__()
-        self.episode_ids = episode_ids
-        self.dataset_dir = dataset_dir
-        self.camera_names = camera_names
-        self.norm_stats = norm_stats
-        self.is_sim = None
-        self.real_ids = real_ids
-        self.augment = augment
-        self.augment_same_on_all = augment_same_on_all
-        self._augmentor = None  # will be built lazily with image size
-
-        # initialize self.is_sim without performing augmentation to avoid randomness here
-        if len(self.episode_ids) > 0:
-            _old = self.augment
-            self.augment = False
-            try:
-                _ = self.__getitem__(0)
-            finally:
-                self.augment = _old
-
-    def __len__(self):
-        return len(self.episode_ids)
-
-    def __getitem__(self, index):
-        sample_full_episode = False  # hardcode
-        if self.real_ids is not None:
-            episode_id = self.real_ids[index]
-        else:
-            episode_id = self.episode_ids[index]
-        dataset_path = os.path.join(self.dataset_dir, f"episode_{episode_id}.hdf5")
-        with h5py.File(dataset_path, "r") as root:
-            # is_sim = root.attrs['sim']  # original format
-            is_sim = True
-            original_action_shape = root["/action"].shape
-            episode_len = original_action_shape[0]
-            if sample_full_episode:
-                start_ts = 0
-            else:
-                pad_info = root["/is_pad"]
-                num_valid_steps = episode_len - np.sum(pad_info)
-                start_ts = np.random.choice(num_valid_steps)
-
-            # get observation at start_ts only
-            if "sim" in root.attrs:
-                qpos = root["/observations/qpos"][start_ts]
-            else:
-                qpos = root["/observations/lrstate"][start_ts]
-
-            # get dataset pad info
-            is_pad_dataset = root["/is_pad"][start_ts:]
-
-            image_dict = {}
-            for cam_name in self.camera_names:
-                image_dict[cam_name] = root[f"/observations/images/{cam_name}"][start_ts]
-
-            # get all actions after and including start_ts
-            if is_sim:
-                action = root["/action"][start_ts:]
-                action_len = episode_len - start_ts
-            else:
-                action = root["/action"][max(0, start_ts - 1) :]
-                action_len = episode_len - max(0, start_ts - 1)
-
-        self.is_sim = is_sim
-        padded_action = np.zeros(original_action_shape, dtype=np.float32)
-        padded_action[:action_len] = action
-        is_pad = np.zeros(episode_len)
-        is_pad[action_len:] = 1
-        # union with dataset-provided pad info for valid steps
-        is_pad[:action_len] = is_pad_dataset
-
-        # stack images over camera axis -> (K, H, W, C)
-        all_cam_images = [image_dict[cam_name] for cam_name in self.camera_names]
-        all_cam_images = np.stack(all_cam_images, axis=0)
-
-        # optional augmentation on numpy arrays before torch conversion
-        if self.augment:
-            all_cam_images = apply_albu_augmentations_multicam(
-                all_cam_images,
-                build_if_none=lambda h, w: build_default_albu_augmentations(
-                    h, w, use_replay=self.augment_same_on_all
-                ),
-                cached_augmentor_ref=self,
-                same_on_all=self.augment_same_on_all,
-            )
-
-        # to torch
-        image_data = torch.from_numpy(all_cam_images)
-        qpos_data = torch.from_numpy(qpos).float()
-        action_data = torch.from_numpy(padded_action).float()
-        is_pad = torch.from_numpy(is_pad).bool()
-
-        # channel last -> channel first
-        image_data = torch.einsum("k h w c -> k c h w", image_data)
-
-        # normalize image to float in [0,1]
-        image_data = image_data / 255.0
-
-        # ensure norm stats are torch.float32 tensors
-        if isinstance(self.norm_stats["action_mean"], np.ndarray):
-            self.norm_stats["action_mean"] = torch.from_numpy(
-                self.norm_stats["action_mean"]
-            ).float()
-        if isinstance(self.norm_stats["action_std"], np.ndarray):
-            self.norm_stats["action_std"] = torch.from_numpy(
-                self.norm_stats["action_std"]
-            ).float()
-        if isinstance(self.norm_stats["qpos_mean"], np.ndarray):
-            self.norm_stats["qpos_mean"] = torch.from_numpy(
-                self.norm_stats["qpos_mean"]
-            ).float()
-        if isinstance(self.norm_stats["qpos_std"], np.ndarray):
-            self.norm_stats["qpos_std"] = torch.from_numpy(
-                self.norm_stats["qpos_std"]
-            ).float()
-
-        action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats[
-            "action_std"
-        ]
-        qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats[
-            "qpos_std"
-        ]
-
-        return image_data, qpos_data, action_data, is_pad
-
-
 def get_norm_stats(dataset_dir, num_episodes, real_ids=None):
     all_qpos_data = []
     all_action_data = []
@@ -661,7 +525,15 @@ def get_norm_stats_with_valid_len(dataset_dir, num_episodes, real_ids=None):
     return stats
 
 
-def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, train_ratio=0.8):
+def load_data(
+    dataset_dir, 
+    num_episodes, 
+    camera_names, 
+    batch_size_train, 
+    batch_size_val, 
+    train_ratio=0.8,
+    repitition_factor=1,
+):
     print(f"\nData from: {dataset_dir}\n")
     partitions = get_episode_file_partitions(dataset_dir)
     real_ids = partitions["valid_ids"]
@@ -692,10 +564,20 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
 
     # construct dataset and dataloader
     train_dataset = EpisodicDataset(
-        train_indices, dataset_dir, camera_names, norm_stats, real_train_ids
+        train_indices,
+        dataset_dir,
+        camera_names,
+        norm_stats,
+        repitition_factor=repitition_factor,
+        real_ids=real_train_ids,
     )
     val_dataset = EpisodicDataset(
-        val_indices, dataset_dir, camera_names, norm_stats, real_val_ids
+        val_indices,
+        dataset_dir,
+        camera_names,
+        norm_stats,
+        repitition_factor=int(repitition_factor / 5),
+        real_ids=real_val_ids,
     )
     train_dataloader = DataLoader(
         train_dataset,
@@ -823,78 +705,3 @@ def apply_albu_augmentations_multicam(
             out.append(augmentor(image=images_khwc[i])["image"])
 
     return np.stack(out, axis=0)
-
-
-def load_data_srt(
-    dataset_dir,
-    num_episodes,
-    camera_names,
-    batch_size_train,
-    batch_size_val,
-    use_augmentation: bool = True,
-    augment_same_on_all: bool = True,
-    train_ratio: float = 0.8,
-):
-    """Same as load_data but using SRTDataset and optional augmentation."""
-    print(f"\nData from: {dataset_dir}\n")
-    partitions = get_episode_file_partitions(dataset_dir)
-    real_ids = partitions["valid_ids"]
-    num_available = len(real_ids)
-    if num_available == 0:
-        raise RuntimeError(
-            f"No valid episode files found in {dataset_dir}. "
-            "Check dataset integrity."
-        )
-    if num_episodes != num_available:
-        print(
-            f"[llp.utils] Requested {num_episodes} episodes but only "
-            f"{num_available} valid episodes are available; proceeding with the "
-            "valid subset."
-        )
-    num_episodes = num_available
-    # obtain train test split
-    shuffled_indices = np.random.permutation(num_episodes)
-    train_indices = shuffled_indices[: int(train_ratio * num_episodes)]
-    val_indices = shuffled_indices[int(train_ratio * num_episodes) :]
-    real_train_ids = [real_ids[i] for i in train_indices]
-    real_val_ids = [real_ids[i] for i in val_indices]
-
-    norm_stats = get_norm_stats(dataset_dir, num_episodes, real_ids=real_ids)
-
-    train_dataset = SRTDataset(
-        train_indices,
-        dataset_dir,
-        camera_names,
-        norm_stats,
-        real_ids=real_train_ids,
-        augment=use_augmentation,
-        augment_same_on_all=augment_same_on_all,
-    )
-    val_dataset = SRTDataset(
-        val_indices,
-        dataset_dir,
-        camera_names,
-        norm_stats,
-        real_ids=real_val_ids,
-        augment=False,
-        augment_same_on_all=augment_same_on_all,
-    )
-
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=batch_size_train,
-        shuffle=True,
-        pin_memory=True,
-        num_workers=1,
-        prefetch_factor=1,
-    )
-    val_dataloader = DataLoader(
-        val_dataset,
-        batch_size=batch_size_val,
-        shuffle=True,
-        pin_memory=True,
-        num_workers=1,
-        prefetch_factor=1,
-    )
-
-    return train_dataloader, val_dataloader, norm_stats, train_dataset.is_sim

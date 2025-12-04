@@ -14,6 +14,8 @@ import numpy as np
 import torch
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm, trange
+import math
+
 
 try:
     # When run as a module: python -m act_refactor.train
@@ -49,7 +51,6 @@ except ImportError:
         is_multi_gpu_checkpoint,
         set_seed,
         load_data,
-        load_data_srt,
     )
 
 
@@ -169,6 +170,7 @@ def train_bc(
         load_ckpt = input().strip().lower()
         if load_ckpt == "y":
             # Priority 1: Try to load latest checkpoint (rolling backup)
+            # Always use a single rolling latest file for simplicity.
             latest_ckpt_path = os.path.join(ckpt_dir, f"policy_latest_seed_{seed}.ckpt")
             if os.path.exists(latest_ckpt_path):
                 ckpt_path = latest_ckpt_path
@@ -211,7 +213,14 @@ def train_bc(
 
     optimizer = make_optimizer(policy)
     constant_lr = config.get("constant_lr", False)
-    scheduler = None if constant_lr else make_scheduler(optimizer, num_epochs)
+
+    total_samples = len(train_dataloader.dataset)
+    batch_size = train_dataloader.batch_size
+    batches_per_epoch = math.ceil(total_samples / batch_size)
+
+    num_steps = num_epochs * batches_per_epoch
+
+    scheduler = None if constant_lr else make_scheduler(optimizer, num_steps)
 
     if load_ckpt == "y" and checkpoint is not None:
         print(f"Loading checkpoint from {ckpt_path}")
@@ -304,6 +313,7 @@ def train_bc(
     # Interval-based checkpoint tracking
     save_ckpt_every = config.get("save_ckpt_every", 100)
     disable_latest_checkpoint = config.get("disable_latest_checkpoint", False)
+    save_latest_every = config.get("save_latest_every", 1)  # in epochs; 1 = every epoch
     interval_best_val_l1 = float("inf")
     interval_best_epoch = -1
     current_interval_start = start_epoch
@@ -407,10 +417,10 @@ def train_bc(
                     # Fall back to total loss for this epoch
                     if val_loss < best_val:
                         best_val = val_loss
+                        # For global best, only keep model weights and metrics in memory;
+                        # optimizer/scheduler states are not needed since resume uses latest/last checkpoints.
                         global_best_state = {
                             "model_state_dict": policy.serialize(),
-                            "optimizer_state_dict": optimizer.state_dict(),
-                            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
                             "epoch": epoch,
                             "best_val": best_val,
                         }
@@ -422,8 +432,6 @@ def train_bc(
                     best_val = val_l1
                     global_best_state = {
                         "model_state_dict": policy.serialize(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
                         "epoch": epoch,
                         "best_val": best_val,
                         "best_val_total_loss": val_loss,  # Also save total loss for reference
@@ -438,8 +446,6 @@ def train_bc(
                     best_val = val_loss
                     global_best_state = {
                         "model_state_dict": policy.serialize(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
                         "epoch": epoch,
                         "best_val": best_val,
                     }
@@ -456,19 +462,26 @@ def train_bc(
                         else:
                             tqdm.write(f"New best model (Total: {best_val:.5f}) - stored in GPU memory")
 
-        # Save latest checkpoint every epoch (rolling backup) - optional
-        # This allows resuming from any epoch, not just multiples of save_ckpt_every
-        if not disable_latest_checkpoint:
-            latest_ckpt_path = os.path.join(ckpt_dir, f"policy_latest_seed_{seed}.ckpt")
-            latest_payload = {
-                "model_state_dict": policy.serialize(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "epoch": epoch,
-                "best_val": best_val,
-            }
-            if scheduler is not None:
-                latest_payload["scheduler_state_dict"] = scheduler.state_dict()
-            torch.save(latest_payload, latest_ckpt_path)
+        # Save latest checkpoint every N epochs (rolling backup) - optional
+        # This allows resuming from recent epochs, not just multiples of save_ckpt_every
+        # Controlled by:
+        #   - disable_latest_checkpoint: completely disable latest checkpoint saving
+        #   - save_latest_every: save every N epochs (default: 1 = every epoch)
+        if (not disable_latest_checkpoint) and save_latest_every > 0:
+            # Use relative epoch index so behavior is consistent when resuming,
+            # but always overwrite the same latest checkpoint file (rolling update).
+            rel_epoch_idx = epoch - start_epoch + 1  # 1-based within this run
+            if rel_epoch_idx % save_latest_every == 0:
+                latest_ckpt_path = os.path.join(ckpt_dir, f"policy_latest_seed_{seed}.ckpt")
+                latest_payload = {
+                    "model_state_dict": policy.serialize(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "epoch": epoch,
+                    "best_val": best_val,
+                }
+                if scheduler is not None:
+                    latest_payload["scheduler_state_dict"] = scheduler.state_dict()
+                torch.save(latest_payload, latest_ckpt_path)
 
         # Interval-based best checkpoint saving: store best model in GPU memory,
         # write to disk only at interval end to reduce IO pressure
@@ -484,16 +497,14 @@ def train_bc(
                 prev_ckpt_path = os.path.join(
                     ckpt_dir, f"policy_interval_{interval_best_interval_idx}_epoch_{interval_best_epoch}_best_seed_{seed}.ckpt"
                 )
-                # Prepare payload for saving (copy state dicts to avoid reference issues)
+                # Prepare payload for saving: for interval-best checkpoints we only
+                # keep model weights and validation metrics to keep files compact.
                 save_payload = {
                     "model_state_dict": interval_best_state["model_state_dict"],
-                    "optimizer_state_dict": interval_best_state["optimizer_state_dict"],
                     "epoch": interval_best_state["epoch"],
                     "val_l1": interval_best_state.get("val_l1"),
                     "val_loss": interval_best_state.get("val_loss"),
                 }
-                if interval_best_state.get("scheduler_state_dict") is not None:
-                    save_payload["scheduler_state_dict"] = interval_best_state["scheduler_state_dict"]
                 torch.save(save_payload, prev_ckpt_path)
                 val_l1_str = f"{interval_best_state.get('val_l1', 'N/A'):.5f}" if interval_best_state.get("val_l1") is not None else "N/A"
                 if logger:
@@ -555,13 +566,10 @@ def train_bc(
         )
         save_payload = {
             "model_state_dict": interval_best_state["model_state_dict"],
-            "optimizer_state_dict": interval_best_state["optimizer_state_dict"],
             "epoch": interval_best_state["epoch"],
             "val_l1": interval_best_state.get("val_l1"),
             "val_loss": interval_best_state.get("val_loss"),
         }
-        if interval_best_state.get("scheduler_state_dict") is not None:
-            save_payload["scheduler_state_dict"] = interval_best_state["scheduler_state_dict"]
         torch.save(save_payload, last_ckpt_path)
         val_l1_str = f"{interval_best_state.get('val_l1', 'N/A'):.5f}" if interval_best_state.get("val_l1") is not None else "N/A"
         if logger:
@@ -578,15 +586,15 @@ def train_bc(
     
     # Write global best model checkpoint if it exists
     if global_best_state is not None:
+        # Use a stable filename for global best; metrics/epoch are stored in the payload.
         best_ckpt_path = os.path.join(ckpt_dir, f"policy_best_seed_{seed}.ckpt")
+        # Global best checkpoint: only store model weights and metrics;
+        # training resumes should go through latest / last checkpoints instead.
         save_payload = {
             "model_state_dict": global_best_state["model_state_dict"],
-            "optimizer_state_dict": global_best_state["optimizer_state_dict"],
             "epoch": global_best_state["epoch"],
             "best_val": global_best_state["best_val"],
         }
-        if global_best_state.get("scheduler_state_dict") is not None:
-            save_payload["scheduler_state_dict"] = global_best_state["scheduler_state_dict"]
         if "best_val_total_loss" in global_best_state:
             save_payload["best_val_total_loss"] = global_best_state["best_val_total_loss"]
         if "best_val_l1" in global_best_state:
@@ -704,26 +712,16 @@ def main(args: Dict):
         
         # Directly load from a directory of episode_*.hdf5 files
         camera_names = args.get("camera_names", ["left_frame", "right_frame"])
-        if hdf5_use_srt:
-            train_dataloader, val_dataloader, stats, _ = load_data_srt(
-                dataset_dir=dataset_dir,
-                num_episodes=num_episodes,
-                camera_names=camera_names,
-                batch_size_train=args["batch_size"],
-                batch_size_val=val_batch_size,
-                use_augmentation=args.get("use_augmentation", False),
-                augment_same_on_all=True,
-                train_ratio=train_ratio,
-            )
-        else:
-            train_dataloader, val_dataloader, stats, _ = load_data(
-                dataset_dir=dataset_dir,
-                num_episodes=num_episodes,
-                camera_names=camera_names,
-                batch_size_train=args["batch_size"],
-                batch_size_val=val_batch_size,
-                train_ratio=train_ratio,
-            )
+        repitition_factor = args.get("repitition_factor", 1)
+        train_dataloader, val_dataloader, stats, _ = load_data(
+            dataset_dir=dataset_dir,
+            num_episodes=num_episodes,
+            camera_names=camera_names,
+            batch_size_train=args["batch_size"],
+            batch_size_val=val_batch_size,
+            train_ratio=train_ratio,
+            repitition_factor=repitition_factor,
+        )
         # For simple episodic datasets we don't use explicit max_episode_len here;
         # chunk_size still controls the number of queries.
         max_episode_len = args.get("chunk_size", 30)
@@ -845,6 +843,7 @@ def main(args: Dict):
         "constant_lr": args.get("constant_lr", False),
         "save_ckpt_every": args.get("save_ckpt_every", 20),
         "disable_latest_checkpoint": args.get("disable_latest_checkpoint", False),
+        "save_latest_every": args.get("save_latest_every", 1),
         "device": device,
     }
 
@@ -884,6 +883,8 @@ if __name__ == "__main__":
     parser.add_argument("--use_augmentation", action="store_true", help="Enable data augmentation for images")
     parser.add_argument("--image_size", type=int, default=224, help="Image size for augmentation")
     parser.add_argument("--use_episodic_sampling", action="store_true", help="Use episodic sampling mode (similar to EpisodicDataset): traverse run IDs, randomly sample stage, then start_ts. Default: single random mode (traverse all stage/run, randomly sample start_ts)")
+    parser.add_argument("--repitition_factor", type=int, default=1, help="Repitition factor for the dataset")
+
 
     parser.add_argument("--task_config", type=json.loads, default=None)
     parser.add_argument("--log_every", type=int, default=1)
@@ -904,6 +905,12 @@ if __name__ == "__main__":
     parser.add_argument("--constant_lr", action="store_true", help="Disable learning rate scheduler and keep LR constant")
     parser.add_argument("--save_ckpt_every", type=int, default=20, help="Interval size for saving best checkpoint within each interval [i*n, (i+1)*n) based on val l1 loss (default: 100)")
     parser.add_argument("--disable_latest_checkpoint", action="store_true", help="Disable saving latest checkpoint every epoch to reduce disk IO (interval and global best models are still saved)")
+    parser.add_argument(
+        "--save_latest_every",
+        type=int,
+        default=1,
+        help="Save latest checkpoint every N epochs (default: 1). Ignored if --disable_latest_checkpoint is set.",
+    )
 
     # Simple HDF5 episodic dataset options (EpisodicDataset / SRTDataset in llp.utils)
     parser.add_argument("--dataset_dir", type=str, help="Directory containing episode_*.hdf5 files")

@@ -410,6 +410,7 @@ def build_act_model(args) -> DETRVAE:
         transformer,
         encoder,
         state_dim=state_dim,
+        action_dim=action_dim,
         num_queries=args.num_queries,
         camera_names=args.camera_names,
         use_language=args.use_language,
