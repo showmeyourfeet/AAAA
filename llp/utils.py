@@ -9,7 +9,7 @@ import cv2
 import h5py
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler, BatchSampler
 
 # Albumentations is optional; it is only needed when augmentation is enabled.
 try:
@@ -219,6 +219,70 @@ def get_episode_file_partitions(dataset_dir: str, refresh: bool = False) -> Dict
     return cache
 
 
+class RepetitionSampler(Sampler):
+    """
+    Base sampler that provides indices for one repetition cycle.
+    Used internally by NonCrossingRepetitionBatchSampler.
+    """
+    def __init__(self, base_length, shuffle=True):
+        self.base_length = base_length
+        self.shuffle = shuffle
+    
+    def __iter__(self):
+        indices = list(range(self.base_length))
+        if self.shuffle:
+            random.shuffle(indices)
+        return iter(indices)
+    
+    def __len__(self):
+        return self.base_length
+
+
+class NonCrossingRepetitionBatchSampler(BatchSampler):
+    """
+    BatchSampler that maintains the original sampling logic but repeats it repitition_factor times.
+    It ensures that batches don't cross repetition boundaries by organizing batches within
+    each repetition cycle.
+    
+    For example, with base_length=137, batch_size=32, repitition_factor=10:
+    - Each repetition cycle has 5 batches (137/32 = 4.28, rounded up)
+    - Total: 10 cycles × 5 batches = 50 batches
+    - Each batch contains indices from only one repetition cycle
+    """
+    def __init__(self, dataset, repitition_factor=1, batch_size=1, shuffle=True):
+        self.dataset = dataset
+        self.repitition_factor = repitition_factor
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.base_length = len(dataset.episode_ids)
+        
+        # Create base sampler for one repetition cycle
+        self.base_sampler = RepetitionSampler(self.base_length, shuffle=shuffle)
+        
+        # Calculate number of batches per repetition cycle
+        self.batches_per_cycle = (self.base_length + self.batch_size - 1) // self.batch_size
+    
+    def __iter__(self):
+        # Generate indices once for all repetition cycles (shuffled if needed)
+        # This ensures all cycles use the same shuffled sequence
+        indices = list(range(self.base_length))
+        if self.shuffle:
+            random.shuffle(indices)
+        
+        # For each repetition cycle, use the same shuffled sequence
+        for rep_idx in range(self.repitition_factor):
+            # Create batches within this cycle using the same indices
+            for batch_idx in range(self.batches_per_cycle):
+                start_idx = batch_idx * self.batch_size
+                end_idx = min(start_idx + self.batch_size, self.base_length)
+                if start_idx < self.base_length:
+                    # Yield a batch containing indices from this repetition cycle only
+                    yield indices[start_idx:end_idx]
+    
+    def __len__(self):
+        return self.batches_per_cycle * self.repitition_factor
+
+
 class EpisodicDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -244,10 +308,14 @@ class EpisodicDataset(torch.utils.data.Dataset):
             _ = self.__getitem__(0)
 
     def __len__(self):
-        return len(self.episode_ids)*self.repitition_factor
+        # Return base length (without repitition_factor expansion)
+        # The repetition is handled by RepetitionSampler
+        return len(self.episode_ids)
 
     def __getitem__(self, index):
-        original_index = index % len(self.episode_ids)
+        # Index now directly maps to episode (no modulo needed)
+        # RepetitionSampler will handle providing the same index multiple times
+        original_index = index
         sample_full_episode = False  # hardcode
         if self.real_ids is not None:
             episode_id = self.real_ids[original_index]
@@ -533,6 +601,8 @@ def load_data(
     batch_size_val, 
     train_ratio=0.8,
     repitition_factor=1,
+    prefetch_factor=1,
+    num_workers=1,
 ):
     print(f"\nData from: {dataset_dir}\n")
     partitions = get_episode_file_partitions(dataset_dir)
@@ -579,21 +649,39 @@ def load_data(
         repitition_factor=int(repitition_factor / 5),
         real_ids=real_val_ids,
     )
+    # Use NonCrossingRepetitionBatchSampler to maintain original sampling logic
+    # while ensuring batches don't cross repetition boundaries
+    train_batch_sampler = NonCrossingRepetitionBatchSampler(
+        train_dataset,
+        repitition_factor=repitition_factor,
+        batch_size=batch_size_train,
+        shuffle=True
+    )
+    val_batch_sampler = NonCrossingRepetitionBatchSampler(
+        val_dataset,
+        repitition_factor=int(repitition_factor / 5),
+        batch_size=batch_size_val,
+        shuffle=True
+    )
+    
+    # When num_workers=0, prefetch_factor must be None
+    train_prefetch_factor = None if num_workers == 0 else prefetch_factor
+    val_num_workers = int(num_workers * 0.2) if num_workers > 0 else 0
+    val_prefetch_factor = None if val_num_workers == 0 else int(prefetch_factor * 0.2)
+    
     train_dataloader = DataLoader(
         train_dataset,
-        batch_size=batch_size_train,
-        shuffle=True,
+        batch_sampler=train_batch_sampler,  # Use batch_sampler instead of sampler+batch_size
         pin_memory=True,
-        num_workers=1,
-        prefetch_factor=1,
+        num_workers=num_workers,
+        prefetch_factor=train_prefetch_factor,
     )
     val_dataloader = DataLoader(
         val_dataset,
-        batch_size=batch_size_val,
-        shuffle=True,
+        batch_sampler=val_batch_sampler,  # Use batch_sampler instead of sampler+batch_size
         pin_memory=True,
-        num_workers=1,
-        prefetch_factor=1,
+        num_workers=val_num_workers,
+        prefetch_factor=val_prefetch_factor,
     )
 
     return train_dataloader, val_dataloader, norm_stats, train_dataset.is_sim

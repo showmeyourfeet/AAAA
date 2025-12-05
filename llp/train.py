@@ -215,12 +215,33 @@ def train_bc(
     constant_lr = config.get("constant_lr", False)
 
     total_samples = len(train_dataloader.dataset)
-    batch_size = train_dataloader.batch_size
-    batches_per_epoch = math.ceil(total_samples / batch_size)
+    
+    # Get batch_size from batch_sampler if available, otherwise from DataLoader
+    # When using batch_sampler, DataLoader.batch_size is None
+    if hasattr(train_dataloader, 'batch_sampler') and train_dataloader.batch_sampler is not None:
+        batch_size = train_dataloader.batch_sampler.batch_size
+    else:
+        batch_size = train_dataloader.batch_size
+    
+    # Get actual batches per epoch from DataLoader
+    # This accounts for repitition_factor: batches_per_epoch = batches_per_cycle * repitition_factor
+    batches_per_epoch = len(train_dataloader)
+    
+    # Calculate scheduler step interval: every (total_episodes // batch_size + 1) batches
+    # This ensures we step the scheduler after processing approximately one full pass through all episodes
+    total_episodes = total_samples  # For EpisodicDataset, len() returns number of unique episodes
+    scheduler_step_interval = total_episodes // batch_size + 1
+    
+    # Calculate total number of scheduler steps
+    # Total batches = num_epochs * batches_per_epoch
+    # Scheduler steps = total_batches // scheduler_step_interval
+    total_batches = num_epochs * batches_per_epoch
+    num_scheduler_steps = total_batches // scheduler_step_interval
+    if total_batches % scheduler_step_interval != 0:
+        # Add one more step for remaining batches
+        num_scheduler_steps += 1
 
-    num_steps = num_epochs * batches_per_epoch
-
-    scheduler = None if constant_lr else make_scheduler(optimizer, num_steps)
+    scheduler = None if constant_lr else make_scheduler(optimizer, num_scheduler_steps)
 
     if load_ckpt == "y" and checkpoint is not None:
         print(f"Loading checkpoint from {ckpt_path}")
@@ -244,6 +265,10 @@ def train_bc(
         print(loading_status)
     else:
         start_epoch = 0
+    
+    # Initialize global_batch_idx based on start_epoch
+    # This ensures scheduler steps correctly when resuming from checkpoint
+    global_batch_idx = start_epoch * batches_per_epoch
 
     policy.to(device)
     
@@ -326,6 +351,7 @@ def train_bc(
     train_history: List[Dict[str, torch.Tensor]] = []
 
     epoch_bar = trange(start_epoch, num_epochs, desc="Epochs", leave=True)
+    # global_batch_idx is initialized above based on start_epoch
     for epoch in epoch_bar:
         policy.train()
         optimizer.zero_grad()
@@ -336,19 +362,32 @@ def train_bc(
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
+            
+            # Step scheduler every scheduler_step_interval batches
+            # This ensures we step after processing approximately one full pass through all episodes
+            # Track current learning rate for tqdm display
+            if scheduler is not None:
+                if global_batch_idx % scheduler_step_interval == 0:
+                    scheduler.step()
+            
+            global_batch_idx += 1
+            
             # Record epoch in training history for traceability
             history_entry = detach_dict(forward_dict)
             history_entry["epoch"] = torch.tensor(epoch, dtype=torch.long)
             train_history.append(history_entry)
+            
+            # Update tqdm postfix with loss, l1, and current learning rate (updated in place)
+            postfix_dict = {
+                "loss": f"{loss.item():.4f}",
+            }
             if "l1" in forward_dict:
-                batch_bar.set_postfix(
-                    {
-                        "l1": f"{forward_dict['l1'].item():.4f}",
-                        "loss": f"{loss.item():.4f}",
-                    }
-                )
-        if scheduler is not None:
-            scheduler.step()
+                postfix_dict["l1"] = f"{forward_dict['l1'].item():.4f}"
+            # Always show current learning rate in postfix (updates in place)
+            if scheduler is not None:
+                current_lr = scheduler.get_last_lr()[0]
+                postfix_dict["lr"] = f"{current_lr:.5e}"
+            batch_bar.set_postfix(postfix_dict)
         e = epoch - start_epoch
         epoch_summary = compute_dict_mean(
             train_history[(batch_idx + 1) * e : (batch_idx + 1) * (e + 1)]
@@ -721,6 +760,8 @@ def main(args: Dict):
             batch_size_val=val_batch_size,
             train_ratio=train_ratio,
             repitition_factor=repitition_factor,
+            prefetch_factor=args.get("prefetch_factor", 0),
+            num_workers=args.get("num_workers", 0),
         )
         # For simple episodic datasets we don't use explicit max_episode_len here;
         # chunk_size still controls the number of queries.
@@ -818,8 +859,8 @@ def main(args: Dict):
         "lr_backbone": args.get("lr_backbone", 1e-5),
         "weight_decay": args.get("weight_decay", 1e-4),
         "backbone": args["image_encoder"],
-        "enc_layers": 4,
-        "dec_layers": 7,
+        "enc_layers": args.get("enc_layers_num", 4),
+        "dec_layers": args.get("dec_layers_num", 7),
         "nheads": 8,
         "camera_names": camera_names,
         "multi_gpu": args["multi_gpu"],
@@ -858,10 +899,13 @@ if __name__ == "__main__":
     parser.add_argument("--num_epochs", type=int, required=True)
     parser.add_argument("--lr", type=float, required=True)
 
+    # Model options
     parser.add_argument("--kl_weight", type=float, default=1.0)
     parser.add_argument("--chunk_size", type=int, default=30)
     parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--dim_feedforward", type=int, default=3200)
+    parser.add_argument("--enc_layers_num", type=int, default=4)
+    parser.add_argument("--dec_layers_num", type=int, default=7)
     parser.add_argument("--image_encoder", type=str, default="efficientnet_b3film")
     parser.add_argument("--gpu", type=int, default=None, help="GPU ID to use (default: auto-select first available GPU, or CPU if no GPU available)")
     parser.add_argument("--multi_gpu", action="store_true")
@@ -875,6 +919,7 @@ if __name__ == "__main__":
     parser.add_argument("--language_encoder", type=str, default="distilbert", choices=["distilbert", "clip"])
     parser.add_argument("--command_list", nargs="*", default=[])
 
+    # Dataset options
     parser.add_argument("--use_splitted", action="store_true")
     parser.add_argument("--splitted_root", type=str)
     parser.add_argument("--val_splitted_root", type=str)
@@ -884,6 +929,10 @@ if __name__ == "__main__":
     parser.add_argument("--image_size", type=int, default=224, help="Image size for augmentation")
     parser.add_argument("--use_episodic_sampling", action="store_true", help="Use episodic sampling mode (similar to EpisodicDataset): traverse run IDs, randomly sample stage, then start_ts. Default: single random mode (traverse all stage/run, randomly sample start_ts)")
     parser.add_argument("--repitition_factor", type=int, default=1, help="Repitition factor for the dataset")
+    
+    # DataLoader options
+    parser.add_argument("--prefetch_factor", type=int, default=0, help="Prefetch factor for the dataset")
+    parser.add_argument("--num_workers", type=int, default=0, help="Number of workers for the dataset")
 
 
     parser.add_argument("--task_config", type=json.loads, default=None)
