@@ -23,7 +23,7 @@ except ImportError:
     ALBUMENTATIONS_AVAILABLE = False
     A = None
 
-from .utils import crop_resize
+from .utils import crop_resize, NonCrossingRepetitionBatchSampler
 
 
 CROP_TOP = True
@@ -711,6 +711,10 @@ def load_splitted_data(
     image_size: int = 224,
     use_episodic_sampling: bool = False,
     use_state: bool = True,
+    repitition_factor: int = 1,
+    prefetch_factor: int | None = 2,
+    num_workers: int = 8,
+    norm_stats_override: Dict[str, np.ndarray] | None = None,
 ):
     stage_embeddings = None
     if use_language and stage_embeddings_file and os.path.exists(stage_embeddings_file):
@@ -723,7 +727,7 @@ def load_splitted_data(
             if "stage" in e and "embedding" in e
         }
 
-    norm_stats = get_norm_stats_splitted(root_dir)
+    norm_stats = norm_stats_override or get_norm_stats_splitted(root_dir)
     dataset = SplittedEpisodicDataset(
         root_dir,
         camera_names,
@@ -737,13 +741,21 @@ def load_splitted_data(
         use_episodic_sampling=use_episodic_sampling,
         use_state=use_state,
     )
-    train_dataloader = DataLoader(
-        dataset,
+    # 复用 utils 中的非跨界重复 BatchSampler 来放大 epoch 批次数
+    batch_sampler = NonCrossingRepetitionBatchSampler(
+        dataset=dataset,
+        repitition_factor=repitition_factor,
         batch_size=batch_size_train,
         shuffle=True,
+    )
+    effective_prefetch = prefetch_factor if (num_workers and num_workers > 0) else None
+
+    train_dataloader = DataLoader(
+        dataset,
+        batch_sampler=batch_sampler,
         pin_memory=True,
-        num_workers=8,
-        prefetch_factor=2,
+        num_workers=num_workers,
+        prefetch_factor=effective_prefetch,
         persistent_workers=False,
     )
     return train_dataloader, norm_stats, False

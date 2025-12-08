@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import pickle
+import re
 from typing import Dict, List, Sequence
 
 import numpy as np
@@ -130,6 +131,64 @@ def make_scheduler(optimizer: torch.optim.Optimizer, num_steps: int) -> LambdaLR
     return get_cosine_schedule_with_warmup(
         optimizer, num_warmup_steps=num_steps // 100, num_training_steps=num_steps
     )
+
+
+def compute_splitted_norm_stats(roots: Sequence[str]) -> Dict[str, np.ndarray]:
+    """聚合多个 splitted 根目录的统计量，生成 action/qpos 的均值和方差。"""
+    all_actions, all_qpos = [], []
+    for root_dir in roots:
+        if not root_dir:
+            continue
+        for stage_dir in sorted(os.listdir(root_dir)):
+            stage_path = os.path.join(root_dir, stage_dir)
+            if not (stage_dir.startswith("stage") and os.path.isdir(stage_path)):
+                continue
+            for run_dir in sorted(os.listdir(stage_path)):
+                run_path = os.path.join(stage_path, run_dir)
+                if not (run_dir.startswith("run") and os.path.isdir(run_path)):
+                    continue
+                data_file = os.path.join(run_path, "data.txt")
+                if not os.path.exists(data_file):
+                    continue
+                with open(data_file, "r", encoding="utf-8") as f:
+                    content = f.read()
+                frame_blocks = re.split(r"Frame_\d+:", content)[1:]
+                q_list, a_list = [], []
+                for block in frame_blocks:
+                    m_act = re.search(r"action:\s*\[([^\]]+)\]", block)
+                    m_lr = re.search(r"lrstate:\s*\[([^\]]+)\]", block)
+                    if m_act and m_lr:
+                        try:
+                            a_list.append(
+                                [float(x.strip()) for x in m_act.group(1).split(",")]
+                            )
+                            q_list.append(
+                                [float(x.strip()) for x in m_lr.group(1).split(",")]
+                            )
+                        except Exception:
+                            continue
+                if a_list:
+                    all_actions.append(torch.tensor(a_list, dtype=torch.float32))
+                if q_list:
+                    all_qpos.append(torch.tensor(q_list, dtype=torch.float32))
+
+    if not all_actions or not all_qpos:
+        raise RuntimeError(
+            f"No valid actions/qpos to compute stats under roots={roots}"
+        )
+
+    all_actions_t = torch.cat(all_actions, dim=0)
+    all_qpos_t = torch.cat(all_qpos, dim=0)
+    action_mean = all_actions_t.mean(dim=0).float().numpy()
+    action_std = torch.clip(all_actions_t.std(dim=0), 1e-2).float().numpy()
+    qpos_mean = all_qpos_t.mean(dim=0).float().numpy()
+    qpos_std = torch.clip(all_qpos_t.std(dim=0), 1e-2).float().numpy()
+    return {
+        "action_mean": action_mean,
+        "action_std": action_std,
+        "qpos_mean": qpos_mean,
+        "qpos_std": qpos_std,
+    }
 
 
 def forward_pass(data, policy: ACTPolicy, device: torch.device):
@@ -772,6 +831,12 @@ def main(args: Dict):
             raise ValueError("--splitted_root must be provided when --use_splitted is set")
         camera_names = args.get("camera_names", ["left_frame", "right_frame"])
         max_episode_len = args.get("chunk_size", 30)
+        # 先对 train/val 根目录求联合统计量，供 train/val 数据集共享
+        roots_for_stats = [splitted_root]
+        val_root = args.get("val_splitted_root")
+        if val_root:
+            roots_for_stats.append(val_root)
+        stats = compute_splitted_norm_stats(roots_for_stats)
         train_dataloader, stats, _ = load_splitted_data(
             root_dir=splitted_root,
             camera_names=camera_names,
@@ -783,9 +848,12 @@ def main(args: Dict):
             image_size=args.get("image_size", 224),
             use_episodic_sampling=args.get("use_episodic_sampling", False),
             use_state=use_state,
+            repitition_factor=args.get("repitition_factor", 1),
+            prefetch_factor=args.get("prefetch_factor", 2),
+            num_workers=args.get("num_workers", 8),
+            norm_stats_override=stats,
         )
         val_dataloader = None
-        val_root = args.get("val_splitted_root")
         if val_root:
             stage_embeddings = None
             if use_language and stage_embeddings_file and os.path.exists(stage_embeddings_file):
@@ -800,7 +868,7 @@ def main(args: Dict):
             val_dataset = SplittedEpisodicDataset(
                 val_root,
                 camera_names,
-                stats,
+                stats,  # 与 train 共享同一统计量
                 max_len=max_episode_len,
                 use_language=use_language,
                 stage_embeddings=stage_embeddings,

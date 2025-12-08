@@ -254,7 +254,12 @@ class NonCrossingRepetitionBatchSampler(BatchSampler):
         self.repitition_factor = repitition_factor
         self.batch_size = batch_size
         self.shuffle = shuffle
-        self.base_length = len(dataset.episode_ids)
+        # 支持既有 episode_id 属性的数据集，也支持普通 __len__。
+        # 注意 episode_ids 可能为 None（如非 episodic 模式），需回落到 __len__。
+        if hasattr(dataset, "episode_ids") and dataset.episode_ids is not None:
+            self.base_length = len(dataset.episode_ids)
+        else:
+            self.base_length = len(dataset)
         
         # Create base sampler for one repetition cycle
         self.base_sampler = RepetitionSampler(self.base_length, shuffle=shuffle)
