@@ -240,11 +240,8 @@ class CustomResNet(ResNet):
             and self.layer4[0].use_film
             else self.layer4(x)
         )
-
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        x = self.fc(x)
-
+        # 作为 backbone 使用时，直接返回特征图 (B, C, H, W)
+        # avgpool、flatten、fc 已不需要
         return x
 
 

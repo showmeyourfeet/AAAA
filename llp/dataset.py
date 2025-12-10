@@ -23,7 +23,7 @@ except ImportError:
     ALBUMENTATIONS_AVAILABLE = False
     A = None
 
-from .utils import crop_resize, NonCrossingRepetitionBatchSampler
+from .utils import crop_resize
 
 
 CROP_TOP = True
@@ -646,88 +646,33 @@ class SplittedEpisodicDataset(torch.utils.data.Dataset):
         return image_data, qpos_data, action_data, is_pad
 
 
-def get_norm_stats_splitted(root_dir: str) -> Dict[str, np.ndarray]:
-    all_qpos, all_actions = [], []
-    for stage_dir in sorted(os.listdir(root_dir)):
-        stage_path = os.path.join(root_dir, stage_dir)
-        if not (stage_dir.startswith("stage") and os.path.isdir(stage_path)):
-            continue
-        for run_dir in sorted(os.listdir(stage_path)):
-            run_path = os.path.join(stage_path, run_dir)
-            if not (run_dir.startswith("run") and os.path.isdir(run_path)):
-                continue
-            data_file = os.path.join(run_path, "data.txt")
-            if not os.path.exists(data_file):
-                continue
-            with open(data_file, "r", encoding="utf-8") as f:
-                content = f.read()
-            frame_blocks = re.split(r"Frame_\d+:", content)[1:]
-            q_list, a_list = [], []
-            for block in frame_blocks:
-                m_act = re.search(r"action:\s*\[([^\]]+)\]", block)
-                m_lr = re.search(r"lrstate:\s*\[([^\]]+)\]", block)
-                if m_act and m_lr:
-                    try:
-                        a_list.append(
-                            [float(x.strip()) for x in m_act.group(1).split(",")]
-                        )
-                        q_list.append(
-                            [float(x.strip()) for x in m_lr.group(1).split(",")]
-                        )
-                    except Exception:
-                        continue
-            if a_list:
-                all_actions.append(torch.tensor(a_list, dtype=torch.float32))
-            if q_list:
-                all_qpos.append(torch.tensor(q_list, dtype=torch.float32))
-
-    if not all_actions or not all_qpos:
-        raise RuntimeError(
-            f"No valid actions/qpos to compute stats under {root_dir}"
-        )
-
-    all_actions = torch.cat(all_actions, dim=0)
-    all_qpos = torch.cat(all_qpos, dim=0)
-    action_mean = all_actions.mean(dim=0).float().numpy()
-    action_std = torch.clip(all_actions.std(dim=0), 1e-2).float().numpy()
-    qpos_mean = all_qpos.mean(dim=0).float().numpy()
-    qpos_std = torch.clip(all_qpos.std(dim=0), 1e-2).float().numpy()
-    return {
-        "action_mean": action_mean,
-        "action_std": action_std,
-        "qpos_mean": qpos_mean,
-        "qpos_std": qpos_std,
-    }
-
-
 def load_splitted_data(
     root_dir: str,
     camera_names: Sequence[str],
     batch_size_train: int,
     max_len: int,
+    norm_stats: Dict[str, np.ndarray],
     use_language: bool = False,
     stage_embeddings_file: str | None = None,
     use_augmentation: bool = False,
     image_size: int = 224,
     use_episodic_sampling: bool = False,
     use_state: bool = True,
-    repitition_factor: int = 1,
     prefetch_factor: int | None = 2,
     num_workers: int = 8,
-    norm_stats_override: Dict[str, np.ndarray] | None = None,
 ):
     stage_embeddings = None
     if use_language and stage_embeddings_file and os.path.exists(stage_embeddings_file):
         with open(stage_embeddings_file, "r", encoding="utf-8") as f:
             data = json.load(f)
         entries = data.get("stage_embeddings", data)
+        # Convert to 0-indexed to match stage_idx in SplittedEpisodicDataset
         stage_embeddings = {
-            int(e["stage"]): e["embedding"]
+            int(e["stage"]) - 1: e["embedding"]
             for e in entries
             if "stage" in e and "embedding" in e
         }
 
-    norm_stats = norm_stats_override or get_norm_stats_splitted(root_dir)
     dataset = SplittedEpisodicDataset(
         root_dir,
         camera_names,
@@ -741,22 +686,28 @@ def load_splitted_data(
         use_episodic_sampling=use_episodic_sampling,
         use_state=use_state,
     )
-    # 复用 utils 中的非跨界重复 BatchSampler 来放大 epoch 批次数
-    batch_sampler = NonCrossingRepetitionBatchSampler(
-        dataset=dataset,
-        repitition_factor=repitition_factor,
-        batch_size=batch_size_train,
-        shuffle=True,
-    )
     effective_prefetch = prefetch_factor if (num_workers and num_workers > 0) else None
+
+    # Worker init function to set random seed for each worker process
+    # This ensures reproducibility when using multiple workers
+    def worker_init_fn(worker_id):
+        import random
+        import numpy as np
+        import torch
+        # Use a combination of base seed and worker_id to ensure each worker has different but deterministic random state
+        worker_seed = torch.initial_seed() % (2**32)
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
 
     train_dataloader = DataLoader(
         dataset,
-        batch_sampler=batch_sampler,
+        batch_size=batch_size_train,
+        shuffle=True,
         pin_memory=True,
         num_workers=num_workers,
         prefetch_factor=effective_prefetch,
         persistent_workers=False,
+        worker_init_fn=worker_init_fn if num_workers > 0 else None,
     )
     return train_dataloader, norm_stats, False
 

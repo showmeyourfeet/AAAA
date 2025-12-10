@@ -29,7 +29,17 @@ class ACTPolicy(nn.Module):
         is_pad: torch.Tensor | None = None,
         command_embedding: torch.Tensor | None = None,
         vq_sample: torch.Tensor | None = None,
+        encode_command: bool = False,
     ):
+        """
+        Forward pass for training or inference.
+        
+        Args:
+            encode_command: whether to encode command_embedding in encoder (default False).
+                           Set to True to enable command encoding in CVAE encoder.
+                           Note: This only affects the encoder; decoder will still use command_embedding
+                           if provided and use_language=True.
+        """
         env_state = None
         if actions is not None:  # training time
             actions = actions[:, : self.num_queries]
@@ -43,6 +53,7 @@ class ACTPolicy(nn.Module):
                 is_pad,
                 command_embedding=command_embedding,
                 vq_sample=vq_sample,
+                encode_command=encode_command,
             )
             loss_dict: dict[str, torch.Tensor] = {}
             
@@ -72,7 +83,8 @@ class ACTPolicy(nn.Module):
             return loss_dict
         else:  # inference time
             a_hat, _, (_, _), _, _ = self.model(
-                qpos, image, env_state, vq_sample=vq_sample, command_embedding=command_embedding
+                qpos, image, env_state, vq_sample=vq_sample, command_embedding=command_embedding,
+                encode_command=encode_command,
             )  # no action, sample from prior
             return a_hat
 

@@ -11,7 +11,6 @@ from torchvision import transforms
 from torch import nn
 from torchvision.models._utils import IntermediateLayerGetter
 from typing import Dict, List
-import math
 from torchvision.models import (
     efficientnet_b0,
     EfficientNet_B0_Weights,
@@ -229,25 +228,18 @@ class FilMedBackbone(torch.nn.Module):
             self.backbone = film_efficientnet_b5(weights=weights, use_film=True)
         else:
             raise ValueError
-        # Remove final average pooling and classification layers.
-        if "resnet" in name:
-            self.backbone.avgpool = nn.Sequential()  # remove average pool layer
-            self.backbone.fc = nn.Sequential()  # remove classification layer
-        else:  # efficientnet
-            self.backbone.avgpool = nn.Sequential()  # remove average pool layer
-            self.backbone.classifier = nn.Sequential()  # remove classification layer
         # Get image preprocessing function.
-        self.preprocess = (
-            weights.transforms()
-        )  # Use this to preprocess images the same way as the pretrained model (e.g., ResNet-18).
+        # self.preprocess = (
+        #     weights.transforms()
+        # )  # Use this to preprocess images the same way as the pretrained model (e.g., ResNet-18).
         # print("---------------- inside preprocess-----------")
         # print(self.preprocess)
         # import sys
         # sys.exit()
 
-        # self.preprocess = transforms.Compose([ 
-        #     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-        # ]) # Use this if you don't want to resize images to 224x224.
+        self.preprocess = transforms.Compose([ 
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ]) # Use this if you don't want to resize images to 224x224.
 
     def forward(self, img_obs, language_embed):
         # img_obs shape: (batch_size, 3, H, W)
@@ -255,23 +247,7 @@ class FilMedBackbone(torch.nn.Module):
         img_obs = self.preprocess(img_obs)
         out = self.backbone(
             img_obs, language_embed
-        )  # shape (B, C_final * H_final * W_final) or (B, C_final, H_final, W_final)
-        # If needed, unflatten output tensor from (B, C_final * H_final * W_final) to (B, C_final, H_final, W_final)
-        if len(out.shape) == 2:
-            total_spatial = out.shape[-1] // self.num_channels
-            # 优先取接近平方的布局；若不能整平方，则用 H x W 相乘等于 total_spatial
-            H_final = int(math.sqrt(total_spatial))
-            if H_final * H_final == total_spatial:
-                W_final = H_final
-            else:
-                # 退化为长方形：以 H_final 为高，W_final 为剩余
-                if H_final == 0:
-                    H_final = 1
-                W_final = total_spatial // H_final
-                if H_final * W_final != total_spatial:
-                    # 最后兜底：单行铺开，避免尺寸不符报错
-                    H_final, W_final = 1, total_spatial
-            out = torch.unflatten(out, -1, (self.num_channels, H_final, W_final))
+        )  # shape: (B, C_final, H_final, W_final)
         return out
 
 

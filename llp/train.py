@@ -13,6 +13,7 @@ from typing import Dict, List, Sequence
 
 import numpy as np
 import torch
+from torch.cuda.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm, trange
 import math
@@ -191,7 +192,7 @@ def compute_splitted_norm_stats(roots: Sequence[str]) -> Dict[str, np.ndarray]:
     }
 
 
-def forward_pass(data, policy: ACTPolicy, device: torch.device):
+def forward_pass(data, policy: ACTPolicy, device: torch.device, encode_command: bool = False):
     if len(data) == 5:
         image_data, qpos_data, action_data, is_pad, command_embedding = data
         command_embedding = command_embedding.to(device)
@@ -202,7 +203,7 @@ def forward_pass(data, policy: ACTPolicy, device: torch.device):
     qpos_data = qpos_data.to(device)
     action_data = action_data.to(device)
     is_pad = is_pad.to(device)
-    return policy(qpos_data, image_data, action_data, is_pad, command_embedding)
+    return policy(qpos_data, image_data, action_data, is_pad, command_embedding, encode_command=encode_command)
 
 
 def train_bc(
@@ -216,6 +217,7 @@ def train_bc(
     seed = config["seed"]
     log_every = config.get("log_every", 1)
     device = config.get("device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    encode_command = config.get("encode_command", False)
 
     policy_config = config["policy_config"]
 
@@ -274,33 +276,17 @@ def train_bc(
     constant_lr = config.get("constant_lr", False)
 
     total_samples = len(train_dataloader.dataset)
-    
-    # Get batch_size from batch_sampler if available, otherwise from DataLoader
-    # When using batch_sampler, DataLoader.batch_size is None
-    if hasattr(train_dataloader, 'batch_sampler') and train_dataloader.batch_sampler is not None:
-        batch_size = train_dataloader.batch_sampler.batch_size
-    else:
-        batch_size = train_dataloader.batch_size
-    
-    # Get actual batches per epoch from DataLoader
-    # This accounts for repitition_factor: batches_per_epoch = batches_per_cycle * repitition_factor
+    batch_size = train_dataloader.batch_size
     batches_per_epoch = len(train_dataloader)
     
-    # Calculate scheduler step interval: every (total_episodes // batch_size + 1) batches
-    # This ensures we step the scheduler after processing approximately one full pass through all episodes
-    total_episodes = total_samples  # For EpisodicDataset, len() returns number of unique episodes
-    scheduler_step_interval = total_episodes // batch_size + 1
+    # Scheduler steps once per epoch
+    scheduler = None if constant_lr else make_scheduler(optimizer, num_epochs)
     
-    # Calculate total number of scheduler steps
-    # Total batches = num_epochs * batches_per_epoch
-    # Scheduler steps = total_batches // scheduler_step_interval
-    total_batches = num_epochs * batches_per_epoch
-    num_scheduler_steps = total_batches // scheduler_step_interval
-    if total_batches % scheduler_step_interval != 0:
-        # Add one more step for remaining batches
-        num_scheduler_steps += 1
-
-    scheduler = None if constant_lr else make_scheduler(optimizer, num_scheduler_steps)
+    # Mixed precision training (AMP)
+    use_amp = config.get("use_amp", False)
+    scaler = GradScaler() if use_amp else None
+    if use_amp:
+        print("Using mixed precision training (AMP)")
 
     if load_ckpt == "y" and checkpoint is not None:
         print(f"Loading checkpoint from {ckpt_path}")
@@ -324,10 +310,6 @@ def train_bc(
         print(loading_status)
     else:
         start_epoch = 0
-    
-    # Initialize global_batch_idx based on start_epoch
-    # This ensures scheduler steps correctly when resuming from checkpoint
-    global_batch_idx = start_epoch * batches_per_epoch
 
     policy.to(device)
     
@@ -410,72 +392,65 @@ def train_bc(
     train_history: List[Dict[str, torch.Tensor]] = []
 
     epoch_bar = trange(start_epoch, num_epochs, desc="Epochs", leave=True)
-    # global_batch_idx is initialized above based on start_epoch
     for epoch in epoch_bar:
         policy.train()
         optimizer.zero_grad()
-        batch_bar = tqdm(train_dataloader, desc=f"Train {epoch}", leave=False)
+        batch_bar = tqdm(train_dataloader, desc=f"Train {epoch+1}", leave=False)
         for batch_idx, data in enumerate(batch_bar):
-            forward_dict = forward_pass(data, policy, device)
-            loss = forward_dict["loss"]
-            loss.backward()
-            optimizer.step()
+            # Forward pass with optional AMP
+            if use_amp:
+                with autocast():
+                    forward_dict = forward_pass(data, policy, device, encode_command)
+                    loss = forward_dict["loss"]
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                forward_dict = forward_pass(data, policy, device, encode_command)
+                loss = forward_dict["loss"]
+                loss.backward()
+                optimizer.step()
             optimizer.zero_grad()
-            
-            # Step scheduler every scheduler_step_interval batches
-            # This ensures we step after processing approximately one full pass through all episodes
-            # Track current learning rate for tqdm display
-            if scheduler is not None:
-                if global_batch_idx % scheduler_step_interval == 0:
-                    scheduler.step()
-            
-            global_batch_idx += 1
             
             # Record epoch in training history for traceability
             history_entry = detach_dict(forward_dict)
             history_entry["epoch"] = torch.tensor(epoch, dtype=torch.long)
             train_history.append(history_entry)
             
-            # Update tqdm postfix with loss, l1, and current learning rate (updated in place)
-            postfix_dict = {
-                "loss": f"{loss.item():.4f}",
-            }
+            # Update tqdm postfix with loss, l1, and current learning rate
+            postfix_dict = {"loss": f"{loss.item():.4f}"}
             if "l1" in forward_dict:
                 postfix_dict["l1"] = f"{forward_dict['l1'].item():.4f}"
-            # Always show current learning rate in postfix (updates in place)
             if scheduler is not None:
-                current_lr = scheduler.get_last_lr()[0]
-                postfix_dict["lr"] = f"{current_lr:.5e}"
+                postfix_dict["lr"] = f"{scheduler.get_last_lr()[0]:.5e}"
             batch_bar.set_postfix(postfix_dict)
+        
+        # Step scheduler at end of each epoch
+        if scheduler is not None:
+            scheduler.step()
+        
+        # Compute epoch training summary
         e = epoch - start_epoch
         epoch_summary = compute_dict_mean(
             train_history[(batch_idx + 1) * e : (batch_idx + 1) * (e + 1)]
         )
         epoch_train_loss = epoch_summary["loss"]
-        msg = f"Train loss: {epoch_train_loss:.5f}"
+        current_lr = scheduler.get_last_lr()[0] if scheduler is not None else None
+        
+        # Log training summary
+        train_msg = f"Epoch {epoch+1}: train_loss={epoch_train_loss:.5f}"
+        if "l1" in epoch_summary:
+            train_msg += f", train_l1={epoch_summary['l1']:.5f}"
+        if current_lr is not None:
+            train_msg += f", lr={current_lr:.5e}"
         if logger:
-            logger.info(msg)
+            logger.info(train_msg)
         else:
-            tqdm.write(msg)
-        if scheduler is not None:
-            epoch_summary["lr"] = np.array(scheduler.get_last_lr()[0])
-        if (epoch + 1) % log_every == 0:
-            summary_parts = []
-            for k, v in epoch_summary.items():
-                value = float(v.item()) if hasattr(v, "item") else float(v)
-                if k == "lr":
-                    summary_parts.append(f"{k}: {value:.5e}")
-                elif k == "epoch":
-                    # epoch should be displayed as integer
-                    summary_parts.append(f"{k}: {int(value)}")
-                else:
-                    summary_parts.append(f"{k}: {value:.5f}")
-            summary_string = " ".join(summary_parts)
-            if logger:
-                logger.info(summary_string)
-            else:
-                tqdm.write(summary_string)
+            tqdm.write(train_msg)
 
+        # Validation at end of epoch
+        val_loss = None
+        val_l1 = None
         if val_dataloader is not None:
             policy.eval()
             val_losses = []
@@ -483,82 +458,46 @@ def train_bc(
             with torch.inference_mode():
                 val_bar = tqdm(val_dataloader, desc=f"Val {epoch}", leave=False)
                 for data in val_bar:
-                    forward_dict = forward_pass(data, policy, device)
+                    if use_amp:
+                        with autocast():
+                            forward_dict = forward_pass(data, policy, device, encode_command)
+                    else:
+                        forward_dict = forward_pass(data, policy, device, encode_command)
                     val_losses.append(forward_dict["loss"].item())
                     if "l1" in forward_dict:
                         val_l1_losses.append(forward_dict["l1"].item())
                     val_bar.set_postfix({"loss": f"{val_losses[-1]:.4f}"})
             val_loss = float(np.mean(val_losses)) if val_losses else float("inf")
-            if logger:
-                logger.info(f"Val loss: {val_loss:.5f}")
-            else:
-                tqdm.write(f"Val loss: {val_loss:.5f}")
-            # Log val l1 loss if available
-            val_l1 = None
-            if len(val_l1_losses) > 0:
-                val_l1 = float(np.mean(val_l1_losses))
-                if logger:
-                    logger.info(f"Val l1: {val_l1:.5f}")
-                else:
-                    tqdm.write(f"Val l1: {val_l1:.5f}")
+            val_l1 = float(np.mean(val_l1_losses)) if val_l1_losses else None
             
-            # Select best model based on chosen metric
-            # Store best model state in GPU memory (will be written at training end)
-            if best_model_metric == "l1_loss":
-                # Use l1 loss for best model selection
-                if val_l1 is None:
-                    msg_warn = "best_model_metric is 'l1_loss' but no val l1 loss available. Falling back to total_loss for this epoch."
-                    if logger:
-                        logger.warning(msg_warn)
-                    else:
-                        tqdm.write(f"Warning: {msg_warn}")
-                    # Fall back to total loss for this epoch
-                    if val_loss < best_val:
-                        best_val = val_loss
-                        # For global best, only keep model weights and metrics in memory;
-                        # optimizer/scheduler states are not needed since resume uses latest/last checkpoints.
-                        global_best_state = {
-                            "model_state_dict": policy.serialize(),
-                            "epoch": epoch,
-                            "best_val": best_val,
-                        }
-                        if logger:
-                            logger.info(f"New best model (Total: {best_val:.5f}, no L1 available) - stored in GPU memory")
-                        else:
-                            tqdm.write(f"New best model (Total: {best_val:.5f}, no L1 available) - stored in GPU memory")
-                elif val_l1 < best_val:
-                    best_val = val_l1
-                    global_best_state = {
-                        "model_state_dict": policy.serialize(),
-                        "epoch": epoch,
-                        "best_val": best_val,
-                        "best_val_total_loss": val_loss,  # Also save total loss for reference
-                    }
-                    if logger:
-                        logger.info(f"New best model (L1: {best_val:.5f}, Total: {val_loss:.5f}) - stored in GPU memory")
-                    else:
-                        tqdm.write(f"New best model (L1: {best_val:.5f}, Total: {val_loss:.5f}) - stored in GPU memory")
+            # Log validation metrics
+            val_msg = f"Epoch {epoch+1}: val_loss={val_loss:.5f}"
+            if val_l1 is not None:
+                val_msg += f", val_l1={val_l1:.5f}"
+            if logger:
+                logger.info(val_msg)
             else:
-                # Use total loss for best model selection (default)
-                if val_loss < best_val:
-                    best_val = val_loss
-                    global_best_state = {
-                        "model_state_dict": policy.serialize(),
-                        "epoch": epoch,
-                        "best_val": best_val,
-                    }
-                    if val_l1 is not None:
-                        global_best_state["best_val_l1"] = val_l1  # Also save l1 loss for reference
-                    if logger:
-                        if val_l1 is not None:
-                            logger.info(f"New best model (Total: {best_val:.5f}, L1: {val_l1:.5f}) - stored in GPU memory")
-                        else:
-                            logger.info(f"New best model (Total: {best_val:.5f}) - stored in GPU memory")
-                    else:
-                        if val_l1 is not None:
-                            tqdm.write(f"New best model (Total: {best_val:.5f}, L1: {val_l1:.5f}) - stored in GPU memory")
-                        else:
-                            tqdm.write(f"New best model (Total: {best_val:.5f}) - stored in GPU memory")
+                tqdm.write(val_msg)
+            
+            # Update global best model based on validation metric
+            if best_model_metric == "l1_loss":
+                current_val_metric = val_l1 if val_l1 is not None else val_loss
+            else:
+                current_val_metric = val_loss
+            
+            if current_val_metric is not None and current_val_metric < best_val:
+                best_val = current_val_metric
+                global_best_state = {
+                    "model_state_dict": policy.serialize(),
+                    "epoch": epoch,
+                    "best_val": best_val,
+                    "val_loss": val_loss,
+                    "val_l1": val_l1,
+                }
+                if logger:
+                    logger.info(f"New best model at epoch {epoch+1} with {best_model_metric}={current_val_metric:.5f}")
+                else:
+                    tqdm.write(f"New best model at epoch {epoch+1} with {best_model_metric}={current_val_metric:.5f}")
 
         # Save latest checkpoint every N epochs (rolling backup) - optional
         # This allows resuming from recent epochs, not just multiples of save_ckpt_every
@@ -571,6 +510,7 @@ def train_bc(
             rel_epoch_idx = epoch - start_epoch + 1  # 1-based within this run
             if rel_epoch_idx % save_latest_every == 0:
                 latest_ckpt_path = os.path.join(ckpt_dir, f"policy_latest_seed_{seed}.ckpt")
+                legacy_latest_path = os.path.join(ckpt_dir, "policy_latest.ckpt")
                 latest_payload = {
                     "model_state_dict": policy.serialize(),
                     "optimizer_state_dict": optimizer.state_dict(),
@@ -579,6 +519,12 @@ def train_bc(
                 }
                 if scheduler is not None:
                     latest_payload["scheduler_state_dict"] = scheduler.state_dict()
+
+                if os.path.exists(legacy_latest_path):
+                    try:
+                        os.remove(legacy_latest_path)
+                    except Exception:
+                        pass
                 torch.save(latest_payload, latest_ckpt_path)
 
         # Interval-based best checkpoint saving: store best model in GPU memory,
@@ -592,8 +538,11 @@ def train_bc(
             if interval_best_state is not None and interval_best_epoch >= 0:
                 prev_interval_start = start_epoch + interval_best_interval_idx * save_ckpt_every
                 prev_interval_end = start_epoch + (interval_best_interval_idx + 1) * save_ckpt_every
+                # Format val_l1 for filename (replace '.' with 'p' to avoid path issues)
+                interval_val_l1 = interval_best_state.get("val_l1")
+                val_l1_fname = f"_l1_{interval_val_l1:.5f}".replace(".", "p") if interval_val_l1 is not None else ""
                 prev_ckpt_path = os.path.join(
-                    ckpt_dir, f"policy_interval_{interval_best_interval_idx}_epoch_{interval_best_epoch}_best_seed_{seed}.ckpt"
+                    ckpt_dir, f"policy_interval_{interval_best_interval_idx}_epoch_{interval_best_epoch}{val_l1_fname}_best_seed_{seed}.ckpt"
                 )
                 # Prepare payload for saving: for interval-best checkpoints we only
                 # keep model weights and validation metrics to keep files compact.
@@ -627,10 +576,13 @@ def train_bc(
         # Update best checkpoint in current interval if validation is available
         # Store state in GPU memory, will be written at interval end
         if val_dataloader is not None:
-            # Use val_l1 if available, otherwise fall back to val_loss
-            current_val_metric = val_l1 if val_l1 is not None else val_loss
+            # 按 best_model_metric 选择验证指标：l1_loss 优先 val_l1，否则用 val_loss
+            if best_model_metric == "l1_loss":
+                current_val_metric = val_l1 if val_l1 is not None else val_loss
+            else:
+                current_val_metric = val_loss if val_loss is not None else val_l1
             
-            if current_val_metric < interval_best_val_l1:
+            if current_val_metric is not None and current_val_metric < interval_best_val_l1:
                 interval_best_val_l1 = current_val_metric
                 interval_best_epoch = epoch
                 interval_best_interval_idx = current_interval_idx
@@ -659,8 +611,11 @@ def train_bc(
     if interval_best_state is not None and interval_best_epoch >= 0:
         last_interval_start = start_epoch + interval_best_interval_idx * save_ckpt_every
         last_interval_end = start_epoch + (interval_best_interval_idx + 1) * save_ckpt_every
+        # Format val_l1 for filename
+        last_val_l1 = interval_best_state.get("val_l1")
+        val_l1_fname = f"_l1_{last_val_l1:.5f}".replace(".", "p") if last_val_l1 is not None else ""
         last_ckpt_path = os.path.join(
-            ckpt_dir, f"policy_interval_{interval_best_interval_idx}_epoch_{interval_best_epoch}_best_seed_{seed}.ckpt"
+            ckpt_dir, f"policy_interval_{interval_best_interval_idx}_epoch_{interval_best_epoch}{val_l1_fname}_best_seed_{seed}.ckpt"
         )
         save_payload = {
             "model_state_dict": interval_best_state["model_state_dict"],
@@ -684,35 +639,25 @@ def train_bc(
     
     # Write global best model checkpoint if it exists
     if global_best_state is not None:
-        # Use a stable filename for global best; metrics/epoch are stored in the payload.
-        best_ckpt_path = os.path.join(ckpt_dir, f"policy_best_seed_{seed}.ckpt")
-        # Global best checkpoint: only store model weights and metrics;
-        # training resumes should go through latest / last checkpoints instead.
+        # Format val_l1 for filename
+        global_val_l1 = global_best_state.get("val_l1")
+        val_l1_fname = f"_l1_{global_val_l1:.5f}".replace(".", "p") if global_val_l1 is not None else ""
+        best_ckpt_path = os.path.join(ckpt_dir, f"policy_best{val_l1_fname}_seed_{seed}.ckpt")
         save_payload = {
             "model_state_dict": global_best_state["model_state_dict"],
             "epoch": global_best_state["epoch"],
             "best_val": global_best_state["best_val"],
+            "val_loss": global_best_state.get("val_loss"),
+            "val_l1": global_best_state.get("val_l1"),
         }
-        if "best_val_total_loss" in global_best_state:
-            save_payload["best_val_total_loss"] = global_best_state["best_val_total_loss"]
-        if "best_val_l1" in global_best_state:
-            save_payload["best_val_l1"] = global_best_state["best_val_l1"]
         torch.save(save_payload, best_ckpt_path)
+        val_l1_str = f"{global_best_state.get('val_l1'):.5f}" if global_best_state.get("val_l1") is not None else "N/A"
+        val_loss_str = f"{global_best_state.get('val_loss'):.5f}" if global_best_state.get("val_loss") is not None else "N/A"
+        msg = f"Saved global best checkpoint (epoch {global_best_state['epoch']}, val_loss={val_loss_str}, val_l1={val_l1_str}) to {best_ckpt_path}"
         if logger:
-            if "best_val_total_loss" in global_best_state:
-                logger.info(f"Saved global best checkpoint (L1: {global_best_state['best_val']:.5f}, Total: {global_best_state['best_val_total_loss']:.5f}) to {best_ckpt_path}")
-            elif "best_val_l1" in global_best_state:
-                logger.info(f"Saved global best checkpoint (Total: {global_best_state['best_val']:.5f}, L1: {global_best_state['best_val_l1']:.5f}) to {best_ckpt_path}")
-            else:
-                logger.info(f"Saved global best checkpoint (Total: {global_best_state['best_val']:.5f}) to {best_ckpt_path}")
+            logger.info(msg)
         else:
-            if "best_val_total_loss" in global_best_state:
-                tqdm.write(f"Saved global best checkpoint (L1: {global_best_state['best_val']:.5f}, Total: {global_best_state['best_val_total_loss']:.5f}) to {best_ckpt_path}")
-            elif "best_val_l1" in global_best_state:
-                tqdm.write(f"Saved global best checkpoint (Total: {global_best_state['best_val']:.5f}, L1: {global_best_state['best_val_l1']:.5f}) to {best_ckpt_path}")
-            else:
-                tqdm.write(f"Saved global best checkpoint (Total: {global_best_state['best_val']:.5f}) to {best_ckpt_path}")
-    
+            tqdm.write(msg)
     # Save final checkpoint (last epoch state)
     ckpt_path_final = os.path.join(ckpt_dir, "policy_last.ckpt")
     final_payload = {
@@ -725,6 +670,15 @@ def train_bc(
     torch.save(final_payload, ckpt_path_final)
     if logger:
         logger.info(f"Saved final checkpoint to {ckpt_path_final}")
+
+    legacy_latest_path = os.path.join(ckpt_dir, f"policy_latest_seed_{seed}.ckpt")
+    if os.path.exists(legacy_latest_path):
+        try:
+            os.remove(legacy_latest_path)
+            if logger:
+                logger.info(f"Removed legacy latest checkpoint {legacy_latest_path}")
+        except Exception:
+            pass
 
 
 def main(args: Dict):
@@ -810,7 +764,6 @@ def main(args: Dict):
         
         # Directly load from a directory of episode_*.hdf5 files
         camera_names = args.get("camera_names", ["left_frame", "right_frame"])
-        repitition_factor = args.get("repitition_factor", 1)
         train_dataloader, val_dataloader, stats, _ = load_data(
             dataset_dir=dataset_dir,
             num_episodes=num_episodes,
@@ -818,7 +771,6 @@ def main(args: Dict):
             batch_size_train=args["batch_size"],
             batch_size_val=val_batch_size,
             train_ratio=train_ratio,
-            repitition_factor=repitition_factor,
             prefetch_factor=args.get("prefetch_factor", 0),
             num_workers=args.get("num_workers", 0),
         )
@@ -842,16 +794,15 @@ def main(args: Dict):
             camera_names=camera_names,
             batch_size_train=args["batch_size"],
             max_len=max_episode_len,
+            norm_stats=stats,
             use_language=use_language,
             stage_embeddings_file=stage_embeddings_file,
             use_augmentation=args.get("use_augmentation", False),
             image_size=args.get("image_size", 224),
             use_episodic_sampling=args.get("use_episodic_sampling", False),
             use_state=use_state,
-            repitition_factor=args.get("repitition_factor", 1),
             prefetch_factor=args.get("prefetch_factor", 2),
             num_workers=args.get("num_workers", 8),
-            norm_stats_override=stats,
         )
         val_dataloader = None
         if val_root:
@@ -860,8 +811,9 @@ def main(args: Dict):
                 with open(stage_embeddings_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 entries = data.get("stage_embeddings", data)
+                # Convert to 0-indexed to match stage_idx in SplittedEpisodicDataset
                 stage_embeddings = {
-                    int(e["stage"]): e["embedding"]
+                    int(e["stage"]) - 1: e["embedding"]
                     for e in entries
                     if "stage" in e and "embedding" in e
                 }
@@ -918,6 +870,13 @@ def main(args: Dict):
     with open(stats_path, "wb") as f:
         pickle.dump(stats, f)
 
+    # Determine shared_backbone: use explicit arg if provided, otherwise compute default
+    if "shared_backbone" in args and args["shared_backbone"] is not None:
+        shared_backbone = args["shared_backbone"]
+    else:
+        # Default logic: share backbone if not using language and not using film
+        shared_backbone = not use_language and "film" not in args["image_encoder"]
+    
     policy_config = {
         "lr": args["lr"],
         "num_queries": args["chunk_size"],
@@ -940,6 +899,7 @@ def main(args: Dict):
         "vq_dim": args.get("vq_dim", 32),
         "train_image_encoder": args.get("train_image_encoder", False),
         "use_state": use_state,
+        "shared_backbone": shared_backbone,
     }
 
     config = {
@@ -966,6 +926,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--num_epochs", type=int, required=True)
     parser.add_argument("--lr", type=float, required=True)
+    parser.add_argument("--use_amp", action="store_true", help="Enable mixed precision training (AMP) to reduce GPU memory usage")
 
     # Model options
     parser.add_argument("--kl_weight", type=float, default=1.0)
@@ -982,10 +943,12 @@ if __name__ == "__main__":
     parser.add_argument("--vq", action="store_true", help="Use Vector Quantization instead of standard VAE")
     parser.add_argument("--vq_class", type=int, default=512, help="Number of VQ codebook classes")
     parser.add_argument("--vq_dim", type=int, default=32, help="Dimension of each VQ codebook entry")
+    parser.add_argument("--shared_backbone", type=lambda x: x.lower() in ('true', '1', 'yes'), default=None, help="Whether to share backbone across cameras (default: auto-detect based on use_language and image_encoder)")
 
     parser.add_argument("--use_language", action="store_true")
     parser.add_argument("--language_encoder", type=str, default="distilbert", choices=["distilbert", "clip"])
     parser.add_argument("--command_list", nargs="*", default=[])
+    parser.add_argument("--encode_command", action="store_true", help="Enable encoding command_embedding in CVAE encoder (default: disabled, decoder will still use it if use_language=True)")
 
     # Dataset options
     parser.add_argument("--use_splitted", action="store_true")
@@ -996,7 +959,6 @@ if __name__ == "__main__":
     parser.add_argument("--use_augmentation", action="store_true", help="Enable data augmentation for images")
     parser.add_argument("--image_size", type=int, default=224, help="Image size for augmentation")
     parser.add_argument("--use_episodic_sampling", action="store_true", help="Use episodic sampling mode (similar to EpisodicDataset): traverse run IDs, randomly sample stage, then start_ts. Default: single random mode (traverse all stage/run, randomly sample start_ts)")
-    parser.add_argument("--repitition_factor", type=int, default=1, help="Repitition factor for the dataset")
     
     # DataLoader options
     parser.add_argument("--prefetch_factor", type=int, default=0, help="Prefetch factor for the dataset")

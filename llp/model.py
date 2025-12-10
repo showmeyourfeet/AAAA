@@ -54,7 +54,6 @@ class DETRVAE(nn.Module):
         use_language=False,
         use_film=False,
         num_command=2,
-        shared_backbone=False,
         vq=False,
         vq_class=512,
         vq_dim=32,
@@ -75,7 +74,8 @@ class DETRVAE(nn.Module):
         self.use_state = use_state
         self.state_dim = state_dim
         self.action_dim = action_dim
-        self.shared_backbone = shared_backbone
+        # shared_backbone will be set externally after model creation
+        self.shared_backbone = False
         if use_language:
             self.lang_embed_proj = nn.Linear(
                 768, hidden_dim
@@ -112,9 +112,15 @@ class DETRVAE(nn.Module):
         else:
             self.latent_proj = nn.Linear(hidden_dim, self.latent_dim * 2)  # project hidden state to latent std, var
         
+        num_special_tokens = 1
+        if self.use_state:
+            num_special_tokens += 1
+        if self.use_language:
+            num_special_tokens += 1
+
         self.register_buffer(
             "pos_table",
-            get_sinusoid_encoding_table(1 + (1 if self.use_state else 0) + num_queries, hidden_dim),
+            get_sinusoid_encoding_table(num_special_tokens + num_queries, hidden_dim),
             # persistent=False,
         )
 
@@ -132,6 +138,7 @@ class DETRVAE(nn.Module):
         else:
             self.proprio_pos_id = None
         if self.use_language:
+            self.encoder_language_proj = nn.Linear(768, hidden_dim)
             self.command_pos_id = pos_embed_dim
             pos_embed_dim += 1
         else:
@@ -150,7 +157,7 @@ class DETRVAE(nn.Module):
             embed_ids.append(self.command_pos_id)
         return self.additional_pos_embed.weight[embed_ids]
 
-    def encode(self, qpos, actions=None, is_pad=None, vq_sample=None):
+    def encode(self, qpos, actions=None, is_pad=None, vq_sample=None, command_embedding=None, encode_command=False):
         """
         Encode action sequence to latent representation.
         
@@ -159,7 +166,9 @@ class DETRVAE(nn.Module):
             actions: batch, seq, action_dim (training only)
             is_pad: batch, seq (training only)
             vq_sample: VQ sample for inference (optional)
-        
+            command_embedding: batch, command_embedding_dim (optional)
+            encode_command: whether to encode command_embedding in encoder (default False).
+                           Set to True to enable command encoding in CVAE encoder.
         Returns:
             latent_input: batch, hidden_dim
             probs: batch, vq_class, vq_dim (VQ mode) or None (VAE mode)
@@ -196,6 +205,12 @@ class DETRVAE(nn.Module):
                 prefix_tokens = [cls_embed]
                 prefix_pad = [torch.full((bs, 1), False, device=cls_embed.device)]
 
+                if self.use_language and command_embedding is not None and encode_command:
+                    cmd_embed = self.encoder_language_proj(command_embedding)
+                    cmd_embed = torch.unsqueeze(cmd_embed, axis=1)
+                    prefix_tokens.append(cmd_embed)
+                    prefix_pad.append(torch.full((bs, 1), False, device=command_embedding.device))
+
                 if self.use_state and qpos is not None:
                     q_dim = qpos.shape[-1]
                     if self.encoder_joint_proj is None or self.encoder_joint_proj.in_features != q_dim:
@@ -214,8 +229,11 @@ class DETRVAE(nn.Module):
                 is_pad = torch.cat([cls_joint_is_pad, is_pad], axis=1)
                 
                 # Obtain position embedding
-                pos_embed = self.pos_table.clone().detach()
-                pos_embed = pos_embed.permute(1, 0, 2)  # (seq+2, 1, hidden_dim)
+                # Slice pos_table to match actual encoder_input sequence length
+                # (pos_table is sized for max tokens, but command token is conditionally added)
+                seq_len = encoder_input.shape[0]
+                pos_embed = self.pos_table[:, :seq_len, :].clone().detach()
+                pos_embed = pos_embed.permute(1, 0, 2)  # (seq_len, 1, hidden_dim)
                 
                 # Query model
                 encoder_output = self.encoder(
@@ -281,6 +299,7 @@ class DETRVAE(nn.Module):
         is_pad=None,
         command_embedding=None,
         vq_sample=None,
+        encode_command=False,
     ):
         """
         Forward pass.
@@ -293,6 +312,8 @@ class DETRVAE(nn.Module):
             is_pad: batch, seq (training only)
             command_embedding: batch, command_embedding_dim (optional)
             vq_sample: VQ sample (not used in our implementation)
+            encode_command: whether to encode command_embedding in encoder (default False).
+                           Set to True to enable command encoding in CVAE encoder.
         
         Returns:
             a_hat: predicted actions
@@ -302,7 +323,7 @@ class DETRVAE(nn.Module):
             binaries: None (VQ not used)
         """
         # Encode action sequence to latent
-        latent_input, probs, binaries, mu, logvar = self.encode(qpos, actions, is_pad, vq_sample)
+        latent_input, probs, binaries, mu, logvar = self.encode(qpos, actions, is_pad, vq_sample, command_embedding, encode_command)
 
         # Project command embedding if using language
         if command_embedding is not None and self.use_language:
@@ -315,10 +336,22 @@ class DETRVAE(nn.Module):
             all_cam_pos = []
             for cam_id, _ in enumerate(self.camera_names):
                 backbone_idx = 0 if self.shared_backbone else cam_id
-                if self.use_film:
-                    features, pos = self.backbones[backbone_idx](image[:, cam_id], command_embedding)
+                backbone = self.backbones[backbone_idx]
+                # Check if backbone is frozen (no trainable params)
+                backbone_frozen = not any(p.requires_grad for p in backbone.parameters())
+                
+                # Use no_grad for frozen backbone to save memory
+                if backbone_frozen:
+                    with torch.no_grad():
+                        if self.use_film:
+                            features, pos = backbone(image[:, cam_id], command_embedding)
+                        else:
+                            features, pos = backbone(image[:, cam_id])
                 else:
-                    features, pos = self.backbones[backbone_idx](image[:, cam_id])
+                    if self.use_film:
+                        features, pos = backbone(image[:, cam_id], command_embedding)
+                    else:
+                        features, pos = backbone(image[:, cam_id])
                 features = features[0]
                 pos = pos[0]
                 all_cam_features.append(self.input_proj(features))
@@ -385,7 +418,12 @@ def build_act_model(args) -> DETRVAE:
     state_dim = getattr(args, "state_dim", 20)
     action_dim = getattr(args, "action_dim", 20)
     backbones = []
-    share_backbone = not args.use_language and "film" not in args.backbone
+    # Get shared_backbone from args, or compute default if not provided
+    if hasattr(args, "shared_backbone") and args.shared_backbone is not None:
+        share_backbone = args.shared_backbone
+    else:
+        # Default logic: share backbone if not using language and not using film
+        share_backbone = not args.use_language and "film" not in args.backbone
 
     if share_backbone:
         backbones.append(build_backbone(args))
@@ -418,9 +456,11 @@ def build_act_model(args) -> DETRVAE:
         vq=vq,
         vq_class=vq_class,
         vq_dim=vq_dim,
-        shared_backbone=share_backbone,
         use_state=getattr(args, "use_state", True),
     )
+    
+    # Set shared_backbone after model creation
+    model.shared_backbone = share_backbone
 
     # Handle image encoder training control
     train_image_encoder = getattr(args, "train_image_encoder", False)

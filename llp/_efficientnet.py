@@ -326,7 +326,7 @@ class FusedMBConv(nn.Module):
                 language_embed_size=language_embed_size, num_channels=self.out_channels
             )
 
-    def forward(self, input: Tensor) -> Tensor:
+    def forward(self, input: Tensor, language_embed: Tensor | None = None) -> Tensor:
         result = self.block(input)
         if self.use_res_connect:
             result = self.stochastic_depth(result)
@@ -474,6 +474,8 @@ class EfficientNet(nn.Module):
             if isinstance(m, FiLMBlock):
                 nn.init.zeros_(m.scale.weight)
                 nn.init.zeros_(m.scale.bias)
+                nn.init.zeros_(m.shift.weight)
+                nn.init.zeros_(m.shift.bias)
 
     def _forward_impl(self, x: Tensor, language_embed: Tensor) -> Tensor:
         # x = self.features(x)
@@ -482,12 +484,8 @@ class EfficientNet(nn.Module):
             for filmed_mbconv_block in stage:
                 x = filmed_mbconv_block(x, language_embed)
         x = self.last_layer(x)
-
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-
-        x = self.classifier(x)
-
+        # 作为 backbone 使用时，直接返回特征图 (B, C, H, W)
+        # avgpool、flatten、classifier 已不需要
         return x
 
     def forward(self, x: Tensor, language_embed: Tensor) -> Tensor:
@@ -583,7 +581,8 @@ def _efficientnet(
                     else:
                         raise ValueError(f"This branch should never be reached.")
                 elif "classifier" in k:
-                    new_key = k
+                    continue
+                    # new_key = k
                 else:
                     raise ValueError(f"This branch should never be reached.")
                 old_to_new_key_mapping[k] = new_key
@@ -594,7 +593,7 @@ def _efficientnet(
             for name, param in model.named_parameters():
                 if "film" in name:
                     weights_dict[name] = param
-        model.load_state_dict(weights_dict)
+        model.load_state_dict(weights_dict, strict=False)
     return model
 
 
