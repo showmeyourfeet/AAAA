@@ -426,7 +426,7 @@ def load_candidate_texts_and_embeddings(dataset_dirs, device=torch.device("cuda"
     return candidate_texts, candidate_embeddings
 
 
-def build_HighLevelModel(dataset_dirs, history_len, device, stage_embeddings_file=None, stage_texts_file=None, train_image_encoder=False):
+def build_HighLevelModel(dataset_dirs, history_len, device, stage_embeddings_file=None, stage_texts_file=None, train_image_encoder=False, num_cameras=4, aggregation_mode="last"):
     # Load candidate texts and embeddings
     candidate_texts, candidate_embeddings = load_candidate_texts_and_embeddings(
         dataset_dirs, device=device, stage_embeddings_file=stage_embeddings_file, stage_texts_file=stage_texts_file
@@ -441,6 +441,8 @@ def build_HighLevelModel(dataset_dirs, history_len, device, stage_embeddings_fil
         candidate_texts=candidate_texts,
         command_to_index=command_to_index,
         train_image_encoder=train_image_encoder,
+        num_cameras=num_cameras,
+        aggregation_mode=aggregation_mode,
     ).to(device)
     return model
 
@@ -502,6 +504,8 @@ if __name__ == "__main__":
                         help='Number of DataLoader workers for validation (annotation dataset). 0 = no multiprocessing (safer on WSL).')
     # Image encoder training control
     parser.add_argument('--train_image_encoder', action='store_true', help='Enable training of the image encoder (default: frozen)')
+    parser.add_argument('--aggregation_mode', type=str, default='last', choices=['last', 'avg', 'cls'],
+                        help="Aggregation mode for transformer output: 'last' (default), 'avg' (mean pooling), 'cls' (use [CLS] token)")
     parser.add_argument('--save_ckpt_every', type=int, default=100,
                         help='Interval size for saving the best checkpoint within each interval [i*n, (i+1)*n) based on val loss (default: 100)')
 
@@ -553,6 +557,8 @@ if __name__ == "__main__":
             stage_embeddings_file=args.stage_embeddings_file,
             stage_texts_file=args.stage_texts_file,
             train_image_encoder=args.train_image_encoder,
+            num_cameras=len(args.camera_names),
+            aggregation_mode=args.aggregation_mode,
         )
 
     elif args.use_splitted or args.use_composite:
@@ -643,6 +649,8 @@ if __name__ == "__main__":
             stage_embeddings_file=args.stage_embeddings_file,
             stage_texts_file=args.stage_texts_file,
             train_image_encoder=args.train_image_encoder,
+            num_cameras=len(camera_names),
+            aggregation_mode=args.aggregation_mode,
         )
     else:
         # Traditional format: use explicit dataset_dirs and camera_names
@@ -672,6 +680,8 @@ if __name__ == "__main__":
             args.history_len, 
             device,
             train_image_encoder=args.train_image_encoder,
+            num_cameras=len(camera_names),
+            aggregation_mode=args.aggregation_mode,
         )
     
     # Optimizer

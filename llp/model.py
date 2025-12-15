@@ -464,12 +464,26 @@ def build_act_model(args) -> DETRVAE:
 
     # Handle image encoder training control
     train_image_encoder = getattr(args, "train_image_encoder", False)
+    use_film = "film" in args.backbone
     if not train_image_encoder:
-        # Freeze all backbone parameters
+        # Freeze backbone parameters, but keep FiLM parameters trainable
+        # FiLM layers are essential for language conditioning and should always be trained
+        film_params_count = 0
+        frozen_params_count = 0
         for backbone in model.backbones:
-            for param in backbone.parameters():
-                param.requires_grad = False
-        print("Image encoder backbones frozen (default)")
+            for name, param in backbone.named_parameters():
+                if use_film and "film" in name:
+                    # Keep FiLM parameters trainable (scale/shift layers for language conditioning)
+                    param.requires_grad = True
+                    film_params_count += param.numel()
+                else:
+                    param.requires_grad = False
+                    frozen_params_count += param.numel()
+        if use_film:
+            print(f"Image encoder backbones frozen (default), but FiLM layers kept trainable "
+                  f"(frozen: {frozen_params_count:,} params, FiLM trainable: {film_params_count:,} params)")
+        else:
+            print("Image encoder backbones frozen (default)")
     else:
         print("Image encoder backbones unfrozen for training")
 

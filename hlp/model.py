@@ -35,8 +35,14 @@ class HighLevelModel(nn.Module):
         command_to_index=None,
         num_cameras=4,
         train_image_encoder=False,
+        aggregation_mode="last",  # 'last', 'avg', or 'cls'
     ):
         super().__init__()
+        
+        assert aggregation_mode in ("last", "avg", "cls"), \
+            f"aggregation_mode must be 'last', 'avg', or 'cls', got {aggregation_mode}"
+        self.aggregation_mode = aggregation_mode
+        self.num_cameras = num_cameras
 
         # Load the pretrained Swin-Tiny image encoder (timm)
         # Outputs a pooled feature vector of dimension self.visual_out_dim
@@ -75,10 +81,23 @@ class HighLevelModel(nn.Module):
         # Learnable temperature
         self.temperature = nn.Parameter(torch.ones(1))
 
-        # Positional Encoding
-        self.positional_encoding = self.create_sinusoidal_embeddings(
-            self.visual_out_dim, (history_len + 1) * num_cameras
-        )
+        # Positional Encoding: separate temporal and camera encoding for multi-camera
+        if num_cameras > 1:
+            # Temporal positional encoding (for each timestep)
+            self.temporal_positional_encoding = self.create_sinusoidal_embeddings(
+                self.visual_out_dim, history_len + 1
+            )
+            # Learnable camera embedding
+            self.camera_embedding = nn.Embedding(num_cameras, self.visual_out_dim)
+        else:
+            # Single camera: use original flat positional encoding
+            self.positional_encoding = self.create_sinusoidal_embeddings(
+                self.visual_out_dim, history_len + 1
+            )
+        
+        # CLS token for 'cls' aggregation mode
+        if aggregation_mode == "cls":
+            self.cls_token = nn.Parameter(torch.randn(1, 1, self.visual_out_dim))
 
         self.history_len = history_len
         self.candidate_embeddings = candidate_embeddings
@@ -88,6 +107,7 @@ class HighLevelModel(nn.Module):
         total, trainable = count_parameters(self)
         print(f"Total parameters: {total / 1e6:.2f}M")
         print(f"Trainable parameters: {trainable / 1e6:.2f}M")
+        print(f"Aggregation mode: {aggregation_mode}")
 
     def forward(self, images):
         # Given images of shape (b, t, k, c, h, w)
@@ -113,23 +133,56 @@ class HighLevelModel(nn.Module):
         # Get image features from Swin-Tiny
         image_features = self.image_encoder(images_transformed)  # (B*, D)
 
-        # Reshape the image features to [batch_size, timesteps*cameras, feature_dim]
+        # Reshape the image features to [batch_size, timesteps, cameras, feature_dim]
         image_features_reshaped = image_features.reshape(
-            batch_size, timesteps * num_cameras, -1
+            batch_size, timesteps, num_cameras, -1
         ).to(torch.float32)
 
         # Add positional encoding
-        image_features_reshaped += self.positional_encoding[
-            : timesteps * num_cameras, :
-        ].to(image_features_reshaped.device)
+        if self.num_cameras > 1:
+            # Separate temporal + camera encoding for multi-camera setup
+            # temporal_pe: (timesteps, D) -> (1, timesteps, 1, D)
+            temporal_pe = self.temporal_positional_encoding[:timesteps, :].to(
+                image_features_reshaped.device
+            ).unsqueeze(0).unsqueeze(2)
+            # camera_pe: (num_cameras, D) -> (1, 1, num_cameras, D)
+            camera_pe = self.camera_embedding.weight[:num_cameras, :].unsqueeze(0).unsqueeze(1)
+            # Combine: broadcast to (batch, timesteps, cameras, D)
+            image_features_reshaped = image_features_reshaped + temporal_pe + camera_pe
+        else:
+            # Single camera: use flat positional encoding
+            # (timesteps, D) -> (1, timesteps, 1, D)
+            pos_enc = self.positional_encoding[:timesteps, :].to(
+                image_features_reshaped.device
+            ).unsqueeze(0).unsqueeze(2)
+            image_features_reshaped = image_features_reshaped + pos_enc
+
+        # Flatten to [batch_size, timesteps * cameras, feature_dim]
+        image_features_flat = image_features_reshaped.reshape(
+            batch_size, timesteps * num_cameras, -1
+        )
+
+        # Prepend CLS token if using 'cls' aggregation mode
+        if self.aggregation_mode == "cls":
+            cls_tokens = self.cls_token.expand(batch_size, -1, -1).to(image_features_flat.device)
+            image_features_flat = torch.cat([cls_tokens, image_features_flat], dim=1)
 
         # Pass the concatenated features through the Transformer
+        # Transformer expects (seq_len, batch, d_model)
         transformer_out = self.transformer(
-            image_features_reshaped.transpose(0, 1)
+            image_features_flat.transpose(0, 1)
         ).transpose(0, 1)
 
-        # Extract the final output of the Transformer for each sequence in the batch
-        final_output = transformer_out[:, -1, :]
+        # Extract output based on aggregation mode
+        if self.aggregation_mode == "cls":
+            # Take the CLS token output (position 0)
+            final_output = transformer_out[:, 0, :]
+        elif self.aggregation_mode == "avg":
+            # Average over all sequence positions
+            final_output = transformer_out.mean(dim=1)
+        else:  # 'last'
+            # Take the last token output
+            final_output = transformer_out[:, -1, :]
 
         if ONE_HOT:
             # Directly predict the logits for each command

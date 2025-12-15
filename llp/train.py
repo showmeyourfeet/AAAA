@@ -13,6 +13,7 @@ from typing import Dict, List, Sequence
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm, trange
@@ -451,36 +452,82 @@ def train_bc(
         # Validation at end of epoch
         val_loss = None
         val_l1 = None
+        val_l1_infer = None  # Inference mode L1 (真实推理能力指标)
         if val_dataloader is not None:
             policy.eval()
             val_losses = []
             val_l1_losses = []
+            val_l1_infer_losses = []  # 推理模式 L1 losses
+            num_queries = policy.num_queries
             with torch.inference_mode():
                 val_bar = tqdm(val_dataloader, desc=f"Val {epoch}", leave=False)
                 for data in val_bar:
+                    # 解包数据
+                    if len(data) == 5:
+                        image_data, qpos_data, action_data, is_pad, command_embedding = data
+                        command_embedding = command_embedding.to(device)
+                    else:
+                        image_data, qpos_data, action_data, is_pad = data
+                        command_embedding = None
+                    image_data = image_data.to(device)
+                    qpos_data = qpos_data.to(device)
+                    action_data = action_data.to(device)
+                    is_pad = is_pad.to(device)
+                    
+                    # 1. 重建模式 Loss（传入 GT actions，用于监控 VAE 训练）
                     if use_amp:
                         with autocast():
-                            forward_dict = forward_pass(data, policy, device, encode_command)
+                            forward_dict = policy(qpos_data, image_data, action_data, is_pad, command_embedding, encode_command=encode_command)
                     else:
-                        forward_dict = forward_pass(data, policy, device, encode_command)
+                        forward_dict = policy(qpos_data, image_data, action_data, is_pad, command_embedding, encode_command=encode_command)
                     val_losses.append(forward_dict["loss"].item())
                     if "l1" in forward_dict:
                         val_l1_losses.append(forward_dict["l1"].item())
-                    val_bar.set_postfix({"loss": f"{val_losses[-1]:.4f}"})
+                    
+                    # 2. 推理模式 Loss（不传入 actions，使用零向量 latent，反映真实推理能力）
+                    if use_amp:
+                        with autocast():
+                            a_hat_infer = policy(qpos_data, image_data, actions=None, is_pad=None, command_embedding=command_embedding, encode_command=encode_command)
+                    else:
+                        a_hat_infer = policy(qpos_data, image_data, actions=None, is_pad=None, command_embedding=command_embedding, encode_command=encode_command)
+                    
+                    # 计算推理模式 L1 loss（手动计算，排除 padding）
+                    action_gt = action_data[:, :num_queries]
+                    is_pad_slice = is_pad[:, :num_queries]
+                    mask = (~is_pad_slice).unsqueeze(-1)  # [batch, seq, 1]
+                    action_dim = action_gt.shape[-1]
+                    valid = mask.sum() * action_dim
+                    l1_infer = (F.l1_loss(action_gt, a_hat_infer, reduction="none") * mask).sum() / valid.clamp(min=1)
+                    val_l1_infer_losses.append(l1_infer.item())
+                    
+                    val_bar.set_postfix({
+                        "loss": f"{val_losses[-1]:.4f}",
+                        "l1_infer": f"{val_l1_infer_losses[-1]:.4f}"
+                    })
+            
             val_loss = float(np.mean(val_losses)) if val_losses else float("inf")
             val_l1 = float(np.mean(val_l1_losses)) if val_l1_losses else None
+            val_l1_infer = float(np.mean(val_l1_infer_losses)) if val_l1_infer_losses else None
             
             # Log validation metrics
             val_msg = f"Epoch {epoch+1}: val_loss={val_loss:.5f}"
             if val_l1 is not None:
                 val_msg += f", val_l1={val_l1:.5f}"
+            if val_l1_infer is not None:
+                val_msg += f", val_l1_infer={val_l1_infer:.5f}"
+                # 显示重建 vs 推理的 gap（gap 越大说明模型越依赖 encoder 提供的 GT 信息）
+                if val_l1 is not None:
+                    gap = val_l1_infer - val_l1
+                    val_msg += f" (gap={gap:+.5f})"
             if logger:
                 logger.info(val_msg)
             else:
                 tqdm.write(val_msg)
             
             # Update global best model based on validation metric
-            if best_model_metric == "l1_loss":
+            if best_model_metric == "l1_loss_infer":
+                current_val_metric = val_l1_infer if val_l1_infer is not None else val_l1
+            elif best_model_metric == "l1_loss":
                 current_val_metric = val_l1 if val_l1 is not None else val_loss
             else:
                 current_val_metric = val_loss
@@ -493,11 +540,13 @@ def train_bc(
                     "best_val": best_val,
                     "val_loss": val_loss,
                     "val_l1": val_l1,
+                    "val_l1_infer": val_l1_infer,  # 推理模式 L1
                 }
+                infer_str = f", val_l1_infer={val_l1_infer:.5f}" if val_l1_infer is not None else ""
                 if logger:
-                    logger.info(f"New best model at epoch {epoch+1} with {best_model_metric}={current_val_metric:.5f}")
+                    logger.info(f"New best model at epoch {epoch+1} with {best_model_metric}={current_val_metric:.5f}{infer_str}")
                 else:
-                    tqdm.write(f"New best model at epoch {epoch+1} with {best_model_metric}={current_val_metric:.5f}")
+                    tqdm.write(f"New best model at epoch {epoch+1} with {best_model_metric}={current_val_metric:.5f}{infer_str}")
 
         # Save latest checkpoint every N epochs (rolling backup) - optional
         # This allows resuming from recent epochs, not just multiples of save_ckpt_every
@@ -538,11 +587,18 @@ def train_bc(
             if interval_best_state is not None and interval_best_epoch >= 0:
                 prev_interval_start = start_epoch + interval_best_interval_idx * save_ckpt_every
                 prev_interval_end = start_epoch + (interval_best_interval_idx + 1) * save_ckpt_every
-                # Format val_l1 for filename (replace '.' with 'p' to avoid path issues)
-                interval_val_l1 = interval_best_state.get("val_l1")
-                val_l1_fname = f"_l1_{interval_val_l1:.5f}".replace(".", "p") if interval_val_l1 is not None else ""
+                # Format metric value for filename based on best_model_metric (replace '.' with 'p' to avoid path issues)
+                if best_model_metric == "l1_loss_infer":
+                    metric_val = interval_best_state.get("val_l1_infer")
+                    metric_fname = f"_l1infer_{metric_val:.5f}".replace(".", "p") if metric_val is not None else ""
+                elif best_model_metric == "l1_loss":
+                    metric_val = interval_best_state.get("val_l1")
+                    metric_fname = f"_l1_{metric_val:.5f}".replace(".", "p") if metric_val is not None else ""
+                else:
+                    metric_val = interval_best_state.get("val_loss")
+                    metric_fname = f"_loss_{metric_val:.5f}".replace(".", "p") if metric_val is not None else ""
                 prev_ckpt_path = os.path.join(
-                    ckpt_dir, f"policy_interval_{interval_best_interval_idx}_epoch_{interval_best_epoch}{val_l1_fname}_best_seed_{seed}.ckpt"
+                    ckpt_dir, f"policy_interval_{interval_best_interval_idx}_epoch_{interval_best_epoch}{metric_fname}_best_seed_{seed}.ckpt"
                 )
                 # Prepare payload for saving: for interval-best checkpoints we only
                 # keep model weights and validation metrics to keep files compact.
@@ -551,19 +607,21 @@ def train_bc(
                     "epoch": interval_best_state["epoch"],
                     "val_l1": interval_best_state.get("val_l1"),
                     "val_loss": interval_best_state.get("val_loss"),
+                    "val_l1_infer": interval_best_state.get("val_l1_infer"),
                 }
                 torch.save(save_payload, prev_ckpt_path)
                 val_l1_str = f"{interval_best_state.get('val_l1', 'N/A'):.5f}" if interval_best_state.get("val_l1") is not None else "N/A"
+                val_l1_infer_str = f", val_l1_infer: {interval_best_state.get('val_l1_infer'):.5f}" if interval_best_state.get("val_l1_infer") is not None else ""
                 if logger:
                     logger.info(
                         f"Saved interval [{prev_interval_start}-{prev_interval_end}) "
-                        f"best checkpoint (epoch {interval_best_epoch}, val_l1: {val_l1_str}, val_loss: {interval_best_state.get('val_loss', 'N/A'):.5f}) "
+                        f"best checkpoint (epoch {interval_best_epoch}, val_l1: {val_l1_str}{val_l1_infer_str}, val_loss: {interval_best_state.get('val_loss', 'N/A'):.5f}) "
                         f"to {prev_ckpt_path}"
                     )
                 else:
                     tqdm.write(
                         f"Saved interval [{prev_interval_start}-{prev_interval_end}) "
-                        f"best checkpoint (epoch {interval_best_epoch}, val_l1: {val_l1_str}, val_loss: {interval_best_state.get('val_loss', 'N/A'):.5f})"
+                        f"best checkpoint (epoch {interval_best_epoch}, val_l1: {val_l1_str}{val_l1_infer_str}, val_loss: {interval_best_state.get('val_loss', 'N/A'):.5f})"
                     )
             
             # Reset for new interval
@@ -576,8 +634,10 @@ def train_bc(
         # Update best checkpoint in current interval if validation is available
         # Store state in GPU memory, will be written at interval end
         if val_dataloader is not None:
-            # 按 best_model_metric 选择验证指标：l1_loss 优先 val_l1，否则用 val_loss
-            if best_model_metric == "l1_loss":
+            # 按 best_model_metric 选择验证指标
+            if best_model_metric == "l1_loss_infer":
+                current_val_metric = val_l1_infer if val_l1_infer is not None else val_l1
+            elif best_model_metric == "l1_loss":
                 current_val_metric = val_l1 if val_l1 is not None else val_loss
             else:
                 current_val_metric = val_loss if val_loss is not None else val_l1
@@ -594,66 +654,86 @@ def train_bc(
                     "epoch": epoch,
                     "val_l1": val_l1 if val_l1 is not None else None,
                     "val_loss": val_loss,
+                    "val_l1_infer": val_l1_infer,  # 推理模式 L1
                 }
                 val_l1_str = f"{val_l1:.5f}" if val_l1 is not None else "N/A"
+                val_l1_infer_str = f", val_l1_infer: {val_l1_infer:.5f}" if val_l1_infer is not None else ""
                 if logger:
                     logger.info(
                         f"New interval [{start_epoch + current_interval_idx * save_ckpt_every}-{start_epoch + (current_interval_idx + 1) * save_ckpt_every}) "
-                        f"best model (epoch {epoch}, val_l1: {val_l1_str}, val_loss: {val_loss:.5f}) - stored in GPU memory"
+                        f"best model (epoch {epoch}, val_l1: {val_l1_str}{val_l1_infer_str}, val_loss: {val_loss:.5f}) - stored in GPU memory"
                     )
                 else:
                     tqdm.write(
                         f"New interval [{start_epoch + current_interval_idx * save_ckpt_every}-{start_epoch + (current_interval_idx + 1) * save_ckpt_every}) "
-                        f"best model (epoch {epoch}, val_l1: {val_l1_str}, val_loss: {val_loss:.5f}) - stored in GPU memory"
+                        f"best model (epoch {epoch}, val_l1: {val_l1_str}{val_l1_infer_str}, val_loss: {val_loss:.5f}) - stored in GPU memory"
                     )
 
     # Write the last interval's best checkpoint if it exists
     if interval_best_state is not None and interval_best_epoch >= 0:
         last_interval_start = start_epoch + interval_best_interval_idx * save_ckpt_every
         last_interval_end = start_epoch + (interval_best_interval_idx + 1) * save_ckpt_every
-        # Format val_l1 for filename
-        last_val_l1 = interval_best_state.get("val_l1")
-        val_l1_fname = f"_l1_{last_val_l1:.5f}".replace(".", "p") if last_val_l1 is not None else ""
+        # Format metric value for filename based on best_model_metric
+        if best_model_metric == "l1_loss_infer":
+            metric_val = interval_best_state.get("val_l1_infer")
+            metric_fname = f"_l1infer_{metric_val:.5f}".replace(".", "p") if metric_val is not None else ""
+        elif best_model_metric == "l1_loss":
+            metric_val = interval_best_state.get("val_l1")
+            metric_fname = f"_l1_{metric_val:.5f}".replace(".", "p") if metric_val is not None else ""
+        else:
+            metric_val = interval_best_state.get("val_loss")
+            metric_fname = f"_loss_{metric_val:.5f}".replace(".", "p") if metric_val is not None else ""
         last_ckpt_path = os.path.join(
-            ckpt_dir, f"policy_interval_{interval_best_interval_idx}_epoch_{interval_best_epoch}{val_l1_fname}_best_seed_{seed}.ckpt"
+            ckpt_dir, f"policy_interval_{interval_best_interval_idx}_epoch_{interval_best_epoch}{metric_fname}_best_seed_{seed}.ckpt"
         )
         save_payload = {
             "model_state_dict": interval_best_state["model_state_dict"],
             "epoch": interval_best_state["epoch"],
             "val_l1": interval_best_state.get("val_l1"),
             "val_loss": interval_best_state.get("val_loss"),
+            "val_l1_infer": interval_best_state.get("val_l1_infer"),
         }
         torch.save(save_payload, last_ckpt_path)
         val_l1_str = f"{interval_best_state.get('val_l1', 'N/A'):.5f}" if interval_best_state.get("val_l1") is not None else "N/A"
+        val_l1_infer_str = f", val_l1_infer: {interval_best_state.get('val_l1_infer'):.5f}" if interval_best_state.get("val_l1_infer") is not None else ""
         if logger:
             logger.info(
                 f"Saved final interval [{last_interval_start}-{last_interval_end}) "
-                f"best checkpoint (epoch {interval_best_epoch}, val_l1: {val_l1_str}, val_loss: {interval_best_state.get('val_loss', 'N/A'):.5f}) "
+                f"best checkpoint (epoch {interval_best_epoch}, val_l1: {val_l1_str}{val_l1_infer_str}, val_loss: {interval_best_state.get('val_loss', 'N/A'):.5f}) "
                 f"to {last_ckpt_path}"
             )
         else:
             tqdm.write(
                 f"Saved final interval [{last_interval_start}-{last_interval_end}) "
-                f"best checkpoint (epoch {interval_best_epoch}, val_l1: {val_l1_str}, val_loss: {interval_best_state.get('val_loss', 'N/A'):.5f})"
+                f"best checkpoint (epoch {interval_best_epoch}, val_l1: {val_l1_str}{val_l1_infer_str}, val_loss: {interval_best_state.get('val_loss', 'N/A'):.5f})"
             )
     
     # Write global best model checkpoint if it exists
     if global_best_state is not None:
-        # Format val_l1 for filename
-        global_val_l1 = global_best_state.get("val_l1")
-        val_l1_fname = f"_l1_{global_val_l1:.5f}".replace(".", "p") if global_val_l1 is not None else ""
-        best_ckpt_path = os.path.join(ckpt_dir, f"policy_best{val_l1_fname}_seed_{seed}.ckpt")
+        # Format metric value for filename based on best_model_metric
+        if best_model_metric == "l1_loss_infer":
+            metric_val = global_best_state.get("val_l1_infer")
+            metric_fname = f"_l1infer_{metric_val:.5f}".replace(".", "p") if metric_val is not None else ""
+        elif best_model_metric == "l1_loss":
+            metric_val = global_best_state.get("val_l1")
+            metric_fname = f"_l1_{metric_val:.5f}".replace(".", "p") if metric_val is not None else ""
+        else:
+            metric_val = global_best_state.get("val_loss")
+            metric_fname = f"_loss_{metric_val:.5f}".replace(".", "p") if metric_val is not None else ""
+        best_ckpt_path = os.path.join(ckpt_dir, f"policy_best{metric_fname}_seed_{seed}.ckpt")
         save_payload = {
             "model_state_dict": global_best_state["model_state_dict"],
             "epoch": global_best_state["epoch"],
             "best_val": global_best_state["best_val"],
             "val_loss": global_best_state.get("val_loss"),
             "val_l1": global_best_state.get("val_l1"),
+            "val_l1_infer": global_best_state.get("val_l1_infer"),
         }
         torch.save(save_payload, best_ckpt_path)
         val_l1_str = f"{global_best_state.get('val_l1'):.5f}" if global_best_state.get("val_l1") is not None else "N/A"
         val_loss_str = f"{global_best_state.get('val_loss'):.5f}" if global_best_state.get("val_loss") is not None else "N/A"
-        msg = f"Saved global best checkpoint (epoch {global_best_state['epoch']}, val_loss={val_loss_str}, val_l1={val_l1_str}) to {best_ckpt_path}"
+        val_l1_infer_str = f", val_l1_infer={global_best_state.get('val_l1_infer'):.5f}" if global_best_state.get("val_l1_infer") is not None else ""
+        msg = f"Saved global best checkpoint (epoch {global_best_state['epoch']}, val_loss={val_loss_str}, val_l1={val_l1_str}{val_l1_infer_str}) to {best_ckpt_path}"
         if logger:
             logger.info(msg)
         else:
@@ -783,12 +863,9 @@ def main(args: Dict):
             raise ValueError("--splitted_root must be provided when --use_splitted is set")
         camera_names = args.get("camera_names", ["left_frame", "right_frame"])
         max_episode_len = args.get("chunk_size", 30)
-        # 先对 train/val 根目录求联合统计量，供 train/val 数据集共享
-        roots_for_stats = [splitted_root]
+        # 只用训练集计算统计量，避免数据泄露
         val_root = args.get("val_splitted_root")
-        if val_root:
-            roots_for_stats.append(val_root)
-        stats = compute_splitted_norm_stats(roots_for_stats)
+        stats = compute_splitted_norm_stats([splitted_root])
         train_dataloader, stats, _ = load_splitted_data(
             root_dir=splitted_root,
             camera_names=camera_names,
@@ -977,9 +1054,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--best_model_metric",
         type=str,
-        default="total_loss",
-        choices=["total_loss", "l1_loss"],
-        help="Metric for selecting best model: 'total_loss' (default, l1 + kl_weight * kl) or 'l1_loss' (action prediction accuracy only)"
+        default="l1_loss_infer",
+        choices=["total_loss", "l1_loss", "l1_loss_infer"],
+        help="Metric for selecting best model: 'total_loss' (l1 + kl_weight * kl), 'l1_loss' (reconstruction L1), or 'l1_loss_infer' (default, inference-mode L1 - reflects true inference capability)"
     )
     parser.add_argument("--constant_lr", action="store_true", help="Disable learning rate scheduler and keep LR constant")
     parser.add_argument("--save_ckpt_every", type=int, default=20, help="Interval size for saving best checkpoint within each interval [i*n, (i+1)*n) based on val l1 loss (default: 100)")
