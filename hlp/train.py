@@ -33,6 +33,11 @@ from hlp.dataset import (
 from hlp.model import HighLevelModel
 
 
+def _normalize_command_text(cmd: str) -> str:
+    # Keep normalization consistent across train/val/test.
+    return cmd.replace("the back", "the bag").replace("mmove", "move")
+
+
 def calculate_hl_loss(logits, true_labels):
     """
     Calculate high-level loss with L1 distance weighting.
@@ -80,7 +85,7 @@ def train(model, dataloader, optimizer, scheduler, device, logger=None, log_wand
         # Convert ground truth command strings to indices using the pre-computed dictionary
         commands_idx = [
             model.command_to_index[
-                cmd.replace("the back", "the bag").replace("mmove", "move")
+                _normalize_command_text(cmd)
             ]
             for cmd in commands
         ]
@@ -131,7 +136,7 @@ def evaluate(model, dataloader, device, epoch: int | None = None):
 
             # Convert ground truth command strings to indices using the pre-computed dictionary
             commands_idx = [
-                model.command_to_index[cmd.replace("the back", "the bag")]
+                model.command_to_index[_normalize_command_text(cmd)]
                 for cmd in commands
             ]
             commands_idx = torch.tensor(commands_idx, device=device)
@@ -146,6 +151,59 @@ def evaluate(model, dataloader, device, epoch: int | None = None):
     avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
     
     return avg_loss
+
+
+def evaluate_with_success_rate(model, dataloader, device, epoch: int | None = None):
+    """
+    Validation evaluation that returns both loss and success rate (top-1 exact match after decoding).
+    Keeps `evaluate()` intact for backward compatibility.
+    """
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+    total_correct = 0
+    total_predictions = 0
+
+    with torch.no_grad():
+        val_bar = tqdm(
+            dataloader,
+            desc=f"Val {epoch}" if epoch is not None else "Val",
+            leave=False,
+            dynamic_ncols=True,
+        )
+        for batch in val_bar:
+            images, _, commands = batch
+            images = images.to(device)
+
+            logits, temperature = model(images)
+
+            commands_idx = [
+                model.command_to_index[_normalize_command_text(cmd)] for cmd in commands
+            ]
+            commands_idx = torch.tensor(commands_idx, device=device)
+
+            loss = calculate_hl_loss(logits, commands_idx)
+            total_loss += loss.item()
+            num_batches += 1
+
+            # Success rate via decoding (string exact match after normalization)
+            decoded_texts = model.decode_logits(logits, temperature)
+            for gt, pred in zip(commands, decoded_texts):
+                total_correct += int(_normalize_command_text(pred) == _normalize_command_text(gt))
+                total_predictions += 1
+
+            # Keep the bar lightweight
+            if total_predictions > 0:
+                val_bar.set_postfix(
+                    loss=f"{loss.item():.4f}",
+                    sr=f"{(total_correct / total_predictions) * 100:.2f}%",
+                )
+            else:
+                val_bar.set_postfix(loss=f"{loss.item():.4f}")
+
+    avg_loss = total_loss / num_batches if num_batches > 0 else float("inf")
+    success_rate = (total_correct / total_predictions) if total_predictions > 0 else 0.0
+    return avg_loss, success_rate
 
 
 def test(model, dataloader, device, current_epoch):
@@ -186,6 +244,14 @@ def test(model, dataloader, device, current_epoch):
 
     # Visualize embeddings
     # tsne_visualize(predicted_embeddings, gt_embeddings, candidate_embeddings, current_epoch)
+
+    if total_predictions == 0:
+        # This can happen if no test dataset was provided or the dataloader is empty.
+        print(
+            f"Epoch {current_epoch}: No test samples were evaluated (total_predictions=0). "
+            "Skipping success rate computation."
+        )
+        return 0.0
 
     success_rate = total_correct / total_predictions
     print(f"Epoch {current_epoch}: Success Rate = {success_rate * 100:.2f}%")
@@ -824,7 +890,7 @@ if __name__ == "__main__":
         os.makedirs(predictions_dir)
 
     if args.test_only:
-        if 'test_dataloader' in locals() and test_dataloader is not None:
+        if 'test_dataloader' in locals() and test_dataloader is not None and _dataset_size(test_dataloader) not in (None, 0):
             test(model, test_dataloader, device, latest_idx)
         else:
             logger.info("test_only is set but no test_dataloader is available; exiting.")
@@ -863,6 +929,7 @@ if __name__ == "__main__":
             and (epoch > 0 or dagger_ratio is not None)
             and 'test_dataloader' in locals()
             and test_dataloader is not None
+            and _dataset_size(test_dataloader) not in (None, 0)
         ):
             test_success_rate = test(model, test_dataloader, device, epoch)
             if logger:
@@ -876,8 +943,11 @@ if __name__ == "__main__":
         
         # Validation
         val_loss = None
+        val_success_rate = None
         if val_dataloader is not None and dagger_ratio is None:
-            val_loss = evaluate(model, val_dataloader, device, epoch=epoch)
+            val_loss, val_success_rate = evaluate_with_success_rate(
+                model, val_dataloader, device, epoch=epoch
+            )
         
         # Get current learning rate
         current_lr = optimizer.param_groups[0]['lr']
@@ -886,6 +956,8 @@ if __name__ == "__main__":
         postfix_dict = {"Train Loss": f"{train_loss:.5f}"}
         if val_loss is not None:
             postfix_dict["Val Loss"] = f"{val_loss:.5f}"
+        if val_success_rate is not None:
+            postfix_dict["Val SR"] = f"{val_success_rate * 100:.2f}%"
         pbar_epochs.set_postfix(postfix_dict)
 
         # Logging in unified format (compatible with llp/train.py)
@@ -894,6 +966,8 @@ if __name__ == "__main__":
             logger.info(f"epoch: {epoch} loss: {train_loss:.5f} lr: {current_lr:.5e}")
             if val_loss is not None:
                 logger.info(f"Epoch {epoch}: Val loss: {val_loss:.5f}")
+            if val_success_rate is not None:
+                logger.info(f"Epoch {epoch}: Val Success Rate = {val_success_rate * 100:.2f}%")
         else:
             tqdm.write(f"Train loss: {train_loss:.5f}" + 
                       (f", Val loss: {val_loss:.5f}" if val_loss is not None else ""))
