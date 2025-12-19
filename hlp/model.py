@@ -5,6 +5,8 @@ import timm
 import torchvision.transforms as transforms
 import random
 
+from additional_modules.gated_attention_SDPA import GatedTransformerEncoderLayer
+
 # Image preprocessing for ImageNet-pretrained encoders (e.g., Swin Tiny)
 # NOTE: Currently dataset returns images of various sizes (e.g., 640x480 for cam_high),
 # so we need to resize to 224x224 here. If you want to optimize, consider resizing
@@ -36,6 +38,7 @@ class HighLevelModel(nn.Module):
         num_cameras=4,
         train_image_encoder=False,
         aggregation_mode="last",  # 'last', 'avg', or 'cls'
+        use_gated_attention: bool = False,  # whether to use gated attention encoder
     ):
         super().__init__()
         
@@ -60,14 +63,32 @@ class HighLevelModel(nn.Module):
                 param.requires_grad = False  # Freeze image encoder parameters
 
         # Transformer for processing sequences of image embeddings
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=self.visual_out_dim,
-                nhead=num_heads,
-                dim_feedforward=hidden_size,
-            ),
-            num_layers=num_layers,
-        )
+        # Two options:
+        #   1) standard TransformerEncoder (seq-first)
+        #   2) custom gated-attention encoder (batch-first)
+        self.use_gated_attention = use_gated_attention
+        if self.use_gated_attention:
+            # stack several gated encoder layers (batch-first: [B, T, D])
+            self.gated_layers = nn.ModuleList(
+                [
+                    GatedTransformerEncoderLayer(
+                        d_model=self.visual_out_dim,
+                        num_heads=num_heads,
+                        dim_feedforward=hidden_size,
+                    )
+                    for _ in range(num_layers)
+                ]
+            )
+        else:
+            self.transformer = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(
+                    d_model=self.visual_out_dim,
+                    nhead=num_heads,
+                    dim_feedforward=hidden_size,
+                    batch_first=True,
+                ),
+                num_layers=num_layers,
+            )
 
         if ONE_HOT:
             output_size = len(candidate_texts)
@@ -108,6 +129,7 @@ class HighLevelModel(nn.Module):
         print(f"Total parameters: {total / 1e6:.2f}M")
         print(f"Trainable parameters: {trainable / 1e6:.2f}M")
         print(f"Aggregation mode: {aggregation_mode}")
+        print(f"Use gated attention: {self.use_gated_attention}")
 
     def forward(self, images):
         # Given images of shape (b, t, k, c, h, w)
@@ -167,11 +189,16 @@ class HighLevelModel(nn.Module):
             cls_tokens = self.cls_token.expand(batch_size, -1, -1).to(image_features_flat.device)
             image_features_flat = torch.cat([cls_tokens, image_features_flat], dim=1)
 
-        # Pass the concatenated features through the Transformer
-        # Transformer expects (seq_len, batch, d_model)
-        transformer_out = self.transformer(
-            image_features_flat.transpose(0, 1)
-        ).transpose(0, 1)
+        # Pass the concatenated features through the Transformer / gated encoder
+        if self.use_gated_attention:
+            # batch-first: (B, T, D) is default.
+            transformer_out = image_features_flat
+            for layer in self.gated_layers:
+                transformer_out = layer(transformer_out)
+        else:
+            # While batch_first is True, the input will be transformed from (seq_len, batch, d_model) to (batch, seq_len, d_model) internally.
+            # which is consistent with the general input format.
+            transformer_out = self.transformer(image_features_flat)
 
         # Extract output based on aggregation mode
         if self.aggregation_mode == "cls":

@@ -492,12 +492,27 @@ def load_candidate_texts_and_embeddings(dataset_dirs, device=torch.device("cuda"
     return candidate_texts, candidate_embeddings
 
 
-def build_HighLevelModel(dataset_dirs, history_len, device, stage_embeddings_file=None, stage_texts_file=None, train_image_encoder=False, num_cameras=4, aggregation_mode="last"):
+def build_HighLevelModel(
+    dataset_dirs,
+    history_len,
+    device,
+    stage_embeddings_file=None,
+    stage_texts_file=None,
+    train_image_encoder=False,
+    num_cameras=4,
+    aggregation_mode="last",
+    use_gated_attention: bool = False,
+):
     # Load candidate texts and embeddings
     candidate_texts, candidate_embeddings = load_candidate_texts_and_embeddings(
         dataset_dirs, device=device, stage_embeddings_file=stage_embeddings_file, stage_texts_file=stage_texts_file
     )
     command_to_index = {command: index for index, command in enumerate(candidate_texts)}
+
+    if use_gated_attention:
+        print("---- Using Gated attention Transformer Encoder ----")
+    else:
+        print("---- Using Vanilla Transformer Encoder ----")
 
     # Build model
     model = HighLevelModel(
@@ -509,6 +524,7 @@ def build_HighLevelModel(dataset_dirs, history_len, device, stage_embeddings_fil
         train_image_encoder=train_image_encoder,
         num_cameras=num_cameras,
         aggregation_mode=aggregation_mode,
+        use_gated_attention=use_gated_attention,
     ).to(device)
     return model
 
@@ -549,6 +565,15 @@ if __name__ == "__main__":
                         help='Number of times each run should be used. Automatically calculates max_combinations = n_repeats × min_runs_per_stage. '
                              'Use this for intuitive control (e.g., --n_repeats 10 means each run used 10 times). '
                              'Ignored if --max_combinations is set.')
+    parser.add_argument('--use_weak_traversal', action='store_true',
+                        help='Use weak traversal sampling strategy. For each combination, systematically sample from each stage '
+                             'with both cross-stage and non-cross-stage samples. This ensures better coverage of long sequences.')
+    parser.add_argument('--samples_non_cross_per_stage', action='store', type=int, default=1,
+                        help='Number of non-cross-stage samples per stage in weak traversal mode (default: 1). '
+                             'These samples have target_ts in the current stage.')
+    parser.add_argument('--samples_cross_per_stage', action='store', type=int, default=1,
+                        help='Number of cross-stage samples per stage in weak traversal mode (default: 1). '
+                             'These samples have target_ts in the next stage.')
     # Paired adjacent-stage training (concatenate two recordings)
     parser.add_argument('--use_paired_sequences', action='store', type=bool, default=False,
                         help='Use paired adjacent-stage sequences for training (splitted format only)')
@@ -574,6 +599,11 @@ if __name__ == "__main__":
                         help="Aggregation mode for transformer output: 'last' (default), 'avg' (mean pooling), 'cls' (use [CLS] token)")
     parser.add_argument('--save_ckpt_every', type=int, default=100,
                         help='Interval size for saving the best checkpoint within each interval [i*n, (i+1)*n) based on val loss (default: 100)')
+    parser.add_argument(
+        '--use_gated_attention',
+        action='store_true',
+        help='Use gated attention encoder instead of vanilla TransformerEncoder in HighLevelModel',
+    )
 
     args = parser.parse_args()
 
@@ -625,6 +655,7 @@ if __name__ == "__main__":
             train_image_encoder=args.train_image_encoder,
             num_cameras=len(args.camera_names),
             aggregation_mode=args.aggregation_mode,
+            use_gated_attention=args.use_gated_attention,
         )
 
     elif args.use_splitted or args.use_composite:
@@ -658,6 +689,9 @@ if __name__ == "__main__":
                 max_combinations=args.max_combinations,
                 n_repeats=args.n_repeats,
                 sync_sequence_augmentation=args.sync_sequence_augmentation,
+                use_weak_traversal=args.use_weak_traversal,
+                samples_non_cross_per_stage=args.samples_non_cross_per_stage,
+                samples_cross_per_stage=args.samples_cross_per_stage,
             )
         elif args.use_paired_sequences:
             # Use paired adjacent-stage sequences for training; keep validation/test as None for now
@@ -717,6 +751,7 @@ if __name__ == "__main__":
             train_image_encoder=args.train_image_encoder,
             num_cameras=len(camera_names),
             aggregation_mode=args.aggregation_mode,
+            use_gated_attention=args.use_gated_attention,
         )
     else:
         # Traditional format: use explicit dataset_dirs and camera_names
@@ -748,6 +783,7 @@ if __name__ == "__main__":
             train_image_encoder=args.train_image_encoder,
             num_cameras=len(camera_names),
             aggregation_mode=args.aggregation_mode,
+            use_gated_attention=args.use_gated_attention,
         )
     
     # Optimizer
@@ -825,6 +861,10 @@ if __name__ == "__main__":
             logger.info(f"  N Repeats: {args.n_repeats} (max_combinations will be auto-calculated)")
         else:
             logger.info(f"  Max Combinations: 50000 (default)")
+        logger.info(f"  Use Weak Traversal: {args.use_weak_traversal}")
+        if args.use_weak_traversal:
+            logger.info(f"  Samples Non-Cross Per Stage: {args.samples_non_cross_per_stage}")
+            logger.info(f"  Samples Cross Per Stage: {args.samples_cross_per_stage}")
     logger.info(f"  Use Data Augmentation: {args.use_augmentation}")
     if args.use_augmentation:
         logger.info(f"  Image Size: {args.image_size}")

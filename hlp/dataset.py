@@ -1113,6 +1113,9 @@ class CompositeSequenceDataset(torch.utils.data.Dataset):
         max_combinations=None,  # Maximum number of combinations (if None, use n_repeats)
         n_repeats=None,  # Number of times each run should be used (alternative to max_combinations)
         sync_sequence_augmentation: bool = False,
+        use_weak_traversal: bool = False,  # Use weak traversal sampling strategy
+        samples_non_cross_per_stage: int = 1,  # Number of non-cross-stage samples per stage (target_ts in current stage)
+        samples_cross_per_stage: int = 1,  # Number of cross-stage samples per stage (target_ts in next stage)
     ):
         super().__init__()
         self.root_dir = root_dir
@@ -1128,6 +1131,9 @@ class CompositeSequenceDataset(torch.utils.data.Dataset):
         self.image_size = image_size
         self.sampling_strategy = sampling_strategy
         self.sync_sequence_augmentation = sync_sequence_augmentation
+        self.use_weak_traversal = use_weak_traversal
+        self.samples_non_cross_per_stage = samples_non_cross_per_stage
+        self.samples_cross_per_stage = samples_cross_per_stage
         
         # Initialize ImagePreprocessor if augmentation is enabled
         if self.use_augmentation:
@@ -1181,18 +1187,29 @@ class CompositeSequenceDataset(torch.utils.data.Dataset):
         if sampling_strategy == 'balanced':
             # Pre-generate balanced combinations ensuring each run is used roughly equally
             self.run_combinations = self._generate_balanced_combinations(max_combinations)
-            self.dataset_size = len(self.run_combinations)
-            print(f"[CompositeSequenceDataset] Generated {self.dataset_size} balanced combinations")
+            num_combinations = len(self.run_combinations)
         elif sampling_strategy == 'sequential':
             # Pre-generate sequential combinations matching runs by their number
             self.run_combinations = self._generate_sequential_combinations()
-            self.dataset_size = len(self.run_combinations)
-            print(f"[CompositeSequenceDataset] Generated {self.dataset_size} sequential combinations")
+            num_combinations = len(self.run_combinations)
         else:  # 'random'
             # Use random sampling on-the-fly
             self.run_combinations = None
-            self.dataset_size = min(max_combinations, self.num_combinations)
-            print(f"[CompositeSequenceDataset] Using random sampling with {self.dataset_size} samples per epoch")
+            num_combinations = min(max_combinations, self.num_combinations)
+        
+        # Pre-compute sampling positions for weak traversal strategy
+        if use_weak_traversal:
+            self.sampling_positions = self._precompute_weak_traversal_sampling(num_combinations)
+            self.dataset_size = len(self.sampling_positions)
+            print(f"[CompositeSequenceDataset] Using weak traversal strategy")
+            print(f"[CompositeSequenceDataset] Generated {num_combinations} combinations")
+            print(f"[CompositeSequenceDataset] With {samples_non_cross_per_stage} non-cross + {samples_cross_per_stage} cross samples per stage, total dataset size: {self.dataset_size}")
+        else:
+            self.sampling_positions = None
+            # For non-weak-traversal, use simple random sampling (1 sample per combination)
+            self.dataset_size = num_combinations
+            print(f"[CompositeSequenceDataset] Generated {num_combinations} combinations")
+            print(f"[CompositeSequenceDataset] Total dataset size: {self.dataset_size}")
         
         self.to_tensor = transforms.ToTensor()
     
@@ -1388,6 +1405,113 @@ class CompositeSequenceDataset(torch.utils.data.Dataset):
             else:
                 print(f"  Stage {stage_idx}: No runs used")
     
+    def _precompute_weak_traversal_sampling(self, num_combinations):
+        """
+        Pre-compute sampling positions for weak traversal strategy.
+        
+        For each combination:
+        - Traverse stages in order
+        - For each stage:
+          - Sample samples_non_cross_per_stage times with target_ts in current stage (non-cross-stage)
+          - Sample samples_cross_per_stage times with target_ts in next stage (cross-stage)
+          - If last stage (no next stage), only non-cross-stage samples are generated
+        
+        Returns:
+            List of (combination_idx, stage_idx_in_combo, is_cross_stage, stage_boundaries_info) tuples
+            where stage_boundaries_info is (stage_start, stage_end, next_stage_start, next_stage_end, total_timesteps)
+        """
+        sampling_positions = []
+        
+        # Determine which combinations to use
+        if self.run_combinations is not None:
+            combinations_to_process = self.run_combinations
+        else:
+            # For random strategy, we'll generate combinations on-the-fly
+            # Use a fixed seed to ensure reproducibility
+            rng = np.random.RandomState(42)
+            combinations_to_process = []
+            for combo_idx in range(num_combinations):
+                combo = []
+                for stage_idx in self.stage_indices:
+                    runs = self.runs_by_stage[stage_idx]
+                    if len(runs) > 0:
+                        selected_run = runs[rng.randint(0, len(runs))]
+                        combo.append((stage_idx, selected_run))
+                combinations_to_process.append(combo)
+        
+        min_start = self.history_len * self.history_skip_frame
+        
+        for combo_idx, selected_runs in enumerate(combinations_to_process):
+            # Compute stage boundaries for this combination
+            stage_boundaries = []
+            run_lengths = []
+            cumulative_length = 0
+            
+            for stage_idx, selected_run in selected_runs:
+                labels, actions_np, qpos_np = self._parse_run(selected_run)
+                if actions_np is None or len(actions_np) < 1:
+                    # Skip this combination if we can't parse it
+                    break
+                
+                run_length = len(actions_np)
+                run_lengths.append(run_length)
+                stage_boundaries.append((cumulative_length, cumulative_length + run_length))
+                cumulative_length += run_length
+            
+            if len(stage_boundaries) == 0:
+                continue
+            
+            total_timesteps = cumulative_length
+            max_start = total_timesteps - self.prediction_offset - 1
+            
+            if max_start < min_start:
+                # Not enough timesteps, skip this combination
+                continue
+            
+            # Traverse each stage
+            for stage_idx_in_combo, stage_idx in enumerate(self.stage_indices):
+                stage_start, stage_end = stage_boundaries[stage_idx_in_combo]
+                
+                # Use separate parameters for non-cross and cross-stage samples
+                num_non_cross = self.samples_non_cross_per_stage
+                
+                # Check if cross-stage sampling is possible (not the last stage)
+                can_cross_stage = stage_idx_in_combo < len(self.stage_indices) - 1
+                
+                # Adjust counts if cross-stage is not possible
+                if not can_cross_stage:
+                    num_cross = 0
+                else:
+                    num_cross = self.samples_cross_per_stage
+                
+                # Prepare stage boundaries info
+                next_stage_start = stage_boundaries[stage_idx_in_combo + 1][0] if can_cross_stage else stage_end
+                next_stage_end = stage_boundaries[stage_idx_in_combo + 1][1] if can_cross_stage else stage_end
+                stage_boundaries_info = (stage_start, stage_end, next_stage_start, next_stage_end, total_timesteps)
+                
+                # Sample non-cross-stage: target_ts should be in current stage
+                non_cross_max_curr = min(stage_end - self.prediction_offset - 1, max_start)
+                non_cross_min_curr = max(min_start, stage_start)
+                
+                if non_cross_max_curr >= non_cross_min_curr:
+                    # Generate num_non_cross non-cross-stage samples
+                    for _ in range(num_non_cross):
+                        sampling_positions.append((combo_idx, stage_idx_in_combo, False, stage_boundaries_info))
+                
+                # Sample cross-stage: target_ts should be in next stage (if exists)
+                if can_cross_stage:
+                    next_stage_start, next_stage_end = stage_boundaries[stage_idx_in_combo + 1]
+                    # curr_ts should be such that: curr_ts + offset >= next_stage_start and < next_stage_end
+                    cross_min_curr = max(min_start, next_stage_start - self.prediction_offset)
+                    cross_max_curr = min(next_stage_end - self.prediction_offset - 1, max_start)
+                    
+                    if cross_max_curr >= cross_min_curr:
+                        # Generate num_cross cross-stage samples
+                        for _ in range(num_cross):
+                            sampling_positions.append((combo_idx, stage_idx_in_combo, True, stage_boundaries_info))
+        
+        return sampling_positions
+    
     def __len__(self):
         return self.dataset_size
     
@@ -1421,22 +1545,52 @@ class CompositeSequenceDataset(torch.utils.data.Dataset):
         return labels, np.stack(actions), np.stack(qpos)
     
     def __getitem__(self, index):
-        # Select runs based on sampling strategy
-        if self.sampling_strategy == 'balanced' and self.run_combinations is not None:
-            # Use pre-generated combination
-            selected_runs = self.run_combinations[index]
+        # Use weak traversal if enabled
+        if self.use_weak_traversal and self.sampling_positions is not None:
+            if index >= len(self.sampling_positions):
+                # Fallback to next valid index
+                return self.__getitem__((index + 1) % len(self))
+            
+            combo_idx, stage_idx_in_combo, is_cross_stage, stage_boundaries_info = self.sampling_positions[index]
+            stage_start, stage_end, next_stage_start, next_stage_end, total_timesteps = stage_boundaries_info
+            
+            # Get the combination
+            if self.run_combinations is not None:
+                selected_runs = self.run_combinations[combo_idx]
+            else:
+                # For random strategy, generate combination on-the-fly with fixed seed
+                rng = np.random.RandomState(combo_idx)
+                selected_runs = []
+                for stage_idx in self.stage_indices:
+                    runs = self.runs_by_stage[stage_idx]
+                    if len(runs) == 0:
+                        return self.__getitem__((index + 1) % len(self))
+                    selected_run = runs[rng.randint(0, len(runs))]
+                    selected_runs.append((stage_idx, selected_run))
         else:
-            # Random sampling on-the-fly
-            selected_runs = []
-            for stage_idx in self.stage_indices:
-                runs = self.runs_by_stage[stage_idx]
-                if len(runs) == 0:
-                    # Fallback: try another sample
-                    return self.__getitem__((index + 1) % len(self))
-                
-                # Randomly select a run from this stage
-                selected_run = runs[np.random.randint(0, len(runs))]
-                selected_runs.append((stage_idx, selected_run))
+            # Original random sampling logic
+            combo_idx = index
+            
+            # Select runs based on sampling strategy
+            if self.sampling_strategy == 'balanced' and self.run_combinations is not None:
+                # Use pre-generated combination
+                selected_runs = self.run_combinations[combo_idx]
+            else:
+                # Random sampling on-the-fly
+                rng = np.random.RandomState(combo_idx)
+                selected_runs = []
+                for stage_idx in self.stage_indices:
+                    runs = self.runs_by_stage[stage_idx]
+                    if len(runs) == 0:
+                        # Fallback: try another sample
+                        return self.__getitem__((index + 1) % len(self))
+                    
+                    # Randomly select a run from this stage using seeded RNG
+                    selected_run = runs[rng.randint(0, len(runs))]
+                    selected_runs.append((stage_idx, selected_run))
+            
+            # Sample a random curr_ts (will be computed after stage_boundaries)
+            curr_ts = None
         
         # Now process the selected runs
         stage_boundaries = []  # Track where each stage starts in the concatenated sequence
@@ -1461,19 +1615,69 @@ class CompositeSequenceDataset(torch.utils.data.Dataset):
         
         total_timesteps = cumulative_length
         
-        # Sample a random curr_ts from the concatenated sequence
-        try:
+        # Determine curr_ts based on weak traversal constraints or random sampling
+        if self.use_weak_traversal and self.sampling_positions is not None:
+            # Use constraints from pre-computed sampling positions
             min_start = self.history_len * self.history_skip_frame
             max_start = total_timesteps - self.prediction_offset - 1
-            if max_start < min_start:
-                # Not enough timesteps, try another sample
-                return self.__getitem__((index + 1) % len(self))
             
-            curr_ts = np.random.randint(min_start, max_start + 1)
-            start_ts = curr_ts - self.history_len * self.history_skip_frame
-            target_ts = curr_ts + self.prediction_offset
-        except ValueError:
-            return self.__getitem__((index + 1) % len(self))
+            if is_cross_stage:
+                # Cross-stage: target_ts should be in next stage
+                # curr_ts should be such that: curr_ts + offset >= next_stage_start and < next_stage_end
+                cross_min_curr = max(min_start, next_stage_start - self.prediction_offset)
+                cross_max_curr = min(next_stage_end - self.prediction_offset - 1, max_start)
+                
+                if cross_max_curr >= cross_min_curr:
+                    # Randomly sample curr_ts within valid range
+                    # Uses global random state: each call produces different random value
+                    # - Different comps in same epoch: different curr_ts
+                    # - Different stages in same comp: different curr_ts
+                    # - Multiple samples in same stage (e.g., samples_cross_per_stage=2): 
+                    #   Each call to __getitem__ uses np.random.randint(), so each sample gets 
+                    #   a different random curr_ts, ensuring independence between samples
+                    # - Same index in different epochs: different curr_ts (due to DataLoader shuffle)
+                    curr_ts = np.random.randint(cross_min_curr, cross_max_curr + 1)
+                else:
+                    # Fallback: try another sample
+                    return self.__getitem__((index + 1) % len(self))
+            else:
+                # Non-cross-stage: target_ts should be in current stage
+                # curr_ts should be such that: curr_ts + offset < stage_end
+                non_cross_max_curr = min(stage_end - self.prediction_offset - 1, max_start)
+                non_cross_min_curr = max(min_start, stage_start)
+                
+                if non_cross_max_curr >= non_cross_min_curr:
+                    # Randomly sample curr_ts within valid range
+                    # Uses global random state: each call produces different random value
+                    # - Different comps in same epoch: different curr_ts
+                    # - Different stages in same comp: different curr_ts
+                    # - Multiple samples in same stage (e.g., samples_non_cross_per_stage=2): 
+                    #   Each call to __getitem__ uses np.random.randint(), so each sample gets 
+                    #   a different random curr_ts, ensuring independence between samples
+                    # - Same index in different epochs: different curr_ts (due to DataLoader shuffle)
+                    curr_ts = np.random.randint(non_cross_min_curr, non_cross_max_curr + 1)
+                else:
+                    # Fallback: try another sample
+                    return self.__getitem__((index + 1) % len(self))
+        else:
+            # Original random sampling logic
+            if curr_ts is None:
+                # Sample a random curr_ts from the concatenated sequence
+                try:
+                    min_start = self.history_len * self.history_skip_frame
+                    max_start = total_timesteps - self.prediction_offset - 1
+                    if max_start < min_start:
+                        # Not enough timesteps, try another sample
+                        return self.__getitem__((index + 1) % len(self))
+                    
+                    # Randomly sample curr_ts from concatenated sequence
+                    # Uses global random state: each call produces different random value
+                    curr_ts = np.random.randint(min_start, max_start + 1)
+                except ValueError:
+                    return self.__getitem__((index + 1) % len(self))
+        
+        start_ts = curr_ts - self.history_len * self.history_skip_frame
+        target_ts = curr_ts + self.prediction_offset
         
         # Determine which stage the target_ts belongs to
         target_stage_idx = self.stage_indices[-1]  # Default to last stage
@@ -1797,6 +2001,9 @@ def load_composite_data(
     max_combinations=None,  # Maximum number of combinations (if None, use n_repeats)
     n_repeats=None,  # Number of times each run should be used (alternative to max_combinations)
     sync_sequence_augmentation: bool = False,
+    use_weak_traversal: bool = False,  # Use weak traversal sampling strategy
+    samples_non_cross_per_stage: int = 1,  # Number of non-cross-stage samples per stage (target_ts in current stage)
+    samples_cross_per_stage: int = 1,  # Number of cross-stage samples per stage (target_ts in next stage)
 ):
     """
     Load composite dataset for HighLevelModel training.
@@ -1915,6 +2122,9 @@ def load_composite_data(
         max_combinations=max_combinations,
         n_repeats=n_repeats,
         sync_sequence_augmentation=sync_sequence_augmentation,
+        use_weak_traversal=use_weak_traversal,
+        samples_non_cross_per_stage=samples_non_cross_per_stage,
+        samples_cross_per_stage=samples_cross_per_stage,
     )
     
     print(f"Training dataset: {len(train_dataset)} samples from {train_root_dir}")
@@ -1939,6 +2149,9 @@ def load_composite_data(
             max_combinations=None,  # Not used for sequential
             n_repeats=None,  # Not used for sequential
             sync_sequence_augmentation=False,
+            use_weak_traversal=use_weak_traversal,  # Use same value for validation
+            samples_non_cross_per_stage=samples_non_cross_per_stage,
+        samples_cross_per_stage=samples_cross_per_stage,  # Use same value for validation
         )
         print(f"Validation dataset: {len(val_dataset)} samples from {val_root_dir}")
     else:

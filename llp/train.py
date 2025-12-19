@@ -977,6 +977,7 @@ def main(args: Dict):
         "train_image_encoder": args.get("train_image_encoder", False),
         "use_state": use_state,
         "shared_backbone": shared_backbone,
+        "use_gated_attention": args.get("use_gated_attention", False),
     }
 
     config = {
@@ -1020,6 +1021,11 @@ if __name__ == "__main__":
     parser.add_argument("--vq", action="store_true", help="Use Vector Quantization instead of standard VAE")
     parser.add_argument("--vq_class", type=int, default=512, help="Number of VQ codebook classes")
     parser.add_argument("--vq_dim", type=int, default=32, help="Dimension of each VQ codebook entry")
+    parser.add_argument(
+        "--use_gated_attention",
+        action="store_true",
+        help="Use gated attention in DETR transformer and encoder (ablation flag)",
+    )
     parser.add_argument("--shared_backbone", type=lambda x: x.lower() in ('true', '1', 'yes'), default=None, help="Whether to share backbone across cameras (default: auto-detect based on use_language and image_encoder)")
 
     parser.add_argument("--use_language", action="store_true")

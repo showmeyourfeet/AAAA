@@ -10,6 +10,10 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 from .misc import NestedTensor
+from additional_modules.gated_attention_SDPA import (
+    GatedDETREncoderLayer,
+    GatedDETRDecoderLayer,
+)
 
 class PositionEmbeddingSine(nn.Module):
     """
@@ -121,20 +125,37 @@ class Transformer(nn.Module):
         activation="relu",
         normalize_before=False,
         return_intermediate_dec=False,
+        use_gated_attention: bool = False,
     ):
         super().__init__()
 
-        encoder_layer = TransformerEncoderLayer(
-            d_model, nhead, dim_feedforward, dropout, activation, normalize_before
-        )
+        self.use_gated_attention = use_gated_attention
+
+        if self.use_gated_attention:
+            print("Using Gated attention DETR Transformer Encoder")
+            encoder_layer = GatedDETREncoderLayer(
+                d_model, nhead, dim_feedforward, dropout, activation, normalize_before
+            )
+        else:
+            print("Using Vanilla DETR Transformer Encoder")
+            encoder_layer = TransformerEncoderLayer(
+                d_model, nhead, dim_feedforward, dropout, activation, normalize_before
+            )
         encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
         self.encoder = TransformerEncoder(
             encoder_layer, num_encoder_layers, encoder_norm
         )
 
-        decoder_layer = TransformerDecoderLayer(
-            d_model, nhead, dim_feedforward, dropout, activation, normalize_before
-        )
+        if self.use_gated_attention:
+            print("Using Gated attention DETR Transformer Decoder")
+            decoder_layer = GatedDETRDecoderLayer(
+                d_model, nhead, dim_feedforward, dropout, activation, normalize_before
+            )
+        else:
+            print("Using Vanilla DETR Transformer Decoder")
+            decoder_layer = TransformerDecoderLayer(
+                d_model, nhead, dim_feedforward, dropout, activation, normalize_before
+            )
         decoder_norm = nn.LayerNorm(d_model)
         self.decoder = TransformerDecoder(
             decoder_layer,
@@ -498,6 +519,7 @@ def build_transformer(args):
         num_decoder_layers=args.dec_layers,
         normalize_before=args.pre_norm,
         return_intermediate_dec=True,
+        use_gated_attention=getattr(args, "use_gated_attention", False),
     )
 
 

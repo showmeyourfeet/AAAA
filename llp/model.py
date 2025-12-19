@@ -14,6 +14,7 @@ from .DETRTransformer import (
     TransformerEncoderLayer,
     build_transformer,
 )
+from additional_modules.gated_attention_SDPA import GatedDETREncoderLayer
 from .backbone_impl import build_backbone, FilMedBackbone, FrozenBatchNorm2d
 
 
@@ -401,14 +402,24 @@ class DETRVAE(nn.Module):
 
 
 def build_encoder(args) -> TransformerEncoder:
-    encoder_layer = TransformerEncoderLayer(
-        args.hidden_dim,
-        args.nheads,
-        args.dim_feedforward,
-        args.dropout,
-        "relu",
-        args.pre_norm,
-    )
+    if getattr(args, "use_gated_attention", False):
+        encoder_layer = GatedDETREncoderLayer(
+            args.hidden_dim,
+            args.nheads,
+            args.dim_feedforward,
+            args.dropout,
+            "relu",
+            args.pre_norm,
+        )
+    else:
+        encoder_layer = TransformerEncoderLayer(
+            args.hidden_dim,
+            args.nheads,
+            args.dim_feedforward,
+            args.dropout,
+            "relu",
+            args.pre_norm,
+        )
     encoder_norm = nn.LayerNorm(args.hidden_dim) if args.pre_norm else None
     encoder = TransformerEncoder(encoder_layer, args.enc_layers, encoder_norm)
     return encoder
@@ -514,6 +525,11 @@ def get_args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nheads", default=8, type=int)
     parser.add_argument("--num_queries", default=400, type=int)
     parser.add_argument("--pre_norm", action="store_true")
+    parser.add_argument(
+        "--use_gated_attention",
+        action="store_true",
+        help="Use gated attention in DETR encoder/decoder and CVAE encoder",
+    )
 
     parser.add_argument("--masks", action="store_true")
     parser.add_argument("--use_language", action="store_true")
