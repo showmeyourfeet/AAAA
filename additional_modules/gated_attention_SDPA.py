@@ -10,7 +10,7 @@ class SwiGLU(nn.Module):
         self.w2 = nn.Linear(d_model, dim_feedforward, bias=bias)
         
         # for the output projection
-        self.w3 = nn.Linear(dim_feedforward, dim_feedforward, bias=bias)
+        self.w3 = nn.Linear(dim_feedforward, d_model, bias=bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # SwiGLU activation function: (xW1) * Swish(xW2)
@@ -178,9 +178,13 @@ class GatedTransformerEncoderLayer(nn.Module):
         )
 
         # Feed-forward network
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        # self.linear1 = nn.Linear(d_model, dim_feedforward)
+        # self.dropout = nn.Dropout(dropout)
+        # self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        # use SwiGLU for the feed-forward network
+        hidden_dim = int(2 * dim_feedforward / 3)
+        self.mlp = SwiGLU(d_model, hidden_dim)
 
         # LayerNorms and dropouts
         self.norm1 = nn.LayerNorm(d_model)
@@ -212,7 +216,11 @@ class GatedTransformerEncoderLayer(nn.Module):
         src = self.norm1(src)
 
         # Feed-forward with residual + norm
-        ff = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        # ff = self.linear2(self.dropout(self.activation(self.linear1(src))))
+
+        # SwiGLU for the feed-forward network
+        ff = self.mlp(src)
+
         src = src + self.dropout2(ff)
         src = self.norm2(src)
         return src
@@ -247,9 +255,13 @@ class GatedTransformerDecoderLayer(nn.Module):
         )
 
         # Feed-forward network
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        # self.linear1 = nn.Linear(d_model, dim_feedforward)
+        # self.dropout = nn.Dropout(dropout)
+        # self.linear2 = nn.Linear(dim_feedforward, d_model)
+        
+        # use SwiGLU for the feed-forward network
+        hidden_dim = int(2 * dim_feedforward / 3)
+        self.mlp = SwiGLU(d_model, hidden_dim)
 
         # LayerNorms and dropouts
         self.norm1 = nn.LayerNorm(d_model)
@@ -304,7 +316,11 @@ class GatedTransformerDecoderLayer(nn.Module):
         tgt = self.norm2(tgt)
 
         # Feed-forward
-        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        # tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+
+        # SwiGLU for the feed-forward network
+        tgt2 = self.mlp(tgt)
+        
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
         return tgt
