@@ -2,6 +2,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class SwiGLU(nn.Module):
+    def __init__(self, d_model: int, dim_feedforward: int, bias=True):
+        super().__init__()
+        # for the value and gated trajectory
+        self.w1 = nn.Linear(d_model, dim_feedforward, bias=bias)
+        self.w2 = nn.Linear(d_model, dim_feedforward, bias=bias)
+        
+        # for the output projection
+        self.w3 = nn.Linear(dim_feedforward, dim_feedforward, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # SwiGLU activation function: (xW1) * Swish(xW2)
+        return self.w3(F.silu(self.w2(x)) * self.w1(x))
 
 class GatedMultiheadAttention(nn.Module):
     """
@@ -321,21 +334,26 @@ class GatedDETREncoderLayer(nn.Module):
             batch_first=False,  # seq-first for DETR
         )
 
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        # self.linear1 = nn.Linear(d_model, dim_feedforward)
+        # self.dropout = nn.Dropout(dropout)
+        # self.linear2 = nn.Linear(dim_feedforward, d_model)
+        
+        # integrate the SwiGLU into the feed-forward network
+        hidden_dim = int(2 * dim_feedforward / 3)
+        self.mlp = SwiGLU(d_model, hidden_dim)
 
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
-        if activation == "relu":
-            self.activation = F.relu
-        elif activation == "gelu":
-            self.activation = F.gelu
-        else:
-            raise RuntimeError(f"activation should be relu/gelu, not {activation}.")
+        # remove the activation function, use SwiGLU (inner activation function) instead
+        # if activation == "relu":
+        #     self.activation = F.relu
+        # elif activation == "gelu":
+        #     self.activation = F.gelu
+        # else:
+        #     raise RuntimeError(f"activation should be relu/gelu, not {activation}.")
         self.normalize_before = normalize_before
 
     @staticmethod
@@ -370,7 +388,8 @@ class GatedDETREncoderLayer(nn.Module):
         src2 = self._sa_block(src, src_mask, src_key_padding_mask, pos)
         src = src + self.dropout1(src2)
         src = self.norm1(src)
-        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        # src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src2 = self.mlp(src)
         src = src + self.dropout2(src2)
         src = self.norm2(src)
         return src
@@ -386,7 +405,8 @@ class GatedDETREncoderLayer(nn.Module):
         src2 = self._sa_block(src2, src_mask, src_key_padding_mask, pos)
         src = src + self.dropout1(src2)
         src2 = self.norm2(src)
-        src2 = self.linear2(self.dropout(self.activation(self.linear1(src2))))
+        # src2 = self.linear2(self.dropout(self.activation(self.linear1(src2))))
+        src2 = self.mlp(src)
         src = src + self.dropout2(src2)
         return src
 
@@ -430,9 +450,13 @@ class GatedDETRDecoderLayer(nn.Module):
             batch_first=False,  # seq-first for DETR
         )
 
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        # self.linear1 = nn.Linear(d_model, dim_feedforward)
+        # self.dropout = nn.Dropout(dropout)
+        # self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        # use SwiGLU for the feed-forward network
+        hidden_dim = int(2 * dim_feedforward / 3)
+        self.mlp = SwiGLU(d_model, hidden_dim)
 
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -440,13 +464,14 @@ class GatedDETRDecoderLayer(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.dropout3 = nn.Dropout(dropout)
-
-        if activation == "relu":
-            self.activation = F.relu
-        elif activation == "gelu":
-            self.activation = F.gelu
-        else:
-            raise RuntimeError(f"activation should be relu/gelu, not {activation}.")
+        
+        # remove the activation function, use SwiGLU (inner activation function) instead
+        # if activation == "relu":
+        #     self.activation = F.relu
+        # elif activation == "gelu":
+        #     self.activation = F.gelu
+        # else:
+        #     raise RuntimeError(f"activation should be relu/gelu, not {activation}.")
         self.normalize_before = normalize_before
 
     @staticmethod
@@ -516,7 +541,8 @@ class GatedDETRDecoderLayer(nn.Module):
         )
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
-        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        # tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        tgt2 = self.mlp(tgt)
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
         return tgt
@@ -546,7 +572,8 @@ class GatedDETRDecoderLayer(nn.Module):
         )
         tgt = tgt + self.dropout2(tgt2)
         tgt2 = self.norm3(tgt)
-        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
+        # tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
+        tgt2 = self.mlp(tgt2)
         tgt = tgt + self.dropout3(tgt2)
         return tgt
 
