@@ -2,6 +2,40 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+def _build_mlp(
+    d_model: int,
+    dim_feedforward: int,
+    dropout: float,
+    mlp_type: str = "swiglu",
+    activation: str = "relu",
+) -> nn.Module:
+    """
+    Helper to build the feedforward block.
+    mlp_type:
+      - "swiglu": SwiGLU projection used in the paper.
+      - "standard": Linear -> activation -> Dropout -> Linear (Transformer-style).
+    """
+    mlp_type = mlp_type.lower()
+
+    if mlp_type == "swiglu":
+        hidden_dim = int(2 * dim_feedforward / 3)
+        return SwiGLU(d_model, hidden_dim)
+
+    if mlp_type == "standard":
+        if activation == "gelu":
+            act = nn.GELU()
+        else:
+            act = nn.ReLU()
+        return nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            act,
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+        )
+
+    raise ValueError(f"Unsupported mlp_type: {mlp_type}")
+
+
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int, dim_feedforward: int, bias=True):
         super().__init__()
@@ -18,7 +52,7 @@ class SwiGLU(nn.Module):
 
 class GatedMultiheadAttention(nn.Module):
     """
-    Element-wise Gated Multihead Attention module (based on https://arxiv.org/abs/2505.06708).
+    Element-wise/Head-wise Gated Multihead Attention module (based on https://arxiv.org/abs/2505.06708).
 
     Internally operates in batch-first mode: (batch_size, seq_len, d_model),
     but can accept either batch-first or seq-first (seq_len, batch_size, d_model)
@@ -32,18 +66,28 @@ class GatedMultiheadAttention(nn.Module):
         dropout: float = 0.1,
         bias: bool = True,
         batch_first: bool = True,
+        gate_mode: str = "element-wise", # "element-wise" or "head-wise"
     ):
         super().__init__()
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        assert gate_mode in ["element-wise", "head-wise"], "gate_mode must be either 'element-wise' or 'head-wise'"
+        
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
         self.scale = self.head_dim ** -0.5
         self.batch_first = batch_first
-
-        # shape trick for query [d_model] --> [d_model * 2], actually [query] --> [query, gate]
-        self.q_proj = nn.Linear(d_model, d_model * 2, bias=bias)
-
+        self.gate_mode = gate_mode
+        
+        if gate_mode == "element-wise":
+            # shape trick for query [d_model] --> [d_model * 2], actually [query] --> [query, gate]
+            # Output: [Head1_Q, Head1_G, Head2_Q, Head2_G...] where G has head_dim
+            self.q_proj = nn.Linear(d_model, d_model * 2, bias=bias)
+        else:
+            # shape trick for query [d_model] --> [d_model + num_heads], actually [query] --> [query, gate]
+            # Output: [Head1_Q, Head1_G, Head2_Q, Head2_G...] where G has 1 dimension
+            self.q_proj = nn.Linear(d_model, d_model + num_heads, bias=bias)
+        
         # keep the key and value shape
         self.k_proj = nn.Linear(d_model, d_model, bias=bias)
         self.v_proj = nn.Linear(d_model, d_model, bias=bias)
@@ -86,28 +130,28 @@ class GatedMultiheadAttention(nn.Module):
         # q_gate: (batch_size, seq_len, d_model * 2)
         q_gate = self.q_proj(query_b)
 
-        # split the query into query and gate score
-        # q: (batch_size, seq_len, d_model)
-        # gate_score: (batch_size, seq_len, d_model)
-        q, gate_score = q_gate.chunk(2, dim=-1)
+        if self.gate_mode == "element-wise":
+            q_gate = q_gate.view(batch_size, -1, self.num_heads, self.head_dim * 2)
+            q, gate_score = torch.split(q_gate, [self.head_dim, self.head_dim], dim=-1)
+        else:
+            q_gate = q_gate.view(batch_size, -1, self.num_heads, self.head_dim + 1)
+            q, gate_score = torch.split(q_gate, [self.head_dim, 1], dim=-1)
 
+        q = q.transpose(1, 2)
+        gate_score = gate_score.transpose(1, 2)
+        
         k = self.k_proj(key_b)
         v = self.v_proj(value_b)
 
         # reshape for multi-head attention
         # [batch_size, seq_len, d_model] --> [batch_size, seq_len, num_heads, head_dim] --> [batch_size, num_heads, seq_len, head_dim]
-        q = q.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-
-        # reshape gate to fit multi-head attention
-        # [batch_size, seq_len, d_model] --> [batch_size, seq_len, num_heads, head_dim] --> [batch_size, num_heads, seq_len, head_dim]
-        gate_score = gate_score.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
         # Build unified attention mask compatible with scaled_dot_product_attention
         final_attn_mask = None
 
-        # 1) Base attn_mask: typically (Tq, Tk)
+        # Base attn_mask: typically (Tq, Tk)
         if attn_mask is not None:
             if attn_mask.dim() == 2:  # (Tq, Tk)
                 final_attn_mask = attn_mask.view(1, 1, attn_mask.size(0), attn_mask.size(1))
@@ -115,7 +159,7 @@ class GatedMultiheadAttention(nn.Module):
                 # Assume user passes something broadcastable to (B, H, Tq, Tk)
                 final_attn_mask = attn_mask
 
-        # 2) key_padding_mask: (B, Tk) -> additive mask (B, 1, 1, Tk) with -inf on padded positions
+        # key_padding_mask: (B, Tk) -> additive mask (B, 1, 1, Tk) with -inf on padded positions
         if key_padding_mask is not None:
             # bool mask: True for padding positions
             pad = key_padding_mask.to(torch.bool).unsqueeze(1).unsqueeze(2)  # (B,1,1,Tk)
@@ -168,6 +212,9 @@ class GatedTransformerEncoderLayer(nn.Module):
         num_heads: int,
         dim_feedforward: int = 2048,
         dropout: float = 0.1,
+        mlp_type: str = "swiglu",
+        activation: str = "relu",
+        gate_mode: str = "element-wise",
     ):
         super().__init__()
         self.self_attn = GatedMultiheadAttention(
@@ -175,16 +222,15 @@ class GatedTransformerEncoderLayer(nn.Module):
             d_model=d_model,
             dropout=dropout,
             batch_first=True,
+            gate_mode=gate_mode,
         )
-
-        # Feed-forward network
-        # self.linear1 = nn.Linear(d_model, dim_feedforward)
-        # self.dropout = nn.Dropout(dropout)
-        # self.linear2 = nn.Linear(dim_feedforward, d_model)
-
-        # use SwiGLU for the feed-forward network
-        hidden_dim = int(2 * dim_feedforward / 3)
-        self.mlp = SwiGLU(d_model, hidden_dim)
+        self.mlp = _build_mlp(
+            d_model=d_model,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            mlp_type=mlp_type,
+            activation=activation,
+        )
 
         # LayerNorms and dropouts
         self.norm1 = nn.LayerNorm(d_model)
@@ -215,10 +261,7 @@ class GatedTransformerEncoderLayer(nn.Module):
         src = src + self.dropout1(attn_output)
         src = self.norm1(src)
 
-        # Feed-forward with residual + norm
-        # ff = self.linear2(self.dropout(self.activation(self.linear1(src))))
-
-        # SwiGLU for the feed-forward network
+        # Feed-forward network
         ff = self.mlp(src)
 
         src = src + self.dropout2(ff)
@@ -238,6 +281,9 @@ class GatedTransformerDecoderLayer(nn.Module):
         num_heads: int,
         dim_feedforward: int = 2048,
         dropout: float = 0.1,
+        mlp_type: str = "swiglu",
+        activation: str = "relu",
+        gate_mode: str = "element-wise",
     ):
         super().__init__()
         # Self-attention and cross-attention both use batch-first gated attention
@@ -246,22 +292,22 @@ class GatedTransformerDecoderLayer(nn.Module):
             d_model=d_model,
             dropout=dropout,
             batch_first=True,
+            gate_mode=gate_mode,
         )
         self.cross_attn = GatedMultiheadAttention(
             num_heads=num_heads,
             d_model=d_model,
             dropout=dropout,
             batch_first=True,
+            gate_mode=gate_mode,
         )
-
-        # Feed-forward network
-        # self.linear1 = nn.Linear(d_model, dim_feedforward)
-        # self.dropout = nn.Dropout(dropout)
-        # self.linear2 = nn.Linear(dim_feedforward, d_model)
-        
-        # use SwiGLU for the feed-forward network
-        hidden_dim = int(2 * dim_feedforward / 3)
-        self.mlp = SwiGLU(d_model, hidden_dim)
+        self.mlp = _build_mlp(
+            d_model=d_model,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            mlp_type=mlp_type,
+            activation=activation,
+        )
 
         # LayerNorms and dropouts
         self.norm1 = nn.LayerNorm(d_model)
@@ -316,9 +362,6 @@ class GatedTransformerDecoderLayer(nn.Module):
         tgt = self.norm2(tgt)
 
         # Feed-forward
-        # tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
-
-        # SwiGLU for the feed-forward network
         tgt2 = self.mlp(tgt)
         
         tgt = tgt + self.dropout3(tgt2)
@@ -340,6 +383,8 @@ class GatedDETREncoderLayer(nn.Module):
         dropout: float = 0.1,
         activation: str = "relu",
         normalize_before: bool = False,
+        mlp_type: str = "swiglu",
+        gate_mode: str = "element-wise",
     ):
         super().__init__()
         # use gated attention instead of nn.MultiheadAttention
@@ -348,28 +393,21 @@ class GatedDETREncoderLayer(nn.Module):
             d_model=d_model,
             dropout=dropout,
             batch_first=False,  # seq-first for DETR
+            gate_mode=gate_mode,
         )
-
-        # self.linear1 = nn.Linear(d_model, dim_feedforward)
-        # self.dropout = nn.Dropout(dropout)
-        # self.linear2 = nn.Linear(dim_feedforward, d_model)
-        
-        # integrate the SwiGLU into the feed-forward network
-        hidden_dim = int(2 * dim_feedforward / 3)
-        self.mlp = SwiGLU(d_model, hidden_dim)
+        self.mlp = _build_mlp(
+            d_model=d_model,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            mlp_type=mlp_type,
+            activation=activation,
+        )
 
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
-        # remove the activation function, use SwiGLU (inner activation function) instead
-        # if activation == "relu":
-        #     self.activation = F.relu
-        # elif activation == "gelu":
-        #     self.activation = F.gelu
-        # else:
-        #     raise RuntimeError(f"activation should be relu/gelu, not {activation}.")
         self.normalize_before = normalize_before
 
     @staticmethod
@@ -404,7 +442,6 @@ class GatedDETREncoderLayer(nn.Module):
         src2 = self._sa_block(src, src_mask, src_key_padding_mask, pos)
         src = src + self.dropout1(src2)
         src = self.norm1(src)
-        # src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
         src2 = self.mlp(src)
         src = src + self.dropout2(src2)
         src = self.norm2(src)
@@ -421,7 +458,6 @@ class GatedDETREncoderLayer(nn.Module):
         src2 = self._sa_block(src2, src_mask, src_key_padding_mask, pos)
         src = src + self.dropout1(src2)
         src2 = self.norm2(src)
-        # src2 = self.linear2(self.dropout(self.activation(self.linear1(src2))))
         src2 = self.mlp(src)
         src = src + self.dropout2(src2)
         return src
@@ -452,27 +488,30 @@ class GatedDETRDecoderLayer(nn.Module):
         dropout: float = 0.1,
         activation: str = "relu",
         normalize_before: bool = False,
+        mlp_type: str = "swiglu",
+        gate_mode: str = "element-wise",
     ):
         super().__init__()
         self.self_attn = GatedMultiheadAttention(
             num_heads=nhead,
             d_model=d_model,
             dropout=dropout,
+            gate_mode=gate_mode,
         )
         self.multihead_attn = GatedMultiheadAttention(
             num_heads=nhead,
             d_model=d_model,
             dropout=dropout,
             batch_first=False,  # seq-first for DETR
+            gate_mode=gate_mode,
         )
-
-        # self.linear1 = nn.Linear(d_model, dim_feedforward)
-        # self.dropout = nn.Dropout(dropout)
-        # self.linear2 = nn.Linear(dim_feedforward, d_model)
-
-        # use SwiGLU for the feed-forward network
-        hidden_dim = int(2 * dim_feedforward / 3)
-        self.mlp = SwiGLU(d_model, hidden_dim)
+        self.mlp = _build_mlp(
+            d_model=d_model,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            mlp_type=mlp_type,
+            activation=activation,
+        )
 
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -481,13 +520,6 @@ class GatedDETRDecoderLayer(nn.Module):
         self.dropout2 = nn.Dropout(dropout)
         self.dropout3 = nn.Dropout(dropout)
         
-        # remove the activation function, use SwiGLU (inner activation function) instead
-        # if activation == "relu":
-        #     self.activation = F.relu
-        # elif activation == "gelu":
-        #     self.activation = F.gelu
-        # else:
-        #     raise RuntimeError(f"activation should be relu/gelu, not {activation}.")
         self.normalize_before = normalize_before
 
     @staticmethod
@@ -557,7 +589,6 @@ class GatedDETRDecoderLayer(nn.Module):
         )
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
-        # tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
         tgt2 = self.mlp(tgt)
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
