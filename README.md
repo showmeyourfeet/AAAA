@@ -1,4 +1,4 @@
-# AutoSurgical-Algorithms
+# Hierarchical-Control-Systems-for-Robotic
 
 This project implements a hierarchical control system for robotic surgery/manipulation tasks. It decomposes the control problem into two levels:
 1.  **High-Level Policy (HLP):** Determines the current "stage" or high-level command (e.g., "grasp needle", "move to suture") based on visual observations.
