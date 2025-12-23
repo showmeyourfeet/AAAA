@@ -502,6 +502,8 @@ def build_HighLevelModel(
     num_cameras=4,
     aggregation_mode="last",
     use_gated_attention: bool = False,
+    mlp_type: str = "swiglu",
+    gate_mode: str = "element-wise",
 ):
     # Load candidate texts and embeddings
     candidate_texts, candidate_embeddings = load_candidate_texts_and_embeddings(
@@ -525,6 +527,8 @@ def build_HighLevelModel(
         num_cameras=num_cameras,
         aggregation_mode=aggregation_mode,
         use_gated_attention=use_gated_attention,
+        mlp_type=mlp_type,
+        gate_mode=gate_mode,
     ).to(device)
     return model
 
@@ -604,6 +608,10 @@ if __name__ == "__main__":
         action='store_true',
         help='Use gated attention encoder instead of vanilla TransformerEncoder in HighLevelModel',
     )
+    parser.add_argument('--mlp_type', type=str, default='swiglu', choices=['swiglu', 'standard'],
+                        help='MLP block type inside Transformer layers')
+    parser.add_argument('--gate_mode', type=str, default='element-wise', choices=['element-wise', 'head-wise'],
+                        help='Gated attention mode for Transformer layers')
 
     args = parser.parse_args()
 
@@ -656,6 +664,8 @@ if __name__ == "__main__":
             num_cameras=len(args.camera_names),
             aggregation_mode=args.aggregation_mode,
             use_gated_attention=args.use_gated_attention,
+        mlp_type=args.mlp_type,
+        gate_mode=args.gate_mode,
         )
 
     elif args.use_splitted or args.use_composite:
@@ -752,6 +762,8 @@ if __name__ == "__main__":
             num_cameras=len(camera_names),
             aggregation_mode=args.aggregation_mode,
             use_gated_attention=args.use_gated_attention,
+        mlp_type=args.mlp_type,
+        gate_mode=args.gate_mode,
         )
     else:
         # Traditional format: use explicit dataset_dirs and camera_names
@@ -784,6 +796,8 @@ if __name__ == "__main__":
             num_cameras=len(camera_names),
             aggregation_mode=args.aggregation_mode,
             use_gated_attention=args.use_gated_attention,
+        mlp_type=args.mlp_type,
+        gate_mode=args.gate_mode,
         )
     
     # Optimizer

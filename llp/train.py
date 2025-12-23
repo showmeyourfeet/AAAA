@@ -978,6 +978,8 @@ def main(args: Dict):
         "use_state": use_state,
         "shared_backbone": shared_backbone,
         "use_gated_attention": args.get("use_gated_attention", False),
+        "mlp_type": args.get("mlp_type", "swiglu"),
+        "gate_mode": args.get("gate_mode", "element-wise"),
     }
 
     config = {
@@ -1015,6 +1017,8 @@ if __name__ == "__main__":
     parser.add_argument("--dec_layers_num", type=int, default=7)
     parser.add_argument("--image_encoder", type=str, default="efficientnet_b3film")
     parser.add_argument("--gpu", type=int, default=None, help="GPU ID to use (default: auto-select first available GPU, or CPU if no GPU available)")
+    parser.add_argument("--mlp_type", type=str, default="swiglu", choices=["swiglu", "standard"], help="MLP block type for Transformer FFN")
+    parser.add_argument("--gate_mode", type=str, default="element-wise", choices=["element-wise", "head-wise"], help="Gated attention mode")
     parser.add_argument("--multi_gpu", action="store_true")
     parser.add_argument("--no_state", action="store_true", help="Disable qpos/state inputs throughout training/inference pipeline")
     parser.add_argument("--no_encoder", action="store_true", help="Disable VAE encoder, use zero latent vector instead")
