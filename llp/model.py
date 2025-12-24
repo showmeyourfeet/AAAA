@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.autograd import Variable
 
-from .DETRTransformer import (
+from additional_modules.DETRTransformer import (
     TransformerEncoder,
     TransformerEncoderLayer,
     build_transformer,
