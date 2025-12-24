@@ -39,6 +39,8 @@ class HighLevelModel(nn.Module):
         train_image_encoder=False,
         aggregation_mode="last",  # 'last', 'avg', or 'cls'
         use_gated_attention: bool = False,  # whether to use gated attention encoder
+        mlp_type: str = "swiglu",  # MLP type for gated attention layers
+        gate_mode: str = "element-wise",  # Gate mode for gated attention layers
     ):
         super().__init__()
         
@@ -75,6 +77,8 @@ class HighLevelModel(nn.Module):
                         d_model=self.visual_out_dim,
                         num_heads=num_heads,
                         dim_feedforward=hidden_size,
+                        mlp_type=mlp_type,
+                        gate_mode=gate_mode,
                     )
                     for _ in range(num_layers)
                 ]
