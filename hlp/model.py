@@ -5,8 +5,8 @@ import timm
 import torchvision.transforms as transforms
 import random
 
-from additional_modules.gated_attention_SDPA import GatedTransformerEncoderLayer
-
+from additional_modules.DETRTransformer import TransformerDecoder, TransformerDecoderLayer
+from additional_modules.gated_attention_SDPA import GatedDETRDecoderLayer
 # Image preprocessing for ImageNet-pretrained encoders (e.g., Swin Tiny)
 # NOTE: Currently dataset returns images of various sizes (e.g., 640x480 for cam_high),
 # so we need to resize to 224x224 here. If you want to optimize, consider resizing
@@ -41,13 +41,16 @@ class HighLevelModel(nn.Module):
         use_gated_attention: bool = False,  # whether to use gated attention encoder
         mlp_type: str = "swiglu",  # MLP type for gated attention layers
         gate_mode: str = "element-wise",  # Gate mode for gated attention layers
+        num_queries: int = 3,
     ):
         super().__init__()
-        
-        assert aggregation_mode in ("last", "avg", "cls"), \
-            f"aggregation_mode must be 'last', 'avg', or 'cls', got {aggregation_mode}"
-        self.aggregation_mode = aggregation_mode
+        self.device = device
         self.num_cameras = num_cameras
+        self.history_len = history_len
+        self.num_queries = num_queries
+        self.candidate_embeddings = candidate_embeddings
+        self.candidate_texts = candidate_texts
+        self.use_gated_attention = use_gated_attention
 
         # Load the pretrained Swin-Tiny image encoder (timm)
         # Outputs a pooled feature vector of dimension self.visual_out_dim
@@ -68,66 +71,69 @@ class HighLevelModel(nn.Module):
         # Two options:
         #   1) standard TransformerEncoder (seq-first)
         #   2) custom gated-attention encoder (batch-first)
+        self.d_model = self.visual_out_dim
         self.use_gated_attention = use_gated_attention
         if self.use_gated_attention:
-            # stack several gated encoder layers (batch-first: [B, T, D])
-            self.gated_layers = nn.ModuleList(
-                [
-                    GatedTransformerEncoderLayer(
-                        d_model=self.visual_out_dim,
-                        num_heads=num_heads,
-                        dim_feedforward=hidden_size,
-                        mlp_type=mlp_type,
-                        gate_mode=gate_mode,
-                    )
-                    for _ in range(num_layers)
-                ]
+            print(f"Using GatedDETRDecoderLayer with mlp_type={mlp_type}, gate_mode={gate_mode}")
+            # use the gated attention
+            decoder_layer = GatedDETRDecoderLayer(
+                d_model=self.d_model,
+                nhead=num_heads,
+                dim_feedforward=hidden_size,
+                dropout=0.1,
+                activation="relu",
+                normalize_before=False,
+                mlp_type=mlp_type,      # pass the MLP type (e.g. SwiGLU)
+                gate_mode=gate_mode     # pass the Gate mode (e.g. element-wise)
             )
         else:
-            self.transformer = nn.TransformerEncoder(
-                nn.TransformerEncoderLayer(
-                    d_model=self.visual_out_dim,
-                    nhead=num_heads,
-                    dim_feedforward=hidden_size,
-                    batch_first=True,
-                ),
-                num_layers=num_layers,
+            print("Using Vanilla TransformerDecoderLayer")
+            decoder_layer = TransformerDecoderLayer(
+                d_model=self.d_model,
+                nhead=num_heads,
+                dim_feedforward=hidden_size,
+                dropout=0.1,
+                activation="relu",
+                normalize_before=False
+            )
+        self.decoder = TransformerDecoder(
+            decoder_layer,
+            num_layers = num_layers,
+            norm=nn.LayerNorm(self.d_model),
+            return_intermediate=False,
+        )
+        self.query_embed = nn.Embedding(num_queries, self.d_model) 
+
+        if num_cameras > 1:
+            self.temporal_positional_encoding = self.create_sinusoidal_embeddings(
+                self.d_model, history_len + 1
+            )
+            self.camera_embedding = nn.Embedding(num_cameras, self.d_model)
+        else:
+            self.positional_encoding = self.create_sinusoidal_embeddings(
+                self.d_model, history_len + 1
             )
 
-        if ONE_HOT:
-            output_size = len(candidate_texts)
-
-        self.mlp = nn.Sequential(
-            nn.Linear(self.visual_out_dim, hidden_size),
+        # Prediction Heads (Regression Heads)
+        self.instruction_proj = nn.Sequential(
+            nn.Linear(self.d_model, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, output_size),
         )
 
-        # Learnable temperature
-        self.temperature = nn.Parameter(torch.ones(1))
+        self.correction_flag_proj = nn.Sequential(
+            nn.Linear(self.d_model, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1),
+        )
 
-        # Positional Encoding: separate temporal and camera encoding for multi-camera
-        if num_cameras > 1:
-            # Temporal positional encoding (for each timestep)
-            self.temporal_positional_encoding = self.create_sinusoidal_embeddings(
-                self.visual_out_dim, history_len + 1
-            )
-            # Learnable camera embedding
-            self.camera_embedding = nn.Embedding(num_cameras, self.visual_out_dim)
-        else:
-            # Single camera: use original flat positional encoding
-            self.positional_encoding = self.create_sinusoidal_embeddings(
-                self.visual_out_dim, history_len + 1
-            )
+        self.correction_instruction_proj = nn.Sequential(
+            nn.Linear(self.d_model, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, output_size),
+        )
         
-        # CLS token for 'cls' aggregation mode
-        if aggregation_mode == "cls":
-            self.cls_token = nn.Parameter(torch.randn(1, 1, self.visual_out_dim))
-
-        self.history_len = history_len
-        self.candidate_embeddings = candidate_embeddings
-        self.candidate_texts = candidate_texts
-        self.command_to_index = command_to_index
+        self.temperature = nn.Parameter(torch.ones(1))
 
         total, trainable = count_parameters(self)
         print(f"Total parameters: {total / 1e6:.2f}M")
@@ -136,7 +142,7 @@ class HighLevelModel(nn.Module):
         print(f"Use gated attention: {self.use_gated_attention}")
 
     def forward(self, images):
-        # Given images of shape (b, t, k, c, h, w)
+        # Given images of shape (bs, ts, k, c, h, w)
         batch_size, timesteps, num_cameras, c, h, w = images.shape
 
         # Check if padding is required
@@ -150,7 +156,7 @@ class HighLevelModel(nn.Module):
                 self.history_len + 1
             )  # Update timesteps to reflect the new length
 
-        # Reshape images to (b*t*k, c, h, w) for processing through CLIP
+        # Reshape images to (bs*ts*k, c, h, w) for processing through CLIP
         images_reshaped = images.reshape(batch_size * timesteps * num_cameras, c, h, w)
 
         # Apply transformations for encoder (resize + ImageNet normalize)
@@ -159,74 +165,59 @@ class HighLevelModel(nn.Module):
         # Get image features from Swin-Tiny
         image_features = self.image_encoder(images_transformed)  # (B*, D)
 
-        # Reshape the image features to [batch_size, timesteps, cameras, feature_dim]
-        image_features_reshaped = image_features.reshape(
-            batch_size, timesteps, num_cameras, -1
-        ).to(torch.float32)
+        # reshape the image features to (bs, ts, k, d)
+        memory_features = image_features.reshape(batch_size, timesteps, num_cameras, -1)
 
-        # Add positional encoding
-        if self.num_cameras > 1:
-            # Separate temporal + camera encoding for multi-camera setup
-            # temporal_pe: (timesteps, D) -> (1, timesteps, 1, D)
-            temporal_pe = self.temporal_positional_encoding[:timesteps, :].to(
-                image_features_reshaped.device
-            ).unsqueeze(0).unsqueeze(2)
-            # camera_pe: (num_cameras, D) -> (1, 1, num_cameras, D)
-            camera_pe = self.camera_embedding.weight[:num_cameras, :].unsqueeze(0).unsqueeze(1)
-            # Combine: broadcast to (batch, timesteps, cameras, D)
-            image_features_reshaped = image_features_reshaped + temporal_pe + camera_pe
+        # build the positional encoding
+        if num_cameras > 1:
+            temporal_pe = self.temporal_positional_encoding[:timesteps, :].to(images.device).unsqueeze(0).unsqueeze(2) # (1, T, 1, D)
+            camera_pe = self.camera_embedding.weight[:num_cameras, :].unsqueeze(0).unsqueeze(1) # (1, 1, K, D)
+            pos_embed = temporal_pe + camera_pe # Broadcasting (1, T, K, D)
         else:
-            # Single camera: use flat positional encoding
-            # (timesteps, D) -> (1, timesteps, 1, D)
-            pos_enc = self.positional_encoding[:timesteps, :].to(
-                image_features_reshaped.device
-            ).unsqueeze(0).unsqueeze(2)
-            image_features_reshaped = image_features_reshaped + pos_enc
+            pos_embed = self.positional_encoding[:timesteps, :].to(images.device).unsqueeze(0).unsqueeze(2) # (1, T, 1, D)
+        # expand the positional encoding to the batch size dimension
+        pos_embed = pos_embed.expand(batch_size, -1, -1, -1) # (bs, T*K, D)
 
-        # Flatten to [batch_size, timesteps * cameras, feature_dim]
-        image_features_flat = image_features_reshaped.reshape(
-            batch_size, timesteps * num_cameras, -1
-        )
+        # Prepare the memory features for the Transformer Decoder
+        # The expected shape is [seq_len, bs, d]
+        # original ([bs, ts, k, d]) --> flatten ([bs, ts*k, d]) --> permute ([ts*k, bs, d])
+        memory = memory_features.reshape(batch_size, timesteps * num_cameras, -1).permute(1, 0, 2)
+        pos = pos_embed.reshape(batch_size, timesteps * num_cameras, -1).permute(1, 0, 2)
 
-        # Prepend CLS token if using 'cls' aggregation mode
-        if self.aggregation_mode == "cls":
-            cls_tokens = self.cls_token.expand(batch_size, -1, -1).to(image_features_flat.device)
-            image_features_flat = torch.cat([cls_tokens, image_features_flat], dim=1)
+        # Prepare the Queries
+        # query embed: [num_queries, d] --> [num_queries, bs, d]
+        # target: [num_queries, bs, d], initialized to 0 according to the DETRTransformer
+        query_pos = self.query_embed.weight.unsqueeze(1).repeat(1, batch_size, 1) # (num_queries, bs, d)
+        tgt = torch.zeros_like(query_pos) # (num_queries, bs, d)
 
-        # Pass the concatenated features through the Transformer / gated encoder
-        if self.use_gated_attention:
-            # batch-first: (B, T, D) is default.
-            transformer_out = image_features_flat
-            for layer in self.gated_layers:
-                transformer_out = layer(transformer_out)
-        else:
-            # While batch_first is True, the input will be transformed from (seq_len, batch, d_model) to (batch, seq_len, d_model) internally.
-            # which is consistent with the general input format.
-            transformer_out = self.transformer(image_features_flat)
+        # Decoer Forward Pass
+        decoder_output = self.decoder(
+            tgt,
+            memory,
+            pos=pos,
+            memory_key_padding_mask=None, # no padding mask for the memory
+            query_pos=query_pos,
+        ) # (num_queries, bs, d)
 
-        # Extract output based on aggregation mode
-        if self.aggregation_mode == "cls":
-            # Take the CLS token output (position 0)
-            final_output = transformer_out[:, 0, :]
-        elif self.aggregation_mode == "avg":
-            # Average over all sequence positions
-            final_output = transformer_out.mean(dim=1)
-        else:  # 'last'
-            # Take the last token output
-            final_output = transformer_out[:, -1, :]
+        # Get the last layer output and permute to (bs, num_queries, d)
+        final_features = decoder_output[-1].permute(1, 0, 2) # (bs, num_queries, d)
 
-        if ONE_HOT:
-            # Directly predict the logits for each command
-            logits = self.mlp(final_output)
-        else:
-            # Predict the command embedding
-            command_pred = self.mlp(final_output)
-            # Compute the similarity scores as logits
-            logits = self.compute_similarities(command_pred) / self.temperature.clamp(
-                min=1e-8
-            )
+        # Prediction Heads
+        feat_instruction = final_features[:, 0, :]
+        feat_correction_flag = final_features[:, 1, :]
+        feat_correction_cmd = final_features[:, 2, :]
 
-        return logits, self.temperature
+        pred_instruction = self.instruction_proj(feat_instruction) # (bs, output_size)
+        pred_correction_flag = self.correction_flag_proj(feat_correction_flag) # (bs, 1)
+        pred_correction_cmd = self.correction_instruction_proj(feat_correction_cmd) # (bs, output_size)
+
+        pred_instruction_logits = self.compute_similarities(pred_instruction) / self.temperature.clamp(min=1e-8)
+        # pass the raw logits without similarity computation
+        pred_correction_flag_logits = pred_correction_flag
+        pred_correction_cmd_logits = self.compute_similarities(pred_correction_cmd) / self.temperature.clamp(min=1e-8)
+
+        return pred_instruction_logits, pred_correction_flag_logits, pred_correction_cmd_logits, self.temperature
+
 
     def compute_similarities(self, embeddings):
         # Compute the cosine similarities

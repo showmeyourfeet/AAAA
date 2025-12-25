@@ -38,9 +38,9 @@ def _normalize_command_text(cmd: str) -> str:
     return cmd.replace("the back", "the bag").replace("mmove", "move")
 
 
-def calculate_hl_loss(logits, true_labels):
+def calculate_instruction_loss(logits, true_labels):
     """
-    Calculate high-level loss with L1 distance weighting.
+    Calculate instruction loss with L1 distance weighting.
     Penalizes predictions that are further from the correct stage.
     
     Args:
@@ -80,7 +80,7 @@ def train(model, dataloader, optimizer, scheduler, device, logger=None, log_wand
         images = images.to(device)
 
         optimizer.zero_grad()
-        logits, temperature = model(images)
+        logits_instr, logits_flag, logits_corr, temperature = model(images)
 
         # Convert ground truth command strings to indices using the pre-computed dictionary
         commands_idx = [
@@ -92,8 +92,17 @@ def train(model, dataloader, optimizer, scheduler, device, logger=None, log_wand
         commands_idx = torch.tensor(commands_idx, device=device)
 
         # Calculate distance-weighted loss
-        loss = calculate_hl_loss(logits, commands_idx)
+        loss_instr = calculate_instruction_loss(logits_instr, commands_idx)
+        loss_flag = torch.nn.BCEWithLogitsLoss()(logits_flag, true_flags)
+        raw_corr_loss = torch.nn.CrossEntropyLoss(reduction='none')(logits_corr, correct_commands_idx)
+        mask = (true_flags > 0.5).float()
+        if mask.sum() > 0:
+            loss_corr = (raw_corr_loss * mask).sum() / (mask.sum() + 1e-8)
+        else:
+            loss_corr = torch.tensor(0.0, device=device)
         
+
+        loss = loss_instr + loss_flag + loss_corr
         # Backpropagation
         loss.backward()
         optimizer.step()
