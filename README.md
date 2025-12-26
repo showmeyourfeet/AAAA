@@ -28,9 +28,9 @@ This project implements a hierarchical control system for robotic surgery/manipu
 
 The HLP predicts the high-level goal or "stage" of the task.
 
-*   **Architecture:** Uses a **Swin-Tiny** image encoder followed by a temporal model. The temporal model can be a standard **Transformer Encoder** or a custom **Gated Attention Encoder**.
+*   **Architecture:** Uses a **Swin-Tiny** image encoder followed by a decoder model. The decoder model can be a standard **DETR Transformer Decoder** or a custom **Gated Attention DETR Decoder**.
 *   **Input:** Sequence of images from multiple cameras (e.g., `left_frame`, `right_frame`).
-*   **Output:** Discrete command class or command embedding.
+*   **Output:** Instrcuction command embedding, Correction flag embedding, Correction command flag.
 
 ### Training
 
@@ -74,7 +74,7 @@ python hlp/train.py \
 *   `--use_gated_attention`: Enables the custom Gated Transformer Encoder.
 *   `--train_image_encoder`: Unfreezes the Swin-Tiny backbone for fine-tuning.
 *   `--use_composite`: Uses composite dataset sampling (combining runs).
-*   `--aggregation_mode cls`: Uses a [CLS] token for final prediction.
+*   `--use_dagger`: Enable dagger training mode.
 
 ## Low-Level Policy (LLP)
 

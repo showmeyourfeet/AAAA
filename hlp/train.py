@@ -21,15 +21,7 @@ from sklearn.manifold import TSNE
 from collections import OrderedDict
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 
-from hlp.dataset import (
-    load_merged_data,
-    load_splitted_data,
-    load_composite_data,
-    load_paired_stage_sequences,
-    load_sequential_stage_sequences,
-    AnnotationStageDataset,
-    load_annotation_data,
-)
+from hlp.dataset import load_composite_data
 from hlp.model import HighLevelModel
 
 
@@ -817,10 +809,10 @@ def build_HighLevelModel(
     dagger_embeddings_file=None,
     train_image_encoder=False,
     num_cameras=4,
-    aggregation_mode="last",
     use_gated_attention: bool = False,
     mlp_type: str = "swiglu",
     gate_mode: str = "element-wise",
+    use_dagger: bool = False,
 ):
     # Load candidate texts and embeddings
     candidate_texts, candidate_embeddings, correction_idx_map, num_stage_commands = load_candidate_texts_and_embeddings(
@@ -846,10 +838,10 @@ def build_HighLevelModel(
         command_to_index=command_to_index,
         train_image_encoder=train_image_encoder,
         num_cameras=num_cameras,
-        aggregation_mode=aggregation_mode,
         use_gated_attention=use_gated_attention,
         mlp_type=mlp_type,
         gate_mode=gate_mode,
+        use_dagger=use_dagger,
     ).to(device)
     
     # Store correction index mapping in model for later use in training
@@ -932,8 +924,6 @@ if __name__ == "__main__":
                         help='Number of DataLoader workers for validation (annotation dataset). 0 = no multiprocessing (safer on WSL).')
     # Image encoder training control
     parser.add_argument('--train_image_encoder', action='store_true', help='Enable training of the image encoder (default: frozen)')
-    parser.add_argument('--aggregation_mode', type=str, default='last', choices=['last', 'avg', 'cls'],
-                        help="Aggregation mode for transformer output: 'last' (default), 'avg' (mean pooling), 'cls' (use [CLS] token)")
     parser.add_argument('--save_ckpt_every', type=int, default=100,
                         help='Interval size for saving the best checkpoint within each interval [i*n, (i+1)*n) based on val loss (default: 100)')
     parser.add_argument(
@@ -961,47 +951,7 @@ if __name__ == "__main__":
     dagger_ratio = args.dagger_ratio
 
     # Data loading
-    if args.use_annotation_dataset:
-        # New annotation-format dataset: example_datasets/run_XXX with annotations.json
-        assert args.annotation_root is not None, "--annotation_root must be provided when --use_annotation_dataset is set"
-        assert not args.use_splitted and not args.use_composite, "--use_annotation_dataset is mutually exclusive with --use_splitted/--use_composite"
-
-        train_dataloader, val_dataloader, test_dataloader = load_annotation_data(
-            root_dir=args.annotation_root,
-            batch_size_train=args.batch_size,
-            batch_size_val=args.batch_size,
-            history_len=args.history_len,
-            prediction_offset=args.prediction_offset,
-            history_skip_frame=args.history_skip_frame,
-            traverse_full_trajectory=args.traverse_full_trajectory,
-            num_workers_train=args.num_workers_train,
-            num_workers_val=args.num_workers_val,
-            stage_embeddings_file=args.stage_embeddings_file,
-            stage_texts_file=args.stage_texts_file,
-            use_augmentation=args.use_augmentation,
-            image_size=args.image_size,
-            drop_initial_frames=1,
-            train_ratio=0.85,
-            val_ratio=0.15,
-            seed=args.seed,
-        )
-
-        # Build model with stage-level candidate texts/embeddings
-        model = build_HighLevelModel(
-            dataset_dirs=[],  # not used in annotation mode
-            history_len=args.history_len,
-            device=device,
-            stage_embeddings_file=args.stage_embeddings_file,
-            stage_texts_file=args.stage_texts_file,
-            train_image_encoder=args.train_image_encoder,
-            num_cameras=len(args.camera_names),
-            aggregation_mode=args.aggregation_mode,
-            use_gated_attention=args.use_gated_attention,
-        mlp_type=args.mlp_type,
-        gate_mode=args.gate_mode,
-        )
-
-    elif args.use_splitted or args.use_composite:
+    if args.use_splitted or args.use_composite:
         # Use splitted or composite dataset format
         # Unified interface: use normal_root_dir (or splitted_root as fallback for backward compatibility)
         normal_root_dir = args.normal_root_dir or args.splitted_root
@@ -1022,85 +972,37 @@ if __name__ == "__main__":
         # Get camera names from task config or use default
         camera_names = args.camera_names
         
-        if args.use_composite:
-            # Use composite dataset format (select one run per stage and concatenate)
-            train_dataloader, val_dataloader, test_dataloader = load_composite_data(
-                root_dir=normal_root_dir,  # Use normal_root_dir (unified interface)
-                camera_names=camera_names,
-                batch_size_train=args.batch_size,
-                batch_size_val=args.batch_size,
-                history_len=args.history_len,
-                prediction_offset=args.prediction_offset,
-                history_skip_frame=args.history_skip_frame,
-                random_crop=args.random_crop,
-                stage_embeddings_file=args.stage_embeddings_file,
-                stage_texts_file=args.stage_texts_file,
-                dagger_ratio=dagger_ratio,
-                train_subdir=None,  # root_dir is training directory directly
-                val_subdir=None,    # use val_root instead
-                val_root=normal_val_root,  # Use normal_val_root (unified interface)
-                use_augmentation=args.use_augmentation,
-                image_size=args.image_size,
-                sampling_strategy=args.sampling_strategy,
-                max_combinations=args.max_combinations,
-                n_repeats=args.n_repeats,
-                sync_sequence_augmentation=args.sync_sequence_augmentation,
-                use_weak_traversal=args.use_weak_traversal,
-                samples_non_cross_per_stage=args.samples_non_cross_per_stage,
-                samples_cross_per_stage=args.samples_cross_per_stage,
-                normal_root_dir=normal_root_dir,  # Normal datasets root (unified interface)
-                dagger_root_dir=args.dagger_root_dir,  # DAgger mode: dagger datasets root
-                normal_val_root=normal_val_root,  # Normal validation datasets root (unified interface)
-                dagger_val_root=args.dagger_val_root,  # DAgger mode: dagger validation datasets root
-                dagger_mix_ratio=args.dagger_mix_ratio,  # DAgger mode: mixing ratio of dagger samples
-            )
-        elif args.use_paired_sequences:
-            # Use paired adjacent-stage sequences for training; keep validation/test as None for now
-            train_dataloader = load_paired_stage_sequences(
-                root_dir=normal_root_dir,
-                camera_names=camera_names,
-                batch_size=args.batch_size,
-                history_len=args.history_len,
-                skip_frame=args.history_skip_frame,
-                offset=args.prediction_offset,
-                stage_embeddings_file=args.stage_embeddings_file,
-                stage_texts_file=args.stage_texts_file,
-                max_run=args.max_run,
-                use_augmentation=args.use_augmentation,
-                image_size=args.image_size,
-                rng_seed=args.seed,  # initial pairing
-            )
-            # For validation/test, use deterministic sequential concatenation per run_name
-            val_root = normal_val_root or normal_root_dir
-            val_dataloader = load_sequential_stage_sequences(
-                root_dir=val_root,
-                camera_names=camera_names,
-                batch_size=args.batch_size,
-                history_len=args.history_len,
-                skip_frame=args.history_skip_frame,
-                offset=args.prediction_offset,
-                stage_embeddings_file=args.stage_embeddings_file,
-                stage_texts_file=args.stage_texts_file,
-                use_augmentation=False,
-                image_size=args.image_size,
-            )
-            test_dataloader = val_dataloader
-        else:
-            train_dataloader, val_dataloader, test_dataloader = load_splitted_data(
-                root_dir=normal_root_dir,
-                camera_names=camera_names,
-                batch_size_train=args.batch_size,
-                batch_size_val=args.batch_size,
-                history_len=args.history_len,
-                prediction_offset=args.prediction_offset,
-                history_skip_frame=args.history_skip_frame,
-                random_crop=args.random_crop,
-                stage_embeddings_file=args.stage_embeddings_file,
-                stage_texts_file=args.stage_texts_file,
-                dagger_ratio=dagger_ratio,
-                use_augmentation=args.use_augmentation,
-                image_size=args.image_size,
-            )
+        # Use composite dataset format (select one run per stage and concatenate)
+        train_dataloader, val_dataloader, test_dataloader = load_composite_data(
+            root_dir=normal_root_dir,  # Use normal_root_dir (unified interface)
+            camera_names=camera_names,
+            batch_size_train=args.batch_size,
+            batch_size_val=args.batch_size,
+            history_len=args.history_len,
+            prediction_offset=args.prediction_offset,
+            history_skip_frame=args.history_skip_frame,
+            random_crop=args.random_crop,
+            stage_embeddings_file=args.stage_embeddings_file,
+            stage_texts_file=args.stage_texts_file,
+            dagger_ratio=dagger_ratio,
+            train_subdir=None,  # root_dir is training directory directly
+            val_subdir=None,    # use val_root instead
+            val_root=normal_val_root,  # Use normal_val_root (unified interface)
+            use_augmentation=args.use_augmentation,
+            image_size=args.image_size,
+            sampling_strategy=args.sampling_strategy,
+            max_combinations=args.max_combinations,
+            n_repeats=args.n_repeats,
+            sync_sequence_augmentation=args.sync_sequence_augmentation,
+            use_weak_traversal=args.use_weak_traversal,
+            samples_non_cross_per_stage=args.samples_non_cross_per_stage,
+            samples_cross_per_stage=args.samples_cross_per_stage,
+            normal_root_dir=normal_root_dir,  # Normal datasets root (unified interface)
+            dagger_root_dir=args.dagger_root_dir,  # DAgger mode: dagger datasets root
+            normal_val_root=normal_val_root,  # Normal validation datasets root (unified interface)
+            dagger_val_root=args.dagger_val_root,  # DAgger mode: dagger validation datasets root
+            dagger_mix_ratio=args.dagger_mix_ratio,  # DAgger mode: mixing ratio of dagger samples
+        )
         
         # Build model with splitted/composite format
         model = build_HighLevelModel(
@@ -1112,45 +1014,13 @@ if __name__ == "__main__":
             dagger_embeddings_file=args.dagger_embeddings_file if args.use_dagger else None,
             train_image_encoder=args.train_image_encoder,
             num_cameras=len(camera_names),
-            aggregation_mode=args.aggregation_mode,
             use_gated_attention=args.use_gated_attention,
-        mlp_type=args.mlp_type,
-        gate_mode=args.gate_mode,
+            mlp_type=args.mlp_type,
+            gate_mode=args.gate_mode,
+            use_dagger=args.use_dagger,
         )
     else:
-        # Traditional format: use explicit dataset_dirs and camera_names
-        assert args.dataset_dirs is not None and len(args.dataset_dirs) > 0, "--dataset_dirs must be provided"
-        dataset_dirs = args.dataset_dirs
-        # Fallbacks (dataset.py expects traditional loaders to know sizes; we set to 1 to load directly)
-        num_episodes_list = [1 for _ in dataset_dirs]
-        camera_names = args.camera_names
-        train_dataloader, val_dataloader, test_dataloader = load_merged_data(
-            dataset_dirs=dataset_dirs,
-            num_episodes_list=num_episodes_list,
-            camera_names=camera_names,
-            batch_size_train=args.batch_size,
-            batch_size_val=args.batch_size,
-            history_len=args.history_len,
-            prediction_offset=args.prediction_offset,
-            history_skip_frame=args.history_skip_frame,
-            random_crop=args.random_crop,
-            dagger_ratio=dagger_ratio,
-            use_augmentation=args.use_augmentation,
-            image_size=args.image_size,
-            sync_sequence_augmentation=args.sync_sequence_augmentation,
-        )
-
-        model = build_HighLevelModel(
-            dataset_dirs, 
-            args.history_len, 
-            device,
-            train_image_encoder=args.train_image_encoder,
-            num_cameras=len(camera_names),
-            aggregation_mode=args.aggregation_mode,
-            use_gated_attention=args.use_gated_attention,
-        mlp_type=args.mlp_type,
-        gate_mode=args.gate_mode,
-        )
+        raise ValueError("--use_splitted or --use_composite must be set. Other data loading modes are no longer supported.")
     
     # Optimizer
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-2)
@@ -1316,23 +1186,6 @@ if __name__ == "__main__":
     
     pbar_epochs = tqdm(range(latest_idx, args.num_epochs), desc="Epochs", leave=True)
     for epoch in pbar_epochs:
-        # Rebuild train dataloader each epoch to randomize pairings (if enabled)
-        if args.use_splitted and args.use_paired_sequences:
-            normal_root_dir = args.normal_root_dir or args.splitted_root
-            train_dataloader = load_paired_stage_sequences(
-                root_dir=normal_root_dir,
-                camera_names=camera_names,
-                batch_size=args.batch_size,
-                history_len=args.history_len,
-                skip_frame=args.history_skip_frame,
-                offset=args.prediction_offset,
-                stage_embeddings_file=args.stage_embeddings_file,
-                stage_texts_file=args.stage_texts_file,
-                max_run=args.max_run,
-                use_augmentation=args.use_augmentation,
-                image_size=args.image_size,
-                rng_seed=int(args.seed + epoch),
-            )
         # Test the model and log success rate every 200 epochs (if test_dataloader is available)
         if (
             epoch % 200 == 0

@@ -37,17 +37,18 @@ class HighLevelModel(nn.Module):
         command_to_index=None,
         num_cameras=4,
         train_image_encoder=False,
-        aggregation_mode="last",  # 'last', 'avg', or 'cls'
         use_gated_attention: bool = False,  # whether to use gated attention encoder
         mlp_type: str = "swiglu",  # MLP type for gated attention layers
         gate_mode: str = "element-wise",  # Gate mode for gated attention layers
-        num_queries: int = 3,
+        use_dagger: bool = False,  # whether to use DAgger mode (determines num_queries and prediction heads)
     ):
         super().__init__()
         self.device = device
         self.num_cameras = num_cameras
         self.history_len = history_len
-        self.num_queries = num_queries
+        self.use_dagger = use_dagger
+        # Set num_queries based on use_dagger: 3 for DAgger (instruction + correction_flag + correction_cmd), 1 for normal
+        self.num_queries = 3 if use_dagger else 1
         self.candidate_embeddings = candidate_embeddings
         self.candidate_texts = candidate_texts
         self.command_to_index = command_to_index
@@ -103,7 +104,7 @@ class HighLevelModel(nn.Module):
             norm=nn.LayerNorm(self.d_model),
             return_intermediate=False,
         )
-        self.query_embed = nn.Embedding(num_queries, self.d_model) 
+        self.query_embed = nn.Embedding(self.num_queries, self.d_model) 
 
         if num_cameras > 1:
             self.temporal_positional_encoding = self.create_sinusoidal_embeddings(
@@ -116,31 +117,38 @@ class HighLevelModel(nn.Module):
             )
 
         # Prediction Heads (Regression Heads)
+        # Always create instruction head
         self.instruction_proj = nn.Sequential(
             nn.Linear(self.d_model, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, output_size),
         )
 
-        self.correction_flag_proj = nn.Sequential(
-            nn.Linear(self.d_model, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, 1),
-        )
+        # Only create correction heads if using DAgger
+        if use_dagger:
+            self.correction_flag_proj = nn.Sequential(
+                nn.Linear(self.d_model, hidden_size),
+                nn.ReLU(),
+                nn.Linear(hidden_size, 1),
+            )
 
-        self.correction_instruction_proj = nn.Sequential(
-            nn.Linear(self.d_model, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, output_size),
-        )
+            self.correction_instruction_proj = nn.Sequential(
+                nn.Linear(self.d_model, hidden_size),
+                nn.ReLU(),
+                nn.Linear(hidden_size, output_size),
+            )
+        else:
+            # Set to None to avoid creating unused parameters
+            self.correction_flag_proj = None
+            self.correction_instruction_proj = None
         
         self.temperature = nn.Parameter(torch.ones(1))
 
         total, trainable = count_parameters(self)
         print(f"Total parameters: {total / 1e6:.2f}M")
         print(f"Trainable parameters: {trainable / 1e6:.2f}M")
-        print(f"Aggregation mode: {aggregation_mode}")
         print(f"Use gated attention: {self.use_gated_attention}")
+        print(f"Use DAgger: {self.use_dagger} (num_queries: {self.num_queries})")
 
     def forward(self, images):
         # Given images of shape (bs, ts, k, c, h, w)
@@ -205,19 +213,26 @@ class HighLevelModel(nn.Module):
 
         # Prediction Heads
         feat_instruction = final_features[:, 0, :]
-        feat_correction_flag = final_features[:, 1, :]
-        feat_correction_cmd = final_features[:, 2, :]
-
         pred_instruction = self.instruction_proj(feat_instruction) # (bs, output_size)
-        pred_correction_flag = self.correction_flag_proj(feat_correction_flag) # (bs, 1)
-        pred_correction_cmd = self.correction_instruction_proj(feat_correction_cmd) # (bs, output_size)
-
         pred_instruction_logits = self.compute_similarities(pred_instruction) / self.temperature.clamp(min=1e-8)
-        # pass the raw logits without similarity computation
-        pred_correction_flag_logits = pred_correction_flag
-        pred_correction_cmd_logits = self.compute_similarities(pred_correction_cmd) / self.temperature.clamp(min=1e-8)
 
-        return pred_instruction_logits, pred_correction_flag_logits, pred_correction_cmd_logits, self.temperature
+        if self.use_dagger:
+            # DAgger mode: compute correction flag and correction command predictions
+            feat_correction_flag = final_features[:, 1, :]
+            feat_correction_cmd = final_features[:, 2, :]
+            
+            pred_correction_flag = self.correction_flag_proj(feat_correction_flag) # (bs, 1)
+            pred_correction_cmd = self.correction_instruction_proj(feat_correction_cmd) # (bs, output_size)
+            
+            # pass the raw logits without similarity computation
+            pred_correction_flag_logits = pred_correction_flag
+            pred_correction_cmd_logits = self.compute_similarities(pred_correction_cmd) / self.temperature.clamp(min=1e-8)
+            
+            return pred_instruction_logits, pred_correction_flag_logits, pred_correction_cmd_logits, self.temperature
+        else:
+            # Normal mode: only return instruction prediction
+            # Return None for correction outputs to maintain compatibility
+            return pred_instruction_logits, None, None, self.temperature
 
 
     def compute_similarities(self, embeddings):
