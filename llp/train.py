@@ -13,14 +13,13 @@ from typing import Dict, List, Sequence
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm, trange
 import math
 
 
 try:
-    # When run as a module: python -m act_refactor.train
     from .dataset import (
         SplittedEpisodicDataset,
         load_splitted_data,
@@ -36,7 +35,6 @@ try:
         set_seed,
     )
 except ImportError:
-    # When run as a script: python path/to/act_refactor/train.py
     import sys
     from os.path import dirname, abspath
 
@@ -285,7 +283,7 @@ def train_bc(
     
     # Mixed precision training (AMP)
     use_amp = config.get("use_amp", False)
-    scaler = GradScaler() if use_amp else None
+    scaler = GradScaler('cuda') if use_amp else None
     if use_amp:
         print("Using mixed precision training (AMP)")
 
@@ -400,7 +398,7 @@ def train_bc(
         for batch_idx, data in enumerate(batch_bar):
             # Forward pass with optional AMP
             if use_amp:
-                with autocast():
+                with autocast('cuda'):
                     forward_dict = forward_pass(data, policy, device, encode_command)
                     loss = forward_dict["loss"]
                 scaler.scale(loss).backward()
@@ -476,7 +474,7 @@ def train_bc(
                     
                     # 1. 重建模式 Loss（传入 GT actions，用于监控 VAE 训练）
                     if use_amp:
-                        with autocast():
+                        with autocast('cuda'):
                             forward_dict = policy(qpos_data, image_data, action_data, is_pad, command_embedding, encode_command=encode_command)
                     else:
                         forward_dict = policy(qpos_data, image_data, action_data, is_pad, command_embedding, encode_command=encode_command)
@@ -486,7 +484,7 @@ def train_bc(
                     
                     # 2. 推理模式 Loss（不传入 actions，使用零向量 latent，反映真实推理能力）
                     if use_amp:
-                        with autocast():
+                        with autocast('cuda'):
                             a_hat_infer = policy(qpos_data, image_data, actions=None, is_pad=None, command_embedding=command_embedding, encode_command=encode_command)
                     else:
                         a_hat_infer = policy(qpos_data, image_data, actions=None, is_pad=None, command_embedding=command_embedding, encode_command=encode_command)
