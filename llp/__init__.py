@@ -18,7 +18,7 @@ from .utils import (
     detach_dict,
     set_seed,
 )
-from .misc import (
+from additional_modules.misc import (
     NestedTensor,
     is_main_process,
 )

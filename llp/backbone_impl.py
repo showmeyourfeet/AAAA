@@ -31,8 +31,8 @@ from ._efficientnet import (
 )
 from ._resnet import film_resnet18, film_resnet34, film_resnet50
 
-from .DETRTransformer import build_position_encoding
-from .misc import NestedTensor, is_main_process
+from additional_modules.DETRTransformer import build_position_encoding
+from additional_modules.misc import NestedTensor, is_main_process
 
 
 class FrozenBatchNorm2d(torch.nn.Module):
