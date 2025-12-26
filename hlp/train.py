@@ -64,7 +64,7 @@ def calculate_instruction_loss(logits, true_labels):
     return weighted_loss
 
 
-def train(model, dataloader, optimizer, scheduler, device, logger=None, log_wandb=False, epoch: int | None = None):
+def train(model, dataloader, optimizer, scheduler, device, logger=None, log_wandb=False, epoch: int | None = None, use_dagger=False):
     model.train()
     total_loss = 0.0
     num_batches = 0
@@ -76,7 +76,14 @@ def train(model, dataloader, optimizer, scheduler, device, logger=None, log_wand
         dynamic_ncols=True,
     )
     for batch in batch_bar:
-        images, _, commands = batch
+        # Unpack batch: handle both old format (3 items) and new format (5 items with correction info)
+        if len(batch) == 3:
+            images, _, commands = batch
+            correction_flags = None
+            correction_command_indices = None
+        else:
+            images, _, commands, correction_flags, correction_command_indices = batch
+        
         images = images.to(device)
 
         optimizer.zero_grad()
@@ -91,18 +98,64 @@ def train(model, dataloader, optimizer, scheduler, device, logger=None, log_wand
         ]
         commands_idx = torch.tensor(commands_idx, device=device)
 
-        # Calculate distance-weighted loss
+        # Calculate distance-weighted loss for instruction prediction
         loss_instr = calculate_instruction_loss(logits_instr, commands_idx)
-        loss_flag = torch.nn.BCEWithLogitsLoss()(logits_flag, true_flags)
-        raw_corr_loss = torch.nn.CrossEntropyLoss(reduction='none')(logits_corr, correct_commands_idx)
-        mask = (true_flags > 0.5).float()
-        if mask.sum() > 0:
-            loss_corr = (raw_corr_loss * mask).sum() / (mask.sum() + 1e-8)
-        else:
-            loss_corr = torch.tensor(0.0, device=device)
         
-
-        loss = loss_instr + loss_flag + loss_corr
+        if use_dagger:
+            # DAgger mode: compute correction flag and correction command losses
+            # Handle correction flags: use from batch if available, otherwise use model prediction
+            if correction_flags is not None:
+                # Convert correction flags to tensor
+                if isinstance(correction_flags, (list, tuple)):
+                    true_flags = torch.tensor([float(f) for f in correction_flags], device=device).unsqueeze(1)
+                else:
+                    true_flags = correction_flags.to(device).unsqueeze(1) if len(correction_flags.shape) == 1 else correction_flags.to(device)
+            else:
+                # Fallback: use model prediction (for backward compatibility)
+                true_flags = torch.sigmoid(logits_flag)
+            
+            loss_flag = torch.nn.BCEWithLogitsLoss()(logits_flag, true_flags)
+            
+            # Handle correction command indices
+            # When correction_flag=1, use correction_command_idx; otherwise use a dummy value (won't be used due to mask)
+            # Note: correction_command_idx from dataset is 1-based (1-10), needs to be mapped to merged candidate index
+            if correction_command_indices is not None:
+                # Convert correction command indices to tensor
+                if isinstance(correction_command_indices, (list, tuple)):
+                    # Map original correction_command_idx (1-10) to merged candidate index
+                    correction_idx_map = getattr(model, 'correction_idx_map', {})
+                    correct_commands_idx = torch.tensor([
+                        correction_idx_map.get(int(idx), int(idx)) if idx >= 0 else commands_idx[i].item() 
+                        for i, idx in enumerate(correction_command_indices)
+                    ], device=device)
+                else:
+                    correction_indices_np = correction_command_indices.cpu().numpy() if hasattr(correction_command_indices, 'cpu') else np.array(correction_command_indices)
+                    correction_idx_map = getattr(model, 'correction_idx_map', {})
+                    correct_commands_idx = torch.tensor([
+                        correction_idx_map.get(int(idx), int(idx)) if idx >= 0 else commands_idx[i].item() 
+                        for i, idx in enumerate(correction_indices_np)
+                    ], device=device)
+            else:
+                # Fallback: use ground truth commands (for backward compatibility)
+                correct_commands_idx = commands_idx
+            
+            # Compute correction command loss
+            # logits_corr: (batch_size, num_commands) - similarity scores with all candidate command embeddings
+            # correct_commands_idx: (batch_size,) - ground truth correction command indices (when correction_flag=1)
+            # When correction_flag=1: model predicts correction command, compute loss against correct_commands_idx
+            # When correction_flag=0: mask out the loss (model still predicts, but we don't penalize it)
+            raw_corr_loss = torch.nn.CrossEntropyLoss(reduction='none')(logits_corr, correct_commands_idx)
+            mask = (true_flags > 0.5).float().squeeze()  # (batch_size,)
+            if mask.sum() > 0:
+                # Only compute loss for samples where correction_flag=1
+                loss_corr = (raw_corr_loss * mask).sum() / (mask.sum() + 1e-8)
+            else:
+                loss_corr = torch.tensor(0.0, device=device)
+            
+            loss = loss_instr + loss_flag + loss_corr
+        else:
+            # Normal mode: only compute instruction loss, ignore correction flag and correction command
+            loss = loss_instr
         # Backpropagation
         loss.backward()
         optimizer.step()
@@ -125,7 +178,7 @@ def train(model, dataloader, optimizer, scheduler, device, logger=None, log_wand
     return avg_loss
 
 
-def evaluate(model, dataloader, device, epoch: int | None = None):
+def evaluate(model, dataloader, device, epoch: int | None = None, use_dagger=False):
     model.eval()
     total_loss = 0.0
     num_batches = 0
@@ -138,10 +191,17 @@ def evaluate(model, dataloader, device, epoch: int | None = None):
             dynamic_ncols=True,
         )
         for batch in val_bar:
-            images, _, commands = batch
+            # Unpack batch: handle both old format (3 items) and new format (5 items with correction info)
+            if len(batch) == 3:
+                images, _, commands = batch
+                correction_flags = None
+                correction_command_indices = None
+            else:
+                images, _, commands, correction_flags, correction_command_indices = batch
+            
             images = images.to(device)
 
-            logits, temperature = model(images)
+            logits_instr, logits_flag, logits_corr, temperature = model(images)
 
             # Convert ground truth command strings to indices using the pre-computed dictionary
             commands_idx = [
@@ -150,8 +210,60 @@ def evaluate(model, dataloader, device, epoch: int | None = None):
             ]
             commands_idx = torch.tensor(commands_idx, device=device)
 
-            # Calculate distance-weighted loss
-            loss = calculate_hl_loss(logits, commands_idx)
+            # Calculate distance-weighted loss for instruction prediction
+            loss_instr = calculate_instruction_loss(logits_instr, commands_idx)
+            
+            if use_dagger:
+                # DAgger mode: compute correction flag and correction command losses
+                # Handle correction flags: use from batch if available, otherwise use model prediction
+                if correction_flags is not None:
+                    # Convert correction flags to tensor
+                    if isinstance(correction_flags, (list, tuple)):
+                        true_flags = torch.tensor([float(f) for f in correction_flags], device=device).unsqueeze(1)
+                    else:
+                        true_flags = correction_flags.to(device).unsqueeze(1) if len(correction_flags.shape) == 1 else correction_flags.to(device)
+                else:
+                    # Fallback: use model prediction (for backward compatibility)
+                    true_flags = torch.sigmoid(logits_flag)
+                
+                loss_flag = torch.nn.BCEWithLogitsLoss()(logits_flag, true_flags)
+                
+                # Handle correction command indices
+                # Note: correction_command_idx from dataset is 1-based (1-10), needs to be mapped to merged candidate index
+                if correction_command_indices is not None:
+                    # Convert correction command indices to tensor
+                    if isinstance(correction_command_indices, (list, tuple)):
+                        # Map original correction_command_idx (1-10) to merged candidate index
+                        correction_idx_map = getattr(model, 'correction_idx_map', {})
+                        correct_commands_idx = torch.tensor([
+                            correction_idx_map.get(int(idx), int(idx)) if idx >= 0 else commands_idx[i].item() 
+                            for i, idx in enumerate(correction_command_indices)
+                        ], device=device)
+                    else:
+                        correction_indices_np = correction_command_indices.cpu().numpy() if hasattr(correction_command_indices, 'cpu') else np.array(correction_command_indices)
+                        correction_idx_map = getattr(model, 'correction_idx_map', {})
+                        correct_commands_idx = torch.tensor([
+                            correction_idx_map.get(int(idx), int(idx)) if idx >= 0 else commands_idx[i].item() 
+                            for i, idx in enumerate(correction_indices_np)
+                        ], device=device)
+                else:
+                    # Fallback: use ground truth commands (for backward compatibility)
+                    correct_commands_idx = commands_idx
+                
+                # Compute correction command loss
+                raw_corr_loss = torch.nn.CrossEntropyLoss(reduction='none')(logits_corr, correct_commands_idx)
+                mask = (true_flags > 0.5).float().squeeze()  # (batch_size,)
+                if mask.sum() > 0:
+                    # Only compute loss for samples where correction_flag=1
+                    loss_corr = (raw_corr_loss * mask).sum() / (mask.sum() + 1e-8)
+                else:
+                    loss_corr = torch.tensor(0.0, device=device)
+                
+                # Total loss
+                loss = loss_instr + loss_flag + loss_corr
+            else:
+                # Normal mode: only compute instruction loss, ignore correction flag and correction command
+                loss = loss_instr
             
             total_loss += loss.item()
             num_batches += 1
@@ -162,7 +274,7 @@ def evaluate(model, dataloader, device, epoch: int | None = None):
     return avg_loss
 
 
-def evaluate_with_success_rate(model, dataloader, device, epoch: int | None = None):
+def evaluate_with_success_rate(model, dataloader, device, epoch: int | None = None, use_dagger=False):
     """
     Validation evaluation that returns both loss and success rate (top-1 exact match after decoding).
     Keeps `evaluate()` intact for backward compatibility.
@@ -181,25 +293,123 @@ def evaluate_with_success_rate(model, dataloader, device, epoch: int | None = No
             dynamic_ncols=True,
         )
         for batch in val_bar:
-            images, _, commands = batch
+            # Unpack batch: handle both old format (3 items) and new format (5 items with correction info)
+            if len(batch) == 3:
+                images, _, commands = batch
+                correction_flags = None
+                correction_command_indices = None
+            else:
+                images, _, commands, correction_flags, correction_command_indices = batch
+            
             images = images.to(device)
 
-            logits, temperature = model(images)
+            logits_instr, logits_flag, logits_corr, temperature = model(images)
 
             commands_idx = [
                 model.command_to_index[_normalize_command_text(cmd)] for cmd in commands
             ]
             commands_idx = torch.tensor(commands_idx, device=device)
 
-            loss = calculate_hl_loss(logits, commands_idx)
+            # Calculate distance-weighted loss for instruction prediction
+            loss_instr = calculate_instruction_loss(logits_instr, commands_idx)
+            
+            if use_dagger:
+                # DAgger mode: compute correction flag and correction command losses
+                # Handle correction flags: use from batch if available, otherwise use model prediction
+                if correction_flags is not None:
+                    # Convert correction flags to tensor
+                    if isinstance(correction_flags, (list, tuple)):
+                        true_flags = torch.tensor([float(f) for f in correction_flags], device=device).unsqueeze(1)
+                    else:
+                        true_flags = correction_flags.to(device).unsqueeze(1) if len(correction_flags.shape) == 1 else correction_flags.to(device)
+                else:
+                    # Fallback: use model prediction (for backward compatibility)
+                    true_flags = torch.sigmoid(logits_flag)
+                
+                loss_flag = torch.nn.BCEWithLogitsLoss()(logits_flag, true_flags)
+                
+                # Handle correction command indices
+                # Note: correction_command_idx from dataset is 1-based (1-10), needs to be mapped to merged candidate index
+                if correction_command_indices is not None:
+                    # Convert correction command indices to tensor
+                    if isinstance(correction_command_indices, (list, tuple)):
+                        # Map original correction_command_idx (1-10) to merged candidate index
+                        correction_idx_map = getattr(model, 'correction_idx_map', {})
+                        correct_commands_idx = torch.tensor([
+                            correction_idx_map.get(int(idx), int(idx)) if idx >= 0 else commands_idx[i].item() 
+                            for i, idx in enumerate(correction_command_indices)
+                        ], device=device)
+                    else:
+                        correction_indices_np = correction_command_indices.cpu().numpy() if hasattr(correction_command_indices, 'cpu') else np.array(correction_command_indices)
+                        correction_idx_map = getattr(model, 'correction_idx_map', {})
+                        correct_commands_idx = torch.tensor([
+                            correction_idx_map.get(int(idx), int(idx)) if idx >= 0 else commands_idx[i].item() 
+                            for i, idx in enumerate(correction_indices_np)
+                        ], device=device)
+                else:
+                    # Fallback: use ground truth commands (for backward compatibility)
+                    correct_commands_idx = commands_idx
+                
+                # Compute correction command loss
+                raw_corr_loss = torch.nn.CrossEntropyLoss(reduction='none')(logits_corr, correct_commands_idx)
+                mask = (true_flags > 0.5).float().squeeze()  # (batch_size,)
+                if mask.sum() > 0:
+                    # Only compute loss for samples where correction_flag=1
+                    loss_corr = (raw_corr_loss * mask).sum() / (mask.sum() + 1e-8)
+                else:
+                    loss_corr = torch.tensor(0.0, device=device)
+                
+                # Total loss
+                loss = loss_instr + loss_flag + loss_corr
+            else:
+                # Normal mode: only compute instruction loss, ignore correction flag and correction command
+                loss = loss_instr
+            
             total_loss += loss.item()
             num_batches += 1
 
             # Success rate via decoding (string exact match after normalization)
-            decoded_texts = model.decode_logits(logits, temperature)
-            for gt, pred in zip(commands, decoded_texts):
-                total_correct += int(_normalize_command_text(pred) == _normalize_command_text(gt))
-                total_predictions += 1
+            if use_dagger and correction_flags is not None and correction_command_indices is not None:
+                # DAgger mode: use logits_corr when correction_flag=1, logits_instr when correction_flag=0
+                # Get true_flags for success rate calculation
+                if isinstance(correction_flags, (list, tuple)):
+                    true_flags_squeezed = torch.tensor([float(f) for f in correction_flags], device=device)
+                else:
+                    true_flags_squeezed = correction_flags.to(device).squeeze() if len(correction_flags.shape) > 1 else correction_flags.to(device)
+                decoded_instr = model.decode_logits(logits_instr, temperature)
+                decoded_corr = model.decode_logits(logits_corr, temperature)
+                
+                # Get correction index mapping for success rate calculation
+                correction_idx_map = getattr(model, 'correction_idx_map', {})
+                
+                for i, (gt_cmd, pred_instr, pred_corr) in enumerate(zip(commands, decoded_instr, decoded_corr)):
+                    if true_flags_squeezed[i] > 0.5:
+                        # correction_flag=1: use correction command prediction and compare with correction command
+                        if isinstance(correction_command_indices, (list, tuple)):
+                            corr_idx_original = correction_command_indices[i]
+                        else:
+                            corr_idx_original = correction_command_indices[i].item() if hasattr(correction_command_indices, '__getitem__') else correction_command_indices[i]
+                        
+                        # Map original correction_command_idx (1-10) to merged candidate index
+                        corr_idx = correction_idx_map.get(int(corr_idx_original), int(corr_idx_original)) if corr_idx_original >= 0 else -1
+                        
+                        if corr_idx >= 0 and corr_idx < len(model.candidate_texts):
+                            gt_corr_cmd = model.candidate_texts[corr_idx]
+                            # Compare prediction from logits_corr with correction command
+                            total_correct += int(_normalize_command_text(pred_corr) == _normalize_command_text(gt_corr_cmd))
+                        else:
+                            # Fallback: compare with regular command
+                            total_correct += int(_normalize_command_text(pred_corr) == _normalize_command_text(gt_cmd))
+                    else:
+                        # correction_flag=0: use instruction prediction and compare with regular command
+                        total_correct += int(_normalize_command_text(pred_instr) == _normalize_command_text(gt_cmd))
+                    total_predictions += 1
+            else:
+                # Normal mode: use instruction logits for all samples
+                decoded_texts = model.decode_logits(logits_instr, temperature)
+                for gt, pred in zip(commands, decoded_texts):
+                    total_correct += int(_normalize_command_text(pred) == _normalize_command_text(gt))
+                    total_predictions += 1
 
             # Keep the bar lightweight
             if total_predictions > 0:
@@ -386,10 +596,17 @@ def tsne_visualize(predicted_embeddings, gt_embeddings, candidate_embeddings, ep
     # wandb removed
 
 
-def load_candidate_texts_and_embeddings(dataset_dirs, device=torch.device("cuda"), stage_embeddings_file=None, stage_texts_file=None):
+def load_candidate_texts_and_embeddings(dataset_dirs, device=torch.device("cuda"), stage_embeddings_file=None, stage_texts_file=None, dagger_embeddings_file=None):
     """
     Load candidate texts and embeddings.
     Supports both traditional format (from dataset_dirs) and splitted format (from stage_embeddings_file).
+    If dagger_embeddings_file is provided, additional correction command embeddings will be merged.
+    
+    Returns:
+        candidate_texts: List of command texts
+        candidate_embeddings: Tensor of embeddings
+        correction_idx_map: Dict mapping original correction_command_idx (1-10) to merged candidate index
+        num_stage_commands: Number of stage commands (before adding correction commands)
     """
     if stage_embeddings_file and os.path.exists(stage_embeddings_file):
         # Load from splitted format
@@ -402,27 +619,36 @@ def load_candidate_texts_and_embeddings(dataset_dirs, device=torch.device("cuda"
         
         if isinstance(entries, list):
             for e in entries:
-                if 'stage' in e and 'embedding' in e:
-                    stage_idx = int(e['stage'])
+                # Support both 'stage' (for stage embeddings) and 'correction_command_idx' (for DAgger correction embeddings)
+                has_stage = 'stage' in e and 'embedding' in e
+                has_correction = 'correction_command_idx' in e and 'embedding' in e
+                
+                if has_stage or has_correction:
+                    # Use correction_command_idx if available (for DAgger), otherwise use stage
+                    idx = int(e.get('correction_command_idx', e.get('stage')))
                     embedding = torch.tensor(e['embedding']).float().to(device).squeeze()
                     candidate_embeddings.append(embedding)
                     # Prefer text inside the same entry if available
                     if 'text' in e and isinstance(e['text'], str) and len(e['text']) > 0:
                         text = e['text']
                     else:
-                        # Fallback: read from stage_texts_file, else default
-                        if stage_texts_file and os.path.exists(stage_texts_file):
-                            with open(stage_texts_file, 'r', encoding='utf-8') as f2:
-                                texts_data = json.load(f2)
-                            # try structured 'stage_texts'; otherwise allow dict with numeric keys
-                            texts_entries = texts_data.get('stage_texts', {})
-                            if isinstance(texts_entries, dict):
-                                text = texts_entries.get(str(stage_idx), f"stage_{stage_idx}")
-                            else:
-                                # last resort default
-                                text = f"stage_{stage_idx}"
+                        # For correction commands, we should always have text, but provide fallback
+                        if has_correction:
+                            text = f"correction_command_{idx}"
                         else:
-                            text = f"stage_{stage_idx}"
+                            # Fallback: read from stage_texts_file, else default
+                            if stage_texts_file and os.path.exists(stage_texts_file):
+                                with open(stage_texts_file, 'r', encoding='utf-8') as f2:
+                                    texts_data = json.load(f2)
+                                # try structured 'stage_texts'; otherwise allow dict with numeric keys
+                                texts_entries = texts_data.get('stage_texts', {})
+                                if isinstance(texts_entries, dict):
+                                    text = texts_entries.get(str(idx), f"stage_{idx}")
+                                else:
+                                    # last resort default
+                                    text = f"stage_{idx}"
+                            else:
+                                text = f"stage_{idx}"
                     candidate_texts.append(text)
         elif isinstance(entries, dict):
             # Filter and sort entries by stage index to ensure consistent order
@@ -460,7 +686,47 @@ def load_candidate_texts_and_embeddings(dataset_dirs, device=torch.device("cuda"
         else:
             raise ValueError(f"No valid embeddings found in {stage_embeddings_file}")
         
-        return candidate_texts, candidate_embeddings
+        # Load additional correction command embeddings from dagger_embeddings_file if provided
+        correction_idx_map = {}  # Maps original correction_command_idx (1-10) to merged candidate index
+        if dagger_embeddings_file and os.path.exists(dagger_embeddings_file):
+            # Load correction command embeddings separately to maintain index mapping
+            with open(dagger_embeddings_file, 'r', encoding='utf-8') as f:
+                dagger_data = json.load(f)
+            dagger_entries = dagger_data.get('stage_embeddings', [])
+            
+            if isinstance(dagger_entries, list):
+                # Sort by correction_command_idx to ensure consistent order
+                sorted_entries = sorted(
+                    [e for e in dagger_entries if 'correction_command_idx' in e and 'embedding' in e],
+                    key=lambda x: int(x['correction_command_idx'])
+                )
+                
+                num_existing_commands = len(candidate_texts)
+                existing_texts_set = set(candidate_texts)
+                
+                for e in sorted_entries:
+                    original_idx = int(e['correction_command_idx'])
+                    embedding = torch.tensor(e['embedding']).float().to(device).squeeze()
+                    text = e.get('text', f"correction_command_{original_idx}")
+                    
+                    # Check for duplicates by text
+                    if text not in existing_texts_set:
+                        merged_idx = len(candidate_texts)
+                        correction_idx_map[original_idx] = merged_idx
+                        candidate_texts.append(text)
+                        candidate_embeddings = torch.cat([candidate_embeddings, embedding.unsqueeze(0)], dim=0)
+                        existing_texts_set.add(text)
+                    else:
+                        # If duplicate, find existing index
+                        existing_idx = candidate_texts.index(text)
+                        correction_idx_map[original_idx] = existing_idx
+                
+                print(f"Loaded {len(sorted_entries)} correction commands, added to candidate list (starting at index {num_existing_commands})")
+                if correction_idx_map:
+                    print(f"Correction command index mapping: {correction_idx_map}")
+        
+        num_stage_commands = len(candidate_texts) - len(correction_idx_map)
+        return candidate_texts, candidate_embeddings, correction_idx_map, num_stage_commands
     
     # Traditional format: load from dataset_dirs
     candidate_texts = []
@@ -498,7 +764,48 @@ def load_candidate_texts_and_embeddings(dataset_dirs, device=torch.device("cuda"
     candidate_texts, candidate_embeddings = remove_duplicates(
         candidate_texts, candidate_embeddings
     )
-    return candidate_texts, candidate_embeddings
+    
+    # Load additional correction command embeddings from dagger_embeddings_file if provided
+    correction_idx_map = {}  # Maps original correction_command_idx (1-10) to merged candidate index
+    if dagger_embeddings_file and os.path.exists(dagger_embeddings_file):
+        # Load correction command embeddings separately to maintain index mapping
+        with open(dagger_embeddings_file, 'r', encoding='utf-8') as f:
+            dagger_data = json.load(f)
+        dagger_entries = dagger_data.get('stage_embeddings', [])
+        
+        if isinstance(dagger_entries, list):
+            # Sort by correction_command_idx to ensure consistent order
+            sorted_entries = sorted(
+                [e for e in dagger_entries if 'correction_command_idx' in e and 'embedding' in e],
+                key=lambda x: int(x['correction_command_idx'])
+            )
+            
+            num_existing_commands = len(candidate_texts)
+            existing_texts_set = set(candidate_texts)
+            
+            for e in sorted_entries:
+                original_idx = int(e['correction_command_idx'])
+                embedding = torch.tensor(e['embedding']).float().to(device).squeeze()
+                text = e.get('text', f"correction_command_{original_idx}")
+                
+                # Check for duplicates by text
+                if text not in existing_texts_set:
+                    merged_idx = len(candidate_texts)
+                    correction_idx_map[original_idx] = merged_idx
+                    candidate_texts.append(text)
+                    candidate_embeddings = torch.cat([candidate_embeddings, embedding.unsqueeze(0)], dim=0)
+                    existing_texts_set.add(text)
+                else:
+                    # If duplicate, find existing index
+                    existing_idx = candidate_texts.index(text)
+                    correction_idx_map[original_idx] = existing_idx
+            
+            print(f"Loaded {len(sorted_entries)} correction commands, added to candidate list (starting at index {num_existing_commands})")
+            if correction_idx_map:
+                print(f"Correction command index mapping: {correction_idx_map}")
+    
+    num_stage_commands = len(candidate_texts) - len(correction_idx_map)
+    return candidate_texts, candidate_embeddings, correction_idx_map, num_stage_commands
 
 
 def build_HighLevelModel(
@@ -507,6 +814,7 @@ def build_HighLevelModel(
     device,
     stage_embeddings_file=None,
     stage_texts_file=None,
+    dagger_embeddings_file=None,
     train_image_encoder=False,
     num_cameras=4,
     aggregation_mode="last",
@@ -515,10 +823,14 @@ def build_HighLevelModel(
     gate_mode: str = "element-wise",
 ):
     # Load candidate texts and embeddings
-    candidate_texts, candidate_embeddings = load_candidate_texts_and_embeddings(
-        dataset_dirs, device=device, stage_embeddings_file=stage_embeddings_file, stage_texts_file=stage_texts_file
+    candidate_texts, candidate_embeddings, correction_idx_map, num_stage_commands = load_candidate_texts_and_embeddings(
+        dataset_dirs, device=device, stage_embeddings_file=stage_embeddings_file, stage_texts_file=stage_texts_file, dagger_embeddings_file=dagger_embeddings_file
     )
     command_to_index = {command: index for index, command in enumerate(candidate_texts)}
+    
+    # Store correction index mapping in model for later use
+    model_correction_idx_map = correction_idx_map if correction_idx_map else {}
+    model_num_stage_commands = num_stage_commands
 
     if use_gated_attention:
         print("---- Using Gated attention Transformer Encoder ----")
@@ -539,6 +851,11 @@ def build_HighLevelModel(
         mlp_type=mlp_type,
         gate_mode=gate_mode,
     ).to(device)
+    
+    # Store correction index mapping in model for later use in training
+    model.correction_idx_map = model_correction_idx_map
+    model.num_stage_commands = model_num_stage_commands
+    
     return model
 
 
@@ -564,14 +881,21 @@ if __name__ == "__main__":
                         help='Sync augmentation across the history frames of a sample (SequenceDataset only)')
     parser.add_argument('--image_size', action='store', type=int, help='Image size for augmentation', default=224)
     parser.add_argument('--dagger_ratio', action='store', type=float, help='dagger_ratio', default=None)
+    parser.add_argument('--dagger_mix_ratio', action='store', type=float, help='Ratio of dagger samples in mixed dataset (0.0=all normal, 1.0=all dagger, 0.5=50/50)', default=0.5)
+    parser.add_argument('--use_dagger', action='store_true', help='Enable DAgger mode: compute correction flag and correction command losses')
     parser.add_argument('--use_splitted', action='store_true', help='Use splitted dataset format (stage*/run_*)')
     parser.add_argument('--use_composite', action='store_true', help='Use composite dataset format (randomly select one run per stage and concatenate)')
-    parser.add_argument('--splitted_root', action='store', type=str, help='Root directory for splitted dataset (training data)', default=None)
+    parser.add_argument('--splitted_root', action='store', type=str, help='[Deprecated] Use --normal_root_dir instead. Root directory for splitted dataset (training data)', default=None)
     parser.add_argument('--stage_embeddings_file', action='store', type=str, help='JSON file with stage embeddings', default=None)
     parser.add_argument('--stage_texts_file', action='store', type=str, help='JSON file with stage texts', default=None)
-    parser.add_argument('--val_splitted_root', action='store', type=str, help='Root directory for validation (splitted format). If unset, will split from training data.', default=None)
+    parser.add_argument('--val_splitted_root', action='store', type=str, help='[Deprecated] Use --normal_val_root instead. Root directory for validation (splitted format). If unset, will split from training data.', default=None)
+    parser.add_argument('--normal_root_dir', action='store', type=str, help='Root directory for normal datasets (training data). In DAgger mode: expert demonstrations. In normal mode: training datasets.', default=None)
+    parser.add_argument('--dagger_root_dir', action='store', type=str, help='Root directory for dagger datasets (agent trajectories with corrections) in DAgger mode', default=None)
+    parser.add_argument('--normal_val_root', action='store', type=str, help='Root directory for normal validation datasets. In DAgger mode: expert validation. In normal mode: validation datasets.', default=None)
+    parser.add_argument('--dagger_val_root', action='store', type=str, help='Root directory for dagger validation datasets in DAgger mode', default=None)
+    parser.add_argument('--dagger_embeddings_file', action='store', type=str, help='JSON file with correction command embeddings for DAgger mode', default=None)
     parser.add_argument('--sampling_strategy', action='store', type=str, choices=['balanced', 'random', 'sequential'], default='balanced', 
-                        help='Sampling strategy for composite dataset: balanced (default, ensures equal run usage), random (fully random), sequential (for validation)')
+                        help='Sampling strategy for composite dataset: balanced (default, ensures equal run usage), random (fully random), sequential (match runs by number: run_001+run_001+...)')
     parser.add_argument('--max_combinations', action='store', type=int, default=None,
                         help='Maximum number of run combinations to generate (only for composite dataset). If not set, use --n_repeats instead.')
     parser.add_argument('--n_repeats', action='store', type=int, default=None,
@@ -679,7 +1003,20 @@ if __name__ == "__main__":
 
     elif args.use_splitted or args.use_composite:
         # Use splitted or composite dataset format
-        assert args.splitted_root is not None, "--splitted_root must be provided when --use_splitted or --use_composite is set"
+        # Unified interface: use normal_root_dir (or splitted_root as fallback for backward compatibility)
+        normal_root_dir = args.normal_root_dir or args.splitted_root
+        normal_val_root = args.normal_val_root or args.val_splitted_root
+        
+        # In DAgger mode, both normal_root_dir and dagger_root_dir are required
+        # In normal mode, only normal_root_dir is required
+        if args.dagger_root_dir:
+            # DAgger mode: both normal and dagger roots are required
+            assert normal_root_dir is not None, "--normal_root_dir (or --splitted_root) must be provided when using DAgger mode"
+            assert args.dagger_root_dir is not None, "--dagger_root_dir must be provided when using DAgger mode"
+        else:
+            # Normal mode: only normal_root_dir is required
+            assert normal_root_dir is not None, "--normal_root_dir (or --splitted_root) must be provided when --use_splitted or --use_composite is set"
+        
         assert args.stage_embeddings_file is not None, "--stage_embeddings_file must be provided when --use_splitted or --use_composite is set"
         
         # Get camera names from task config or use default
@@ -688,7 +1025,7 @@ if __name__ == "__main__":
         if args.use_composite:
             # Use composite dataset format (select one run per stage and concatenate)
             train_dataloader, val_dataloader, test_dataloader = load_composite_data(
-                root_dir=args.splitted_root,
+                root_dir=normal_root_dir,  # Use normal_root_dir (unified interface)
                 camera_names=camera_names,
                 batch_size_train=args.batch_size,
                 batch_size_val=args.batch_size,
@@ -701,7 +1038,7 @@ if __name__ == "__main__":
                 dagger_ratio=dagger_ratio,
                 train_subdir=None,  # root_dir is training directory directly
                 val_subdir=None,    # use val_root instead
-                val_root=args.val_splitted_root,  # Separate validation directory
+                val_root=normal_val_root,  # Use normal_val_root (unified interface)
                 use_augmentation=args.use_augmentation,
                 image_size=args.image_size,
                 sampling_strategy=args.sampling_strategy,
@@ -711,11 +1048,16 @@ if __name__ == "__main__":
                 use_weak_traversal=args.use_weak_traversal,
                 samples_non_cross_per_stage=args.samples_non_cross_per_stage,
                 samples_cross_per_stage=args.samples_cross_per_stage,
+                normal_root_dir=normal_root_dir,  # Normal datasets root (unified interface)
+                dagger_root_dir=args.dagger_root_dir,  # DAgger mode: dagger datasets root
+                normal_val_root=normal_val_root,  # Normal validation datasets root (unified interface)
+                dagger_val_root=args.dagger_val_root,  # DAgger mode: dagger validation datasets root
+                dagger_mix_ratio=args.dagger_mix_ratio,  # DAgger mode: mixing ratio of dagger samples
             )
         elif args.use_paired_sequences:
             # Use paired adjacent-stage sequences for training; keep validation/test as None for now
             train_dataloader = load_paired_stage_sequences(
-                root_dir=args.splitted_root,
+                root_dir=normal_root_dir,
                 camera_names=camera_names,
                 batch_size=args.batch_size,
                 history_len=args.history_len,
@@ -729,7 +1071,7 @@ if __name__ == "__main__":
                 rng_seed=args.seed,  # initial pairing
             )
             # For validation/test, use deterministic sequential concatenation per run_name
-            val_root = args.val_splitted_root or args.splitted_root
+            val_root = normal_val_root or normal_root_dir
             val_dataloader = load_sequential_stage_sequences(
                 root_dir=val_root,
                 camera_names=camera_names,
@@ -745,7 +1087,7 @@ if __name__ == "__main__":
             test_dataloader = val_dataloader
         else:
             train_dataloader, val_dataloader, test_dataloader = load_splitted_data(
-                root_dir=args.splitted_root,
+                root_dir=normal_root_dir,
                 camera_names=camera_names,
                 batch_size_train=args.batch_size,
                 batch_size_val=args.batch_size,
@@ -767,6 +1109,7 @@ if __name__ == "__main__":
             device=device,
             stage_embeddings_file=args.stage_embeddings_file,
             stage_texts_file=args.stage_texts_file,
+            dagger_embeddings_file=args.dagger_embeddings_file if args.use_dagger else None,
             train_image_encoder=args.train_image_encoder,
             num_cameras=len(camera_names),
             aggregation_mode=args.aggregation_mode,
@@ -876,6 +1219,7 @@ if __name__ == "__main__":
     logger.info(f"  Train Image Encoder: {args.train_image_encoder}")
     logger.info(f"  Use Splitted Dataset: {args.use_splitted}")
     logger.info(f"  Use Composite Dataset: {args.use_composite}")
+    logger.info(f"  Use DAgger Mode: {args.use_dagger}")
     if args.use_composite:
         logger.info(f"  Sampling Strategy: {args.sampling_strategy}")
         if args.max_combinations is not None:
@@ -892,9 +1236,11 @@ if __name__ == "__main__":
     if args.use_augmentation:
         logger.info(f"  Image Size: {args.image_size}")
     if args.use_splitted or args.use_composite:
-        logger.info(f"  Training Root: {args.splitted_root}")
-        if args.val_splitted_root:
-            logger.info(f"  Validation Root: {args.val_splitted_root}")
+        normal_root_dir = args.normal_root_dir or args.splitted_root
+        normal_val_root = args.normal_val_root or args.val_splitted_root
+        logger.info(f"  Training Root: {normal_root_dir}")
+        if normal_val_root:
+            logger.info(f"  Validation Root: {normal_val_root}")
         logger.info(f"  Stage Embeddings File: {args.stage_embeddings_file}")
     logger.info("=" * 80)
     # Also report dataset sizes
@@ -972,8 +1318,9 @@ if __name__ == "__main__":
     for epoch in pbar_epochs:
         # Rebuild train dataloader each epoch to randomize pairings (if enabled)
         if args.use_splitted and args.use_paired_sequences:
+            normal_root_dir = args.normal_root_dir or args.splitted_root
             train_dataloader = load_paired_stage_sequences(
-                root_dir=args.splitted_root,
+                root_dir=normal_root_dir,
                 camera_names=camera_names,
                 batch_size=args.batch_size,
                 history_len=args.history_len,
@@ -999,7 +1346,7 @@ if __name__ == "__main__":
                 logger.info(f"Epoch {epoch}: Test Success Rate = {test_success_rate * 100:.2f}%")
 
         # Training
-        train_loss = train(model, train_dataloader, optimizer, scheduler, device, logger=logger, log_wandb=False, epoch=epoch)
+        train_loss = train(model, train_dataloader, optimizer, scheduler, device, logger=logger, log_wandb=False, epoch=epoch, use_dagger=args.use_dagger)
         
         # Step scheduler after training
         scheduler.step()
@@ -1009,7 +1356,7 @@ if __name__ == "__main__":
         val_success_rate = None
         if val_dataloader is not None and dagger_ratio is None:
             val_loss, val_success_rate = evaluate_with_success_rate(
-                model, val_dataloader, device, epoch=epoch
+                model, val_dataloader, device, epoch=epoch, use_dagger=args.use_dagger
             )
         
         # Get current learning rate

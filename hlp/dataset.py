@@ -1116,6 +1116,8 @@ class CompositeSequenceDataset(torch.utils.data.Dataset):
         use_weak_traversal: bool = False,  # Use weak traversal sampling strategy
         samples_non_cross_per_stage: int = 1,  # Number of non-cross-stage samples per stage (target_ts in current stage)
         samples_cross_per_stage: int = 1,  # Number of cross-stage samples per stage (target_ts in next stage)
+        normal_root_dir: str | None = None,  # Optional: additional root for normal data (for DAgger mixing)
+        dagger_root_dir: str | None = None,  # Optional: additional root for dagger data (for DAgger mixing)
     ):
         super().__init__()
         self.root_dir = root_dir
@@ -1143,24 +1145,38 @@ class CompositeSequenceDataset(torch.utils.data.Dataset):
             )
         
         # Organize runs by stage: {stage_idx: [list of run_paths]}
+        # Support mixing runs from multiple root directories (for DAgger)
         self.runs_by_stage = {}
-        for stage_dir in sorted(os.listdir(root_dir)):
-            stage_path = os.path.join(root_dir, stage_dir)
-            if not (stage_dir.startswith("stage") and os.path.isdir(stage_path)):
-                continue
-            try:
-                stage_idx = int(stage_dir[5:]) - 1  # stage1 -> 0, stage2 -> 1, etc.
-            except Exception:
-                continue
-            
-            runs = []
-            for run_dir in sorted(os.listdir(stage_path)):
-                run_path = os.path.join(stage_path, run_dir)
-                if run_dir.startswith("run") and os.path.isdir(run_path):
-                    runs.append(run_path)
-            
-            if len(runs) > 0:
-                self.runs_by_stage[stage_idx] = runs
+        
+        # Collect runs from all root directories
+        root_dirs = []
+        # Add primary root_dir if it exists
+        if root_dir and os.path.exists(root_dir):
+            root_dirs.append(root_dir)
+        # Add normal_root_dir if provided and different from root_dir
+        if normal_root_dir and os.path.exists(normal_root_dir) and normal_root_dir != root_dir:
+            root_dirs.append(normal_root_dir)
+        # Add dagger_root_dir if provided and different from root_dir
+        if dagger_root_dir and os.path.exists(dagger_root_dir) and dagger_root_dir != root_dir:
+            root_dirs.append(dagger_root_dir)
+        
+        for root in root_dirs:
+            for stage_dir in sorted(os.listdir(root)):
+                stage_path = os.path.join(root, stage_dir)
+                if not (stage_dir.startswith("stage") and os.path.isdir(stage_path)):
+                    continue
+                try:
+                    stage_idx = int(stage_dir[5:]) - 1  # stage1 -> 0, stage2 -> 1, etc.
+                except Exception:
+                    continue
+                
+                if stage_idx not in self.runs_by_stage:
+                    self.runs_by_stage[stage_idx] = []
+                
+                for run_dir in sorted(os.listdir(stage_path)):
+                    run_path = os.path.join(stage_path, run_dir)
+                    if run_dir.startswith("run") and os.path.isdir(run_path):
+                        self.runs_by_stage[stage_idx].append(run_path)
         
         # Get sorted stage indices
         self.stage_indices = sorted(self.runs_by_stage.keys())
@@ -1448,10 +1464,13 @@ class CompositeSequenceDataset(torch.utils.data.Dataset):
             cumulative_length = 0
             
             for stage_idx, selected_run in selected_runs:
-                labels, actions_np, qpos_np = self._parse_run(selected_run)
-                if actions_np is None or len(actions_np) < 1:
+                parse_result = self._parse_run(selected_run)
+                if parse_result is None or parse_result[1] is None or len(parse_result[1]) < 1:
                     # Skip this combination if we can't parse it
                     break
+                # _parse_run returns (labels, actions, qpos, correction_flags, correction_command_indices)
+                # For weak traversal precomputation, we only need actions to get run length
+                labels, actions_np, qpos_np = parse_result[0], parse_result[1], parse_result[2]
                 
                 run_length = len(actions_np)
                 run_lengths.append(run_length)
@@ -1490,8 +1509,10 @@ class CompositeSequenceDataset(torch.utils.data.Dataset):
                 stage_boundaries_info = (stage_start, stage_end, next_stage_start, next_stage_end, total_timesteps)
                 
                 # Sample non-cross-stage: target_ts should be in current stage
+                # target_ts = curr_ts + prediction_offset should be in [stage_start, stage_end)
+                # So curr_ts should be in [stage_start - prediction_offset, stage_end - prediction_offset)
+                non_cross_min_curr = max(min_start, stage_start - self.prediction_offset)
                 non_cross_max_curr = min(stage_end - self.prediction_offset - 1, max_start)
-                non_cross_min_curr = max(min_start, stage_start)
                 
                 if non_cross_max_curr >= non_cross_min_curr:
                     # Generate num_non_cross non-cross-stage samples
@@ -1510,39 +1531,79 @@ class CompositeSequenceDataset(torch.utils.data.Dataset):
                         for _ in range(num_cross):
                             sampling_positions.append((combo_idx, stage_idx_in_combo, True, stage_boundaries_info))
         
+        
         return sampling_positions
     
     def __len__(self):
         return self.dataset_size
     
     def _parse_run(self, run_path: str):
-        """Parse data.txt to extract labels (stages), actions, and qpos."""
+        """Parse data.txt to extract labels (stages), actions, qpos, and correction info."""
         data_file = os.path.join(run_path, 'data.txt')
         if not os.path.exists(data_file):
-            return None, None, None
+            return None, None, None, None, None
         
         with open(data_file, 'r', encoding='utf-8') as f:
             content = f.read()
         
+        # Parse Correction Info if present (for DAgger datasets)
+        correction_segments = []
+        correction_info_match = re.search(r'Correction Info:\s*\n(\[.*?\])', content, re.DOTALL)
+        if correction_info_match:
+            try:
+                import json
+                correction_json = correction_info_match.group(1)
+                correction_segments = json.loads(correction_json)
+            except Exception as e:
+                print(f"Warning: Failed to parse Correction Info in {data_file}: {e}")
+        
+        # Extract stage from file header (preprocessed format has stage info at the top)
+        stage_match = re.search(r'stage\s*:\s*(\d+)', content)
+        if stage_match:
+            stage_num = int(stage_match.group(1)) - 1  # stage1 -> 0
+        else:
+            # Fallback: try to extract from "Stage: X" line
+            stage_match = re.search(r'^Stage:\s*(\d+)', content, re.MULTILINE)
+            if stage_match:
+                stage_num = int(stage_match.group(1)) - 1
+            else:
+                stage_num = 0  # Default to stage 0 if not found
+        
         labels, actions, qpos = [], [], []
         frame_blocks = re.split(r'Frame_\d+:', content)[1:]
         
-        for b in frame_blocks:
-            m_stage = re.search(r'stage\s*:\s*(\d+)', b)
+        for frame_idx, b in enumerate(frame_blocks):
+            # Stage info is in file header, not in each frame block (preprocessed format)
             m_act = re.search(r'action:\s*\[([^\]]+)\]', b)
             m_lr = re.search(r'lrstate\s*:\s*\[([^\]]+)\]', b)
-            if m_stage and m_act and m_lr:
+            if m_act and m_lr:
                 try:
-                    labels.append(int(m_stage.group(1)) - 1)  # stage1 -> 0
+                    labels.append(stage_num)  # Use stage from file header
                     actions.append(np.array([float(x.strip()) for x in m_act.group(1).split(',')], dtype=np.float32))
                     qpos.append(np.array([float(x.strip()) for x in m_lr.group(1).split(',')], dtype=np.float32))
                 except Exception:
                     continue
         
         if not actions:
-            return None, None, None
+            return None, None, None, None, None
         
-        return labels, np.stack(actions), np.stack(qpos)
+        # Build correction_flags and correction_command_indices arrays
+        num_frames = len(actions)
+        correction_flags = np.zeros(num_frames, dtype=np.float32)
+        correction_command_indices = np.zeros(num_frames, dtype=np.int64) - 1  # -1 means no correction
+        
+        for segment in correction_segments:
+            start = segment.get('correction_flag_start', 1) - 1  # Convert to 0-indexed
+            end = segment.get('correction_flag_end', 1) - 1  # Convert to 0-indexed
+            command_idx = segment.get('correction_command_idx', -1)
+            
+            # Set correction flags for the segment range (inclusive)
+            for i in range(max(0, start), min(num_frames, end + 1)):
+                correction_flags[i] = 1.0
+                if command_idx >= 0:
+                    correction_command_indices[i] = command_idx
+        
+        return labels, np.stack(actions), np.stack(qpos), correction_flags, correction_command_indices
     
     def __getitem__(self, index):
         # Use weak traversal if enabled
@@ -1596,21 +1657,34 @@ class CompositeSequenceDataset(torch.utils.data.Dataset):
         stage_boundaries = []  # Track where each stage starts in the concatenated sequence
         run_lengths = []  # Store length of each selected run
         cumulative_length = 0
+        all_correction_flags = []  # Store correction flags for all runs
+        all_correction_command_indices = []  # Store correction command indices for all runs
         
         for stage_idx, selected_run in selected_runs:
             if selected_run is None:
                 # Fallback for any issues
                 return self.__getitem__((index + 1) % len(self))
             
-            # Parse run to get its length
-            labels, actions_np, qpos_np = self._parse_run(selected_run)
-            if actions_np is None or len(actions_np) < 1:
+            # Parse run to get its length and correction info
+            parse_result = self._parse_run(selected_run)
+            if parse_result[1] is None or len(parse_result[1]) < 1:
                 # Fallback: try another sample
                 return self.__getitem__((index + 1) % len(self))
+            
+            labels, actions_np, qpos_np, correction_flags, correction_command_indices = parse_result
             
             run_length = len(actions_np)
             run_lengths.append(run_length)
             stage_boundaries.append((cumulative_length, cumulative_length + run_length))
+            
+            # Store correction info (pad with zeros if None for normal datasets)
+            if correction_flags is None:
+                correction_flags = np.zeros(run_length, dtype=np.float32)
+            if correction_command_indices is None:
+                correction_command_indices = np.zeros(run_length, dtype=np.int64) - 1
+            
+            all_correction_flags.append(correction_flags)
+            all_correction_command_indices.append(correction_command_indices)
             cumulative_length += run_length
         
         total_timesteps = cumulative_length
@@ -1642,9 +1716,10 @@ class CompositeSequenceDataset(torch.utils.data.Dataset):
                     return self.__getitem__((index + 1) % len(self))
             else:
                 # Non-cross-stage: target_ts should be in current stage
-                # curr_ts should be such that: curr_ts + offset < stage_end
+                # target_ts = curr_ts + prediction_offset should be in [stage_start, stage_end)
+                # So curr_ts should be in [stage_start - prediction_offset, stage_end - prediction_offset)
+                non_cross_min_curr = max(min_start, stage_start - self.prediction_offset)
                 non_cross_max_curr = min(stage_end - self.prediction_offset - 1, max_start)
-                non_cross_min_curr = max(min_start, stage_start)
                 
                 if non_cross_max_curr >= non_cross_min_curr:
                     # Randomly sample curr_ts within valid range
@@ -1768,7 +1843,26 @@ class CompositeSequenceDataset(torch.utils.data.Dataset):
         # Stack sequence: (timesteps, num_cameras, C, H, W)
         image_sequence = torch.stack(image_sequence, dim=0)
         
-        return image_sequence, command_embedding, command_gt
+        # Get correction flag and command index for curr_ts (current frame, not target_ts)
+        # Correction is an immediate feedback based on current state, not a future prediction
+        # Find which run the curr_ts belongs to
+        curr_run_idx = len(selected_runs) - 1  # Default to last run
+        curr_local_ts = curr_ts
+        for i, (start_bound, end_bound) in enumerate(stage_boundaries):
+            if start_bound <= curr_ts < end_bound:
+                curr_run_idx = i
+                curr_local_ts = curr_ts - start_bound
+                break
+        
+        # Get correction flag and command index for current frame
+        if curr_run_idx < len(all_correction_flags) and curr_local_ts < len(all_correction_flags[curr_run_idx]):
+            correction_flag = all_correction_flags[curr_run_idx][curr_local_ts]
+            correction_command_idx = all_correction_command_indices[curr_run_idx][curr_local_ts]
+        else:
+            correction_flag = 0.0
+            correction_command_idx = -1
+        
+        return image_sequence, command_embedding, command_gt, correction_flag, correction_command_idx
 
 
 def load_splitted_data(
@@ -2004,6 +2098,11 @@ def load_composite_data(
     use_weak_traversal: bool = False,  # Use weak traversal sampling strategy
     samples_non_cross_per_stage: int = 1,  # Number of non-cross-stage samples per stage (target_ts in current stage)
     samples_cross_per_stage: int = 1,  # Number of cross-stage samples per stage (target_ts in next stage)
+    normal_root_dir: str | None = None,  # Root directory for normal datasets (expert demonstrations)
+    dagger_root_dir: str | None = None,  # Root directory for dagger datasets (agent trajectories with corrections)
+    normal_val_root: str | None = None,  # Root directory for normal validation datasets
+    dagger_val_root: str | None = None,  # Root directory for dagger validation datasets
+    dagger_mix_ratio: float = 0.5,  # Ratio of dagger samples in the mixed dataset (0.0 = all normal, 1.0 = all dagger)
 ):
     """
     Load composite dataset for HighLevelModel training.
@@ -2083,55 +2182,210 @@ def load_composite_data(
                     continue
     
     # Determine train and validation root directories
-    train_root_dir = os.path.join(root_dir, train_subdir) if train_subdir else root_dir
-    
-    # Handle validation directory (support separate val_root parameter)
-    if val_root:
-        val_root_dir = val_root
-    elif val_subdir:
-        val_root_dir = os.path.join(root_dir, val_subdir)
-    else:
-        val_root_dir = None
-    
-    # Check if training directory exists
-    if not os.path.exists(train_root_dir):
-        # Fallback: try root_dir directly
-        if os.path.exists(root_dir) and any(d.startswith("stage") for d in os.listdir(root_dir)):
-            train_root_dir = root_dir
-            val_root_dir = None
+    # Support DAgger mode: if normal_root_dir and dagger_root_dir are provided, use them
+    if normal_root_dir and dagger_root_dir:
+        # DAgger mode: combine normal (expert) and dagger (agent with corrections) datasets
+        normal_train_root = os.path.join(normal_root_dir, train_subdir) if train_subdir else normal_root_dir
+        dagger_train_root = os.path.join(dagger_root_dir, train_subdir) if train_subdir else dagger_root_dir
+        
+        if not os.path.exists(normal_train_root):
+            raise ValueError(f"Normal training directory not found: {normal_train_root}")
+        if not os.path.exists(dagger_train_root):
+            raise ValueError(f"Dagger training directory not found: {dagger_train_root}")
+        
+        print(f"DAgger mode: Separating expert and agent sequences, mixing at batch level")
+        print(f"  Normal dataset: {normal_train_root}")
+        print(f"  Dagger dataset: {dagger_train_root}")
+        print(f"  Dagger mix ratio: {dagger_mix_ratio:.2f} (ratio of dagger samples in each batch)")
+        
+        # Create separate datasets for expert and agent sequences
+        # This maintains sequence integrity: expert sequences show complete correct execution,
+        # agent sequences show execution with corrections
+        normal_dataset = CompositeSequenceDataset(
+            normal_train_root,
+            camera_names,
+            history_len=history_len,
+            prediction_offset=prediction_offset,
+            history_skip_frame=history_skip_frame,
+            random_crop=random_crop,
+            stage_embeddings=stage_embeddings,
+            stage_texts=stage_texts,
+            use_augmentation=use_augmentation,
+            training=True,
+            image_size=image_size,
+            sampling_strategy=sampling_strategy,
+            max_combinations=max_combinations,
+            n_repeats=n_repeats,
+            sync_sequence_augmentation=sync_sequence_augmentation,
+            use_weak_traversal=use_weak_traversal,
+            samples_non_cross_per_stage=samples_non_cross_per_stage,
+            samples_cross_per_stage=samples_cross_per_stage,
+        )
+        
+        dagger_dataset = CompositeSequenceDataset(
+            dagger_train_root,
+            camera_names,
+            history_len=history_len,
+            prediction_offset=prediction_offset,
+            history_skip_frame=history_skip_frame,
+            random_crop=random_crop,
+            stage_embeddings=stage_embeddings,
+            stage_texts=stage_texts,
+            use_augmentation=use_augmentation,
+            training=True,
+            image_size=image_size,
+            sampling_strategy=sampling_strategy,
+            max_combinations=max_combinations,
+            n_repeats=n_repeats,
+            sync_sequence_augmentation=sync_sequence_augmentation,
+            use_weak_traversal=use_weak_traversal,
+            samples_non_cross_per_stage=samples_non_cross_per_stage,
+            samples_cross_per_stage=samples_cross_per_stage,
+        )
+        
+        # Combine datasets for batch-level mixing
+        train_dataset = ConcatDataset([normal_dataset, dagger_dataset])
+        
+        normal_size = len(normal_dataset)
+        dagger_size = len(dagger_dataset)
+        total_size = len(train_dataset)
+        
+        print(f"Training dataset: {normal_size} expert + {dagger_size} agent = {total_size} total samples")
+        print(f"  Batch-level mixing: {dagger_mix_ratio:.2f} ratio of agent samples per batch")
+        
+        # Store sizes for later use in creating WeightedRandomSampler
+        train_dataset.normal_size = normal_size
+        train_dataset.dagger_size = dagger_size
+        train_dataset.dagger_mix_ratio = dagger_mix_ratio
+        
+        # Handle validation directories for DAgger mode
+        if val_root:
+            val_root_dir = val_root
         else:
-            raise ValueError(f"Training directory not found: {train_root_dir}")
-    
-    if use_augmentation:
-        print(f"Data augmentation enabled")
-    
-    # Create training dataset
-    train_dataset = CompositeSequenceDataset(
-        train_root_dir,
-        camera_names,
-        history_len=history_len,
-        prediction_offset=prediction_offset,
-        history_skip_frame=history_skip_frame,
-        random_crop=random_crop,
-        stage_embeddings=stage_embeddings,
-        stage_texts=stage_texts,
-        use_augmentation=use_augmentation,
-        training=True,
-        image_size=image_size,
-        sampling_strategy=sampling_strategy,
-        max_combinations=max_combinations,
-        n_repeats=n_repeats,
-        sync_sequence_augmentation=sync_sequence_augmentation,
-        use_weak_traversal=use_weak_traversal,
-        samples_non_cross_per_stage=samples_non_cross_per_stage,
-        samples_cross_per_stage=samples_cross_per_stage,
-    )
-    
-    print(f"Training dataset: {len(train_dataset)} samples from {train_root_dir}")
+            # Use provided normal_val_root and dagger_val_root if available, otherwise try to find from subdirs
+            if normal_val_root is None:
+                normal_val_root = os.path.join(normal_root_dir, val_subdir) if val_subdir else None
+            if dagger_val_root is None:
+                dagger_val_root = os.path.join(dagger_root_dir, val_subdir) if val_subdir else None
+            val_root_dir = None  # Will be handled separately
+    else:
+        # Original mode: use single root_dir
+        train_root_dir = os.path.join(root_dir, train_subdir) if train_subdir else root_dir
+        
+        # Handle validation directory (support separate val_root parameter)
+        if val_root:
+            val_root_dir = val_root
+        elif val_subdir:
+            val_root_dir = os.path.join(root_dir, val_subdir)
+        else:
+            val_root_dir = None
+        
+        # Check if training directory exists
+        if not os.path.exists(train_root_dir):
+            # Fallback: try root_dir directly
+            if os.path.exists(root_dir) and any(d.startswith("stage") for d in os.listdir(root_dir)):
+                train_root_dir = root_dir
+                val_root_dir = None
+            else:
+                raise ValueError(f"Training directory not found: {train_root_dir}")
+        
+        if use_augmentation:
+            print(f"Data augmentation enabled")
+        
+        # Create training dataset
+        train_dataset = CompositeSequenceDataset(
+            train_root_dir,
+            camera_names,
+            history_len=history_len,
+            prediction_offset=prediction_offset,
+            history_skip_frame=history_skip_frame,
+            random_crop=random_crop,
+            stage_embeddings=stage_embeddings,
+            stage_texts=stage_texts,
+            use_augmentation=use_augmentation,
+            training=True,
+            image_size=image_size,
+            sampling_strategy=sampling_strategy,
+            max_combinations=max_combinations,
+            n_repeats=n_repeats,
+            sync_sequence_augmentation=sync_sequence_augmentation,
+            use_weak_traversal=use_weak_traversal,
+            samples_non_cross_per_stage=samples_non_cross_per_stage,
+            samples_cross_per_stage=samples_cross_per_stage,
+        )
+        
+        print(f"Training dataset: {len(train_dataset)} samples from {train_root_dir}")
     
     # Create validation dataset if validation directory exists
     val_dataset = None
-    if val_root_dir and os.path.exists(val_root_dir):
+    if normal_root_dir and dagger_root_dir:
+        # DAgger mode: combine normal and dagger validation datasets
+        # Use provided normal_val_root and dagger_val_root if available, otherwise try to find from subdirs
+        if normal_val_root is None:
+            normal_val_root = os.path.join(normal_root_dir, val_subdir) if val_subdir else None
+        if dagger_val_root is None:
+            dagger_val_root = os.path.join(dagger_root_dir, val_subdir) if val_subdir else None
+        
+        val_datasets = []
+        if val_root:
+            # Use provided validation root (should contain both normal and dagger)
+            if os.path.exists(val_root):
+                val_dataset = CompositeSequenceDataset(
+                    val_root,  # Primary root
+                    camera_names,
+                    history_len=history_len,
+                    prediction_offset=prediction_offset,
+                    history_skip_frame=history_skip_frame,
+                    random_crop=random_crop,
+                    stage_embeddings=stage_embeddings,
+                    stage_texts=stage_texts,
+                    use_augmentation=False,
+                    training=False,
+                    image_size=image_size,
+                    sampling_strategy='sequential',
+                    max_combinations=None,
+                    n_repeats=None,
+                    sync_sequence_augmentation=False,
+                    use_weak_traversal=use_weak_traversal,
+                    samples_non_cross_per_stage=samples_non_cross_per_stage,
+                    samples_cross_per_stage=samples_cross_per_stage,
+                    normal_root_dir=normal_val_root,  # Optional: additional normal validation data
+                    dagger_root_dir=dagger_val_root,   # Optional: additional dagger validation data
+                )
+                print(f"Validation dataset: {len(val_dataset)} samples from {val_root}")
+        else:
+            # Create a single validation dataset that mixes runs from both normal and dagger validation roots
+            # Use normal_val_root as primary, dagger_val_root as additional source
+            if normal_val_root and os.path.exists(normal_val_root):
+                val_dataset = CompositeSequenceDataset(
+                    normal_val_root,  # Primary root
+                    camera_names,
+                    history_len=history_len,
+                    prediction_offset=prediction_offset,
+                    history_skip_frame=history_skip_frame,
+                    random_crop=random_crop,
+                    stage_embeddings=stage_embeddings,
+                    stage_texts=stage_texts,
+                    use_augmentation=False,
+                    training=False,
+                    image_size=image_size,
+                    sampling_strategy='sequential',  # Sequential for deterministic validation
+                    max_combinations=None,
+                    n_repeats=None,
+                    sync_sequence_augmentation=False,
+                    use_weak_traversal=use_weak_traversal,
+                    samples_non_cross_per_stage=samples_non_cross_per_stage,
+                    samples_cross_per_stage=samples_cross_per_stage,
+                    normal_root_dir=normal_val_root,  # Normal validation data source
+                    dagger_root_dir=dagger_val_root,   # Dagger validation data source (will be mixed in)
+                )
+                print(f"Validation dataset: {len(val_dataset)} samples (mixed from normal and dagger validation roots)")
+                if normal_val_root:
+                    print(f"  Normal validation root: {normal_val_root}")
+                if dagger_val_root:
+                    print(f"  Dagger validation root: {dagger_val_root}")
+    elif val_root_dir and os.path.exists(val_root_dir):
+        # Original mode: single validation directory
         # Validation uses sequential strategy for deterministic evaluation
         val_dataset = CompositeSequenceDataset(
             val_root_dir,
@@ -2151,7 +2405,7 @@ def load_composite_data(
             sync_sequence_augmentation=False,
             use_weak_traversal=use_weak_traversal,  # Use same value for validation
             samples_non_cross_per_stage=samples_non_cross_per_stage,
-        samples_cross_per_stage=samples_cross_per_stage,  # Use same value for validation
+            samples_cross_per_stage=samples_cross_per_stage,  # Use same value for validation
         )
         print(f"Validation dataset: {len(val_dataset)} samples from {val_root_dir}")
     else:
@@ -2182,7 +2436,66 @@ def load_composite_data(
         test_dataset = train_dataset
     
     # Create dataloaders
-    if dagger_ratio is not None:
+    if normal_root_dir and dagger_root_dir:
+        # DAgger mode: use WeightedRandomSampler to control batch-level mixing ratio
+        normal_size = getattr(train_dataset, 'normal_size', 0)
+        dagger_size = getattr(train_dataset, 'dagger_size', 0)
+        dagger_mix_ratio = getattr(train_dataset, 'dagger_mix_ratio', 0.5)
+        
+        if normal_size > 0 and dagger_size > 0:
+            # Calculate weights for WeightedRandomSampler
+            # We want dagger_mix_ratio of samples to be from dagger dataset
+            # So: dagger_weight / (normal_weight + dagger_weight) = dagger_mix_ratio
+            # Let normal_weight = 1.0 - dagger_mix_ratio, dagger_weight = dagger_mix_ratio
+            # This ensures: dagger_weight / (normal_weight + dagger_weight) = dagger_mix_ratio / 1.0 = dagger_mix_ratio
+            normal_weight = 1.0 - dagger_mix_ratio
+            dagger_weight = dagger_mix_ratio
+            
+            # Create weights: first normal_size samples get normal_weight, next dagger_size samples get dagger_weight
+            weights = [normal_weight] * normal_size + [dagger_weight] * dagger_size
+            sampler = torch.utils.data.WeightedRandomSampler(
+                weights=weights,
+                num_samples=len(weights),  # Sample with replacement to maintain ratio
+                replacement=True
+            )
+            
+            train_dataloader = DataLoader(
+                train_dataset,
+                batch_size=batch_size_train,
+                sampler=sampler,  # Use WeightedRandomSampler instead of shuffle
+                pin_memory=True,
+                num_workers=8,
+                prefetch_factor=8,
+                persistent_workers=True,
+            )
+            print(f"  Using WeightedRandomSampler: normal_weight={normal_weight:.3f}, dagger_weight={dagger_weight:.3f}")
+            print(f"  Expected ratio: {dagger_mix_ratio:.2f} dagger samples per batch")
+        else:
+            # Fallback: simple shuffle if sizes are invalid
+            train_dataloader = DataLoader(
+                train_dataset,
+                batch_size=batch_size_train,
+                shuffle=True,
+                pin_memory=True,
+                num_workers=8,
+                prefetch_factor=8,
+                persistent_workers=True,
+            )
+        
+        # Create validation dataloader if available
+        if val_dataset is not None:
+            val_dataloader = DataLoader(
+                val_dataset,
+                batch_size=batch_size_val,
+                shuffle=False,  # No shuffle for validation
+                pin_memory=True,
+                num_workers=8,
+                prefetch_factor=16,
+                persistent_workers=True,
+            )
+        else:
+            val_dataloader = None
+    elif dagger_ratio is not None:
         # For DAgger, use all training data
         train_dataloader = DataLoader(
             train_dataset,

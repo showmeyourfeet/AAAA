@@ -50,6 +50,7 @@ class HighLevelModel(nn.Module):
         self.num_queries = num_queries
         self.candidate_embeddings = candidate_embeddings
         self.candidate_texts = candidate_texts
+        self.command_to_index = command_to_index
         self.use_gated_attention = use_gated_attention
 
         # Load the pretrained Swin-Tiny image encoder (timm)
