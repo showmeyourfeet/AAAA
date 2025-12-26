@@ -19,6 +19,8 @@ This project implements a hierarchical control system for robotic surgery/manipu
 │   └── ...               # Backbone implementations (EfficientNet, ResNet)
 ├── additional_modules/   # Custom Neural Network Modules
 │   └── gated_attention_SDPA.py # Gated Multi-Head Attention implementation
+|   └── DETRTransformer.py # DETR-style Transformer block implementation
+|   └── ...
 └── ...
 ```
 
@@ -36,10 +38,11 @@ To train the HLP, use `hlp/train.py`. The following command (based on `train_hl.
 
 ```bash
 python hlp/train.py \
-  --splitted_root splitted_datasets/training_datasets  \
-  --val_splitted_root splitted_datasets/validation_dataset \
+  --normal_root_dir datasets/normal_training_datasets \
+  --normal_val_root datasets/normal_validation_datasets \
   --stage_embeddings_file utils/stage_embeddings_file.json \
   --stage_texts_file utils/stage_embeddings_file.json \
+  --dagger_embeddings_file utils/dagger_embeddings_file.json \
   --ckpt_dir ckpts/hl_test \
   --batch_size 4 \
   --num_epochs 1000 \
@@ -47,15 +50,24 @@ python hlp/train.py \
   --train_image_encoder \
   --lr 1e-5 \
   --seed 42 \
-  --gpu 0  \
+  --gpu 0 \
   --history_len 4 \
-  --history_skip_frame 12  \
+  --history_skip_frame 12 \
   --prediction_offset 15 \
   --use_composite \
-  --n_repeats 1 \
   --use_augmentation \
-  --aggregation_mode cls \
-  --use_gated_attention
+  --sampling_strategy sequential \
+  --n_repeats 1 \
+  --use_weak_traversal \
+  --samples_non_cross_per_stage 2 \
+  --samples_cross_per_stage 2 \
+  --use_dagger \
+  --dagger_root_dir datasets/dagger_training_datasets \
+  --dagger_val_root datasets/dagger_validation_datasets \
+  --dagger_mix_ratio 0.5 \
+  --use_gated_attention \
+  --mlp_type swiglu \
+  --gate_mode element-wise
 ```
 
 **Key Arguments:**
