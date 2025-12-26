@@ -410,6 +410,11 @@ def build_encoder(args) -> TransformerEncoder:
     GatedDETRDecoderLayer when use_gated_attention is enabled.
     Both encoder and decoder support mlp_type and gate_mode configuration.
     """
+    # Get CVAE encoder layers (backward compatible: use enc_layers if cvae_enc_layers not provided)
+    cvae_enc_layers = getattr(args, "cvae_enc_layers", None)
+    if cvae_enc_layers is None:
+        cvae_enc_layers = getattr(args, "enc_layers", 4)
+    
     if getattr(args, "use_gated_attention", False):
         mlp_type = getattr(args, "mlp_type", "swiglu")
         gate_mode = getattr(args, "gate_mode", "element-wise")
@@ -435,7 +440,7 @@ def build_encoder(args) -> TransformerEncoder:
             mlp_type=mlp_type,
         )
     encoder_norm = nn.LayerNorm(args.hidden_dim) if args.pre_norm else None
-    encoder = TransformerEncoder(encoder_layer, args.enc_layers, encoder_norm)
+    encoder = TransformerEncoder(encoder_layer, cvae_enc_layers, encoder_norm)
     return encoder
 
 
@@ -460,16 +465,19 @@ def build_act_model(args) -> DETRVAE:
     # Build transformer (decoder supports GatedDETRDecoderLayer when use_gated_attention is enabled)
     transformer = build_transformer(args)
 
-    # Decoder-only architecture: --no_encoder + enc_layers=0
+    # Decoder-only architecture: --no_encoder + transformer_enc_layers=0
     # This creates a simpler architecture without CVAE encoder and Transformer encoder
     # Pros: Fewer parameters, faster inference, simpler training (no KL divergence)
     # Cons: Less expressive, no uncertainty modeling, may need stronger decoder
-    is_decoder_only = args.no_encoder and getattr(args, "enc_layers", 4) == 0
+    transformer_enc_layers = getattr(args, "transformer_enc_layers", None)
+    if transformer_enc_layers is None:
+        transformer_enc_layers = getattr(args, "enc_layers", 4)
+    is_decoder_only = args.no_encoder and transformer_enc_layers == 0
     if is_decoder_only:
         print("=" * 60)
         print("Using Decoder-Only Architecture:")
         print("  - CVAE encoder: DISABLED (--no_encoder)")
-        print("  - Transformer encoder: DISABLED (enc_layers=0)")
+        print("  - Transformer encoder: DISABLED (transformer_enc_layers=0)")
         print("  - Only Transformer decoder is active")
         print("  - Latent input will be zero vector")
         print("=" * 60)
@@ -546,7 +554,9 @@ def get_args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--position_embedding", default="sine", type=str, choices=("sine", "learned", "v2", "v3"))
     parser.add_argument("--camera_names", default=[], type=list)
 
-    parser.add_argument("--enc_layers", default=4, type=int)
+    parser.add_argument("--enc_layers", default=4, type=int, help="[Deprecated] Use --cvae_enc_layers and --transformer_enc_layers instead. If provided, sets both encoder layer counts.")
+    parser.add_argument("--cvae_enc_layers", default=None, type=int, help="Number of layers in CVAE encoder (default: same as --enc_layers if provided, else 4)")
+    parser.add_argument("--transformer_enc_layers", default=None, type=int, help="Number of layers in DETRTransformer encoder (default: same as --enc_layers if provided, else 4)")
     parser.add_argument("--dec_layers", default=6, type=int)
     parser.add_argument("--dim_feedforward", default=2048, type=int)
     parser.add_argument("--hidden_dim", default=256, type=int)

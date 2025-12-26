@@ -1000,7 +1000,9 @@ def main(args: Dict):
         "lr_backbone": args.get("lr_backbone", 1e-5),
         "weight_decay": args.get("weight_decay", 1e-4),
         "backbone": args["image_encoder"],
-        "enc_layers": args.get("enc_layers_num", 4),
+        "enc_layers": args.get("enc_layers_num", 4),  # For backward compatibility
+        "cvae_enc_layers": args.get("cvae_enc_layers", None),
+        "transformer_enc_layers": args.get("transformer_enc_layers", None),
         "dec_layers": args.get("dec_layers_num", 7),
         "nheads": 8,
         "camera_names": camera_names,
@@ -1050,7 +1052,9 @@ if __name__ == "__main__":
     parser.add_argument("--chunk_size", type=int, default=30)
     parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--dim_feedforward", type=int, default=3200)
-    parser.add_argument("--enc_layers_num", type=int, default=4)
+    parser.add_argument("--enc_layers_num", type=int, default=4, help="[Deprecated] Use --cvae_enc_layers and --transformer_enc_layers instead. If provided, sets both encoder layer counts.")
+    parser.add_argument("--cvae_enc_layers", type=int, default=None, help="Number of layers in CVAE encoder (default: same as --enc_layers_num if provided, else 4)")
+    parser.add_argument("--transformer_enc_layers", type=int, default=None, help="Number of layers in DETRTransformer encoder (default: same as --enc_layers_num if provided, else 4)")
     parser.add_argument("--dec_layers_num", type=int, default=7)
     parser.add_argument("--image_encoder", type=str, default="efficientnet_b3film")
     parser.add_argument("--gpu", type=int, default=None, help="GPU ID to use (default: auto-select first available GPU, or CPU if no GPU available)")
