@@ -13,6 +13,7 @@ from .misc import NestedTensor
 from additional_modules.gated_attention_SDPA import (
     GatedDETREncoderLayer,
     GatedDETRDecoderLayer,
+    _build_mlp,
 )
 
 class PositionEmbeddingSine(nn.Module):
@@ -126,35 +127,46 @@ class Transformer(nn.Module):
         normalize_before=False,
         return_intermediate_dec=False,
         use_gated_attention: bool = False,
+        mlp_type: str = "swiglu",
+        gate_mode: str = "element-wise",
     ):
         super().__init__()
 
         self.use_gated_attention = use_gated_attention
+        self.num_encoder_layers = num_encoder_layers
 
-        if self.use_gated_attention:
-            print("Using Gated attention DETR Transformer Encoder")
-            encoder_layer = GatedDETREncoderLayer(
-                d_model, nhead, dim_feedforward, dropout, activation, normalize_before
+        if num_encoder_layers > 0:
+            if self.use_gated_attention:
+                print(f"Using Gated attention DETR Transformer Encoder (mlp_type={mlp_type}, gate_mode={gate_mode})")
+                encoder_layer = GatedDETREncoderLayer(
+                    d_model, nhead, dim_feedforward, dropout, activation, normalize_before,
+                    mlp_type=mlp_type, gate_mode=gate_mode
+                )
+            else:
+                print(f"Using Vanilla DETR Transformer Encoder (mlp_type={mlp_type})")
+                encoder_layer = TransformerEncoderLayer(
+                    d_model, nhead, dim_feedforward, dropout, activation, normalize_before,
+                    mlp_type=mlp_type
+                )
+            encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
+            self.encoder = TransformerEncoder(
+                encoder_layer, num_encoder_layers, encoder_norm
             )
         else:
-            print("Using Vanilla DETR Transformer Encoder")
-            encoder_layer = TransformerEncoderLayer(
-                d_model, nhead, dim_feedforward, dropout, activation, normalize_before
-            )
-        encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
-        self.encoder = TransformerEncoder(
-            encoder_layer, num_encoder_layers, encoder_norm
-        )
+            print("Skipping Transformer Encoder (num_encoder_layers=0), using features directly as memory")
+            self.encoder = None
 
         if self.use_gated_attention:
-            print("Using Gated attention DETR Transformer Decoder")
+            print(f"Using Gated attention DETR Transformer Decoder (mlp_type={mlp_type}, gate_mode={gate_mode})")
             decoder_layer = GatedDETRDecoderLayer(
-                d_model, nhead, dim_feedforward, dropout, activation, normalize_before
+                d_model, nhead, dim_feedforward, dropout, activation, normalize_before,
+                mlp_type=mlp_type, gate_mode=gate_mode
             )
         else:
-            print("Using Vanilla DETR Transformer Decoder")
+            print(f"Using Vanilla DETR Transformer Decoder (mlp_type={mlp_type})")
             decoder_layer = TransformerDecoderLayer(
-                d_model, nhead, dim_feedforward, dropout, activation, normalize_before
+                d_model, nhead, dim_feedforward, dropout, activation, normalize_before,
+                mlp_type=mlp_type
             )
         decoder_norm = nn.LayerNorm(d_model)
         self.decoder = TransformerDecoder(
@@ -213,7 +225,13 @@ class Transformer(nn.Module):
             query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
 
         tgt = torch.zeros_like(query_embed)
-        memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
+        # Skip encoder if num_encoder_layers=0, use src directly as memory
+        if self.num_encoder_layers > 0:
+            # With inner (different from outer cvae encoder) encoder: backbone features -> Transformer encoder (self-attention) -> memory -> decoder
+            memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
+        else:
+            # No encoder (different from outer cvae encoder) layers: backbone features (with FiLM conditioning) -> memory -> decoder
+            memory = src
         hs = self.decoder(
             tgt,
             memory,
@@ -312,12 +330,18 @@ class TransformerEncoderLayer(nn.Module):
         dropout=0.1,
         activation="relu",
         normalize_before=False,
+        mlp_type="standard",
     ):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        # Use _build_mlp to support different MLP types (swiglu, standard)
+        self.mlp = _build_mlp(
+            d_model=d_model,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            mlp_type=mlp_type,
+            activation=activation,
+        )
 
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -343,7 +367,7 @@ class TransformerEncoderLayer(nn.Module):
         )[0]
         src = src + self.dropout1(src2)
         src = self.norm1(src)
-        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src2 = self.mlp(src)
         src = src + self.dropout2(src2)
         src = self.norm2(src)
         return src
@@ -362,7 +386,7 @@ class TransformerEncoderLayer(nn.Module):
         )[0]
         src = src + self.dropout1(src2)
         src2 = self.norm2(src)
-        src2 = self.linear2(self.dropout(self.activation(self.linear1(src2))))
+        src2 = self.mlp(src2)
         src = src + self.dropout2(src2)
         return src
 
@@ -387,14 +411,19 @@ class TransformerDecoderLayer(nn.Module):
         dropout=0.1,
         activation="relu",
         normalize_before=False,
+        mlp_type="standard",
     ):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
         self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-        # Implementation of Feedforward model
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        # Use _build_mlp to support different MLP types (swiglu, standard)
+        self.mlp = _build_mlp(
+            d_model=d_model,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            mlp_type=mlp_type,
+            activation=activation,
+        )
 
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -435,7 +464,7 @@ class TransformerDecoderLayer(nn.Module):
         )[0]
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
-        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        tgt2 = self.mlp(tgt)
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
         return tgt
@@ -467,7 +496,7 @@ class TransformerDecoderLayer(nn.Module):
         )[0]
         tgt = tgt + self.dropout2(tgt2)
         tgt2 = self.norm3(tgt)
-        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
+        tgt2 = self.mlp(tgt2)
         tgt = tgt + self.dropout3(tgt2)
         return tgt
 
@@ -520,6 +549,8 @@ def build_transformer(args):
         normalize_before=args.pre_norm,
         return_intermediate_dec=True,
         use_gated_attention=getattr(args, "use_gated_attention", False),
+        mlp_type=getattr(args, "mlp_type", "swiglu"),
+        gate_mode=getattr(args, "gate_mode", "element-wise"),
     )
 
 

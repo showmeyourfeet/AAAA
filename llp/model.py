@@ -14,7 +14,7 @@ from additional_modules.DETRTransformer import (
     TransformerEncoderLayer,
     build_transformer,
 )
-from additional_modules.gated_attention_SDPA import GatedDETREncoderLayer
+from additional_modules.gated_attention_SDPA import GatedDETREncoderLayer, GatedDETRDecoderLayer
 from .backbone_impl import build_backbone, FilMedBackbone, FrozenBatchNorm2d
 
 
@@ -179,7 +179,9 @@ class DETRVAE(nn.Module):
         """
         bs, _ = qpos.shape
         if self.encoder is None:
-            # No encoder: use zero latent vector
+            # Decoder-only mode: No CVAE encoder, use zero latent vector
+            # This is used when --no_encoder is set, creating a simpler architecture
+            # that directly predicts actions from image features without latent space modeling
             if self.vq:
                 vq_zero = torch.zeros([bs, self.vq_class * self.vq_dim], dtype=torch.float32, device=qpos.device)
                 latent_input = self.latent_out_proj(vq_zero)
@@ -402,7 +404,15 @@ class DETRVAE(nn.Module):
 
 
 def build_encoder(args) -> TransformerEncoder:
+    """
+    Build CVAE encoder with optional gated attention support.
+    Note: The transformer decoder (built via build_transformer) also supports
+    GatedDETRDecoderLayer when use_gated_attention is enabled.
+    Both encoder and decoder support mlp_type and gate_mode configuration.
+    """
     if getattr(args, "use_gated_attention", False):
+        mlp_type = getattr(args, "mlp_type", "swiglu")
+        gate_mode = getattr(args, "gate_mode", "element-wise")
         encoder_layer = GatedDETREncoderLayer(
             args.hidden_dim,
             args.nheads,
@@ -410,8 +420,11 @@ def build_encoder(args) -> TransformerEncoder:
             args.dropout,
             "relu",
             args.pre_norm,
+            mlp_type=mlp_type,
+            gate_mode=gate_mode,
         )
     else:
+        mlp_type = getattr(args, "mlp_type", "standard")
         encoder_layer = TransformerEncoderLayer(
             args.hidden_dim,
             args.nheads,
@@ -419,6 +432,7 @@ def build_encoder(args) -> TransformerEncoder:
             args.dropout,
             "relu",
             args.pre_norm,
+            mlp_type=mlp_type,
         )
     encoder_norm = nn.LayerNorm(args.hidden_dim) if args.pre_norm else None
     encoder = TransformerEncoder(encoder_layer, args.enc_layers, encoder_norm)
@@ -443,7 +457,22 @@ def build_act_model(args) -> DETRVAE:
             backbone = build_backbone(args)
             backbones.append(backbone)
 
+    # Build transformer (decoder supports GatedDETRDecoderLayer when use_gated_attention is enabled)
     transformer = build_transformer(args)
+
+    # Decoder-only architecture: --no_encoder + enc_layers=0
+    # This creates a simpler architecture without CVAE encoder and Transformer encoder
+    # Pros: Fewer parameters, faster inference, simpler training (no KL divergence)
+    # Cons: Less expressive, no uncertainty modeling, may need stronger decoder
+    is_decoder_only = args.no_encoder and getattr(args, "enc_layers", 4) == 0
+    if is_decoder_only:
+        print("=" * 60)
+        print("Using Decoder-Only Architecture:")
+        print("  - CVAE encoder: DISABLED (--no_encoder)")
+        print("  - Transformer encoder: DISABLED (enc_layers=0)")
+        print("  - Only Transformer decoder is active")
+        print("  - Latent input will be zero vector")
+        print("=" * 60)
 
     if args.no_encoder:
         encoder = None
@@ -529,6 +558,20 @@ def get_args_parser() -> argparse.ArgumentParser:
         "--use_gated_attention",
         action="store_true",
         help="Use gated attention in DETR encoder/decoder and CVAE encoder",
+    )
+    parser.add_argument(
+        "--mlp_type",
+        type=str,
+        default="swiglu",
+        choices=["swiglu", "standard"],
+        help="MLP block type for Transformer FFN (swiglu or standard)",
+    )
+    parser.add_argument(
+        "--gate_mode",
+        type=str,
+        default="element-wise",
+        choices=["element-wise", "head-wise"],
+        help="Gated attention mode (element-wise or head-wise)",
     )
 
     parser.add_argument("--masks", action="store_true")

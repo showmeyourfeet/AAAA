@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import logging
 import os
@@ -24,8 +23,10 @@ try:
     # When run as a module: python -m act_refactor.train
     from .dataset import (
         SplittedEpisodicDataset,
-        load_merged_data,
         load_splitted_data,
+        load_splitted_data_with_dagger,
+        MixedDataset,
+        MixedRatioSampler,
     )
     from .policy import ACTPolicy
     from .utils import (
@@ -33,8 +34,6 @@ try:
         detach_dict,
         is_multi_gpu_checkpoint,
         set_seed,
-        load_data,
-        load_data_srt,
     )
 except ImportError:
     # When run as a script: python path/to/act_refactor/train.py
@@ -44,8 +43,10 @@ except ImportError:
     sys.path.append(dirname(dirname(abspath(__file__))))
     from llp.dataset import (
         SplittedEpisodicDataset,
-        load_merged_data,
         load_splitted_data,
+        load_splitted_data_with_dagger,
+        MixedDataset,
+        MixedRatioSampler,
     )
     from llp.policy import ACTPolicy
     from llp.utils import (
@@ -53,7 +54,6 @@ except ImportError:
         detach_dict,
         is_multi_gpu_checkpoint,
         set_seed,
-        load_data,
     )
 
 
@@ -800,89 +800,79 @@ def main(args: Dict):
     language_encoder = args["language_encoder"]
     use_state = not args.get("no_state", False)
 
-    dataset_dirs: List[str] = []
-    num_episodes_list: List[int] = []
-    camera_names: Sequence[str] = []
-    max_episode_len = 0
-
     use_splitted = args.get("use_splitted", False)
-    splitted_root = args.get("splitted_root")
     stage_embeddings_file = args.get("stage_embeddings_file")
 
-    # Simple HDF5 episodic dataset interface (EpisodicDataset / SRTDataset in llp.utils)
-    dataset_dir = args.get("dataset_dir")
-    num_episodes = args.get("num_episodes")
-    hdf5_use_srt = args.get("hdf5_use_srt", False)
-    val_batch_size = args.get("val_batch_size") or args["batch_size"]
-    train_ratio = args.get("train_ratio", 0.8)
+    if not use_splitted:
+        raise ValueError("--use_splitted must be provided. Only SplittedEpisodicDataset format is supported.")
 
-    if dataset_dir is not None:
-        # Auto-detect num_episodes if not provided
-        if num_episodes is None:
-            # Find all episode_*.hdf5 files and get the maximum episode ID
-            episode_files = glob.glob(os.path.join(dataset_dir, "episode_*.hdf5"))
-            if not episode_files:
-                raise ValueError(f"No episode_*.hdf5 files found in {dataset_dir}")
-            # Extract episode IDs and find max
-            episode_ids = []
-            for f in episode_files:
-                try:
-                    # Extract number from "episode_123.hdf5"
-                    basename = os.path.basename(f)
-                    ep_id = int(basename.split("_")[1].split(".")[0])
-                    episode_ids.append(ep_id)
-                except (ValueError, IndexError):
-                    continue
-            if not episode_ids:
-                raise ValueError(f"Could not parse episode IDs from files in {dataset_dir}")
-            # num_episodes should be max_id + 1 (assuming IDs start from 0)
-            num_episodes = max(episode_ids) + 1
-            if logger:
-                logger.info(f"Auto-detected num_episodes={num_episodes} from {dataset_dir}")
-            else:
-                print(f"Auto-detected num_episodes={num_episodes} from {dataset_dir}")
+    if use_splitted:
+        # Unified interface: use new parameter names, fallback to old ones for backward compatibility
+        normal_root_dir = args.get("normal_root_dir") or args.get("splitted_root")
+        normal_val_root = args.get("normal_val_root") or args.get("val_splitted_root")
         
-        # Directly load from a directory of episode_*.hdf5 files
-        camera_names = args.get("camera_names", ["left_frame", "right_frame"])
-        train_dataloader, val_dataloader, stats, _ = load_data(
-            dataset_dir=dataset_dir,
-            num_episodes=num_episodes,
-            camera_names=camera_names,
-            batch_size_train=args["batch_size"],
-            batch_size_val=val_batch_size,
-            train_ratio=train_ratio,
-            prefetch_factor=args.get("prefetch_factor", 0),
-            num_workers=args.get("num_workers", 0),
-        )
-        # For simple episodic datasets we don't use explicit max_episode_len here;
-        # chunk_size still controls the number of queries.
-        max_episode_len = args.get("chunk_size", 30)
-
-    elif use_splitted:
-        if not splitted_root:
-            raise ValueError("--splitted_root must be provided when --use_splitted is set")
+        if not normal_root_dir:
+            raise ValueError("--normal_root_dir (or --splitted_root) must be provided when --use_splitted is set")
+        
         camera_names = args.get("camera_names", ["left_frame", "right_frame"])
         max_episode_len = args.get("chunk_size", 30)
-        # 只用训练集计算统计量，避免数据泄露
-        val_root = args.get("val_splitted_root")
-        stats = compute_splitted_norm_stats([splitted_root])
-        train_dataloader, stats, _ = load_splitted_data(
-            root_dir=splitted_root,
-            camera_names=camera_names,
-            batch_size_train=args["batch_size"],
-            max_len=max_episode_len,
-            norm_stats=stats,
-            use_language=use_language,
-            stage_embeddings_file=stage_embeddings_file,
-            use_augmentation=args.get("use_augmentation", False),
-            image_size=args.get("image_size", 224),
-            use_episodic_sampling=args.get("use_episodic_sampling", False),
-            use_state=use_state,
-            prefetch_factor=args.get("prefetch_factor", 2),
-            num_workers=args.get("num_workers", 8),
-        )
+        
+        # Check if DAgger mode is enabled
+        use_dagger = args.get("use_dagger", False)
+        dagger_root_dir = args.get("dagger_root_dir") or args.get("dagger_root")  # Support both new and old name
+        dagger_val_root = args.get("dagger_val_root")
+        mix_ratio = args.get("mix_ratio", 0.5)
+        
+        if use_dagger:
+            if not dagger_root_dir:
+                raise ValueError("--dagger_root_dir (or --dagger_root) must be provided when --use_dagger is set")
+            if not (0.0 <= mix_ratio <= 1.0):
+                raise ValueError("--mix_ratio must be between 0.0 and 1.0")
+            
+            # Compute stats from both normal and dagger datasets
+            stats = compute_splitted_norm_stats([normal_root_dir, dagger_root_dir])
+            
+            # Load mixed data
+            train_dataloader, stats, _ = load_splitted_data_with_dagger(
+                normal_root_dir=normal_root_dir,
+                dagger_root_dir=dagger_root_dir,
+                camera_names=camera_names,
+                batch_size_train=args["batch_size"],
+                max_len=max_episode_len,
+                norm_stats=stats,
+                mix_ratio=mix_ratio,
+                use_language=use_language,
+                stage_embeddings_file=stage_embeddings_file,
+                dagger_embeddings_file=args.get("dagger_embeddings_file"),
+                use_augmentation=args.get("use_augmentation", False),
+                image_size=args.get("image_size", 224),
+                use_episodic_sampling=args.get("use_episodic_sampling", False),
+                use_state=use_state,
+                prefetch_factor=args.get("prefetch_factor", 2),
+                num_workers=args.get("num_workers", 8),
+            )
+        else:
+            # Normal mode: only load normal data
+            # 只用训练集计算统计量，避免数据泄露
+            stats = compute_splitted_norm_stats([normal_root_dir])
+            train_dataloader, stats, _ = load_splitted_data(
+                root_dir=normal_root_dir,
+                camera_names=camera_names,
+                batch_size_train=args["batch_size"],
+                max_len=max_episode_len,
+                norm_stats=stats,
+                use_language=use_language,
+                stage_embeddings_file=stage_embeddings_file,
+                dagger_embeddings_file=args.get("dagger_embeddings_file"),  # Optional, for normal data with correction segments
+                use_augmentation=args.get("use_augmentation", False),
+                image_size=args.get("image_size", 224),
+                use_episodic_sampling=args.get("use_episodic_sampling", False),
+                use_state=use_state,
+                prefetch_factor=args.get("prefetch_factor", 2),
+                num_workers=args.get("num_workers", 8),
+            )
         val_dataloader = None
-        if val_root:
+        if normal_val_root:
             stage_embeddings = None
             if use_language and stage_embeddings_file and os.path.exists(stage_embeddings_file):
                 with open(stage_embeddings_file, "r", encoding="utf-8") as f:
@@ -894,53 +884,100 @@ def main(args: Dict):
                     for e in entries
                     if "stage" in e and "embedding" in e
                 }
-            val_dataset = SplittedEpisodicDataset(
-                val_root,
-                camera_names,
-                stats,  # 与 train 共享同一统计量
-                max_len=max_episode_len,
-                use_language=use_language,
-                stage_embeddings=stage_embeddings,
-                image_size=args.get("image_size", 224),
-                use_augmentation=False,  # No augmentation for validation
-                training=False,
-                use_episodic_sampling=args.get("use_episodic_sampling", False),
-                use_state=use_state,
-            )
-            val_dataloader = torch.utils.data.DataLoader(
-                val_dataset,
-                batch_size=args["batch_size"],
-                shuffle=False,
-                pin_memory=True,
-                num_workers=4,
-                prefetch_factor=2,
-                persistent_workers=False,
-            )
-    else:
-        # Expect task_config list describing dataset directories
-        task_configs: Sequence[Dict] = args.get("task_config", [])
-        if not task_configs:
-            raise ValueError("Either --use_splitted or --task_config must be provided")
-        for task_config in task_configs:
-            dataset_dirs.append(task_config["dataset_dir"])
-            num_episodes_list.append(task_config["num_episodes"])
-            max_episode_len = max(max_episode_len, task_config["episode_len"])
-            camera_names = task_config["camera_names"]
-        train_dataloader, stats, _ = load_merged_data(
-            dataset_dirs,
-            num_episodes_list,
-            camera_names,
-            args["batch_size"],
-            max_len=max_episode_len,
-            command_list=args.get("command_list", []),
-            use_language=use_language,
-            language_encoder=language_encoder,
-            policy_class="ACT",
-            use_augmentation=args.get("use_augmentation", False),
-            image_size=args.get("image_size", 224),
-            use_state=use_state,
-        )
-        val_dataloader = None
+            
+            # Load correction embeddings if available
+            correction_embeddings = None
+            dagger_embeddings_file = args.get("dagger_embeddings_file")
+            if use_language and dagger_embeddings_file and os.path.exists(dagger_embeddings_file):
+                with open(dagger_embeddings_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                entries = data.get("correction_embeddings", data)
+                if isinstance(entries, list):
+                    correction_embeddings = {
+                        int(e["correction_command_idx"]): e["embedding"]
+                        for e in entries
+                        if "correction_command_idx" in e and "embedding" in e
+                    }
+                elif isinstance(entries, dict):
+                    correction_embeddings = {
+                        int(k): v.get("embedding") if isinstance(v, dict) else v
+                        for k, v in entries.items()
+                        if "embedding" in (v if isinstance(v, dict) else {})
+                    }
+            
+            # Handle DAgger validation data
+            if use_dagger and dagger_val_root:
+                # Create mixed validation dataset
+                normal_val_dataset = SplittedEpisodicDataset(
+                    normal_val_root,
+                    camera_names,
+                    stats,
+                    max_len=max_episode_len,
+                    use_language=use_language,
+                    stage_embeddings=stage_embeddings,
+                    correction_embeddings=None,  # Normal validation data doesn't use correction embeddings
+                    image_size=args.get("image_size", 224),
+                    use_augmentation=False,
+                    training=False,
+                    use_episodic_sampling=args.get("use_episodic_sampling", False),
+                    use_state=use_state,
+                )
+                dagger_val_dataset = SplittedEpisodicDataset(
+                    dagger_val_root,
+                    camera_names,
+                    stats,
+                    max_len=max_episode_len,
+                    use_language=use_language,
+                    stage_embeddings=stage_embeddings,
+                    correction_embeddings=correction_embeddings,  # DAgger validation data uses correction embeddings
+                    image_size=args.get("image_size", 224),
+                    use_augmentation=False,
+                    training=False,
+                    use_episodic_sampling=args.get("use_episodic_sampling", False),
+                    use_state=use_state,
+                )
+                val_batch_size = args.get("val_batch_size") or args["batch_size"]
+                mixed_val_dataset = MixedDataset(normal_val_dataset, dagger_val_dataset)
+                mixed_val_sampler = MixedRatioSampler(
+                    normal_dataset=normal_val_dataset,
+                    dagger_dataset=dagger_val_dataset,
+                    mix_ratio=mix_ratio,
+                    batch_size=val_batch_size,
+                    shuffle=False,  # No shuffle for validation
+                )
+                val_dataloader = torch.utils.data.DataLoader(
+                    mixed_val_dataset,
+                    batch_sampler=mixed_val_sampler,
+                    pin_memory=True,
+                    num_workers=4,
+                    prefetch_factor=2,
+                    persistent_workers=False,
+                )
+            else:
+                # Normal validation dataset
+                val_dataset = SplittedEpisodicDataset(
+                    normal_val_root,
+                    camera_names,
+                    stats,  # 与 train 共享同一统计量
+                    max_len=max_episode_len,
+                    use_language=use_language,
+                    stage_embeddings=stage_embeddings,
+                    correction_embeddings=correction_embeddings,  # Optional, for normal data with correction segments
+                    image_size=args.get("image_size", 224),
+                    use_augmentation=False,  # No augmentation for validation
+                    training=False,
+                    use_episodic_sampling=args.get("use_episodic_sampling", False),
+                    use_state=use_state,
+                )
+                val_dataloader = torch.utils.data.DataLoader(
+                    val_dataset,
+                    batch_size=args.get("val_batch_size") or args["batch_size"],
+                    shuffle=False,
+                    pin_memory=True,
+                    num_workers=4,
+                    prefetch_factor=2,
+                    persistent_workers=False,
+                )
 
     stats["use_state"] = use_state
     stats_path = os.path.join(ckpt_dir, "dataset_stats.pkl")
@@ -1039,9 +1076,18 @@ if __name__ == "__main__":
 
     # Dataset options
     parser.add_argument("--use_splitted", action="store_true")
-    parser.add_argument("--splitted_root", type=str)
-    parser.add_argument("--val_splitted_root", type=str)
+    parser.add_argument("--splitted_root", type=str, help="[Deprecated] Use --normal_root_dir instead. Root directory for splitted dataset (training data)")
+    parser.add_argument("--val_splitted_root", type=str, help="[Deprecated] Use --normal_val_root instead. Root directory for validation (splitted format)")
+    parser.add_argument("--normal_root_dir", type=str, help="Root directory for normal datasets (training data). In DAgger mode: expert demonstrations. In normal mode: training datasets.")
+    parser.add_argument("--normal_val_root", type=str, help="Root directory for normal validation datasets. In DAgger mode: expert validation. In normal mode: validation datasets.")
     parser.add_argument("--stage_embeddings_file", type=str)
+    
+    # DAgger options
+    parser.add_argument("--use_dagger", action="store_true", help="Enable DAgger training mode: mix normal and correction command data")
+    parser.add_argument("--dagger_root_dir", type=str, help="Root directory for DAgger training datasets (agent trajectories with corrections) in DAgger mode")
+    parser.add_argument("--dagger_val_root", type=str, help="Root directory for DAgger validation datasets in DAgger mode")
+    parser.add_argument("--dagger_embeddings_file", type=str, help="JSON file containing correction command embeddings for DAgger mode. Format: {\"correction_embeddings\": [{\"correction_command_idx\": 1, \"embedding\": [...]}, ...]}")
+    parser.add_argument("--mix_ratio", type=float, default=0.5, help="Ratio of correction command samples in each batch (default: 0.5, range: 0.0-1.0)")
     parser.add_argument("--camera_names", nargs="*", default=["left_frame", "right_frame"])
     parser.add_argument("--use_augmentation", action="store_true", help="Enable data augmentation for images")
     parser.add_argument("--image_size", type=int, default=224, help="Image size for augmentation")
@@ -1052,7 +1098,6 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=0, help="Number of workers for the dataset")
 
 
-    parser.add_argument("--task_config", type=json.loads, default=None)
     parser.add_argument("--log_every", type=int, default=1)
     
     # Image encoder training control
@@ -1078,12 +1123,8 @@ if __name__ == "__main__":
         help="Save latest checkpoint every N epochs (default: 1). Ignored if --disable_latest_checkpoint is set.",
     )
 
-    # Simple HDF5 episodic dataset options (EpisodicDataset / SRTDataset in llp.utils)
-    parser.add_argument("--dataset_dir", type=str, help="Directory containing episode_*.hdf5 files")
-    parser.add_argument("--num_episodes", type=int, default=None, help="Number of episodes in dataset_dir (default: auto-detect from max episode ID)")
-    parser.add_argument("--train_ratio", type=float, default=0.8, help="Ratio of training data (default: 0.8)")
+    # Validation batch size
     parser.add_argument("--val_batch_size", type=int, help="Validation batch size (default: same as --batch_size)")
-    parser.add_argument("--hdf5_use_srt", action="store_true", help="Use SRTDataset with Albumentations instead of plain EpisodicDataset")
 
     args = parser.parse_args()
     main(vars(args))

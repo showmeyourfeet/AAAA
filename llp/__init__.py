@@ -8,10 +8,11 @@ from .model import (
     get_args_parser,
 )
 from .dataset import (
-    EpisodicDataset,
     SplittedEpisodicDataset,
-    load_merged_data,
     load_splitted_data,
+    load_splitted_data_with_dagger,
+    MixedDataset,
+    MixedRatioSampler,
 )
 from .utils import (
     compute_dict_mean,
@@ -29,9 +30,10 @@ __all__ = [
     "build_act_model_and_optimizer",
     "get_args_parser",
     "SplittedEpisodicDataset",
-    "EpisodicDataset",
     "load_splitted_data",
-    "load_merged_data",
+    "load_splitted_data_with_dagger",
+    "MixedDataset",
+    "MixedRatioSampler",
     "compute_dict_mean",
     "detach_dict",
     "set_seed",
