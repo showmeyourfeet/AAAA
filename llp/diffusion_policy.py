@@ -12,6 +12,7 @@ class DiffusionPolicy(nn.Module):
         from robomimic.models.diffusion_policy_nets import ConditionalUnet1D
         from robomimic.algo.diffusion_policy import replace_bn_with_gn
         from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+        from diffusers.training_utils import EMAModel
 
 
         self.camera_names = args_override['camera_names']
@@ -164,15 +165,20 @@ class DiffusionPolicy(nn.Module):
 
         self.nets = nn.ModuleDict({"policy": nn.ModuleDict(nets_dict)})
 
-        nets = self.nets.float() # update reference
-
-        # Modified: 删除了内部 DataParallel，因为它破坏了字典结构，多卡请在外部处理
+        # Note: deleted DataParallel, it breaks the dictionary structure
+        # if multi-gpu training, we should handle it externally
         # if args_override.get("multi_gpu", False):
         #     nets = nn.DataParallel(nets)
         
         device = args_override.get("device", "cuda")
         self.nets.to(device)
-        # self.nets = nets # unnecessary since we used self.nets.to()
+        # Note: nn.ModuleDict defaults to float32, so no need to explicitly convert
+
+        # add ema model
+        self.ema = EMAModel(
+            model = self.nets,
+            power = self.ema_power
+        )
 
         self.noise_scheduler = DDIMScheduler(
             num_train_timesteps = 100,
@@ -346,6 +352,8 @@ class DiffusionPolicy(nn.Module):
             else:
                 loss = all_l2.mean()
                 l1_loss = all_l1.mean()
+
+            self.step(self.nets.parameters())
 
             return {
                 "l2_loss": loss,
