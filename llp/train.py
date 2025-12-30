@@ -28,6 +28,7 @@ try:
         MixedRatioSampler,
     )
     from .policy import ACTPolicy
+    from .diffusion_policy import DiffusionPolicy
     from .utils import (
         compute_dict_mean,
         detach_dict,
@@ -47,6 +48,7 @@ except ImportError:
         MixedRatioSampler,
     )
     from llp.policy import ACTPolicy
+    from llp.diffusion_policy import DiffusionPolicy
     from llp.utils import (
         compute_dict_mean,
         detach_dict,
@@ -101,12 +103,29 @@ def format_number(num: int) -> str:
         return str(num)
 
 
-def make_policy(policy_config: Dict) -> ACTPolicy:
-    policy = ACTPolicy(policy_config)
+def make_policy(policy_config: Dict):
+    """
+    Create a policy based on the policy_type specified in config.
+    
+    Args:
+        policy_config: Configuration dictionary containing policy_type and other parameters
+        
+    Returns:
+        Policy instance (ACTPolicy or DiffusionPolicy)
+    """
+    policy_type = policy_config.get("policy_type", "act").lower()
+    
+    if policy_type == "diffusion":
+        policy = DiffusionPolicy(policy_config)
+    elif policy_type == "act":
+        policy = ACTPolicy(policy_config)
+    else:
+        raise ValueError(f"Unknown policy_type: {policy_type}. Must be 'act' or 'diffusion'")
+    
     return policy
 
 
-def make_optimizer(policy: ACTPolicy) -> torch.optim.Optimizer:
+def make_optimizer(policy) -> torch.optim.Optimizer:
     return policy.configure_optimizers()
 
 
@@ -191,7 +210,7 @@ def compute_splitted_norm_stats(roots: Sequence[str]) -> Dict[str, np.ndarray]:
     }
 
 
-def forward_pass(data, policy: ACTPolicy, device: torch.device, encode_command: bool = False):
+def forward_pass(data, policy, device: torch.device, encode_command: bool = False):
     if len(data) == 5:
         image_data, qpos_data, action_data, is_pad, command_embedding = data
         command_embedding = command_embedding.to(device)
@@ -211,6 +230,11 @@ def train_bc(
     val_dataloader=None,
     logger: logging.Logger | None = None,
 ):
+    """
+    Train a behavior cloning policy (ACT or Diffusion).
+    
+    Supports both ACTPolicy and DiffusionPolicy through unified interface.
+    """
     num_epochs = config["num_epochs"]
     ckpt_dir = config["ckpt_dir"]
     seed = config["seed"]
@@ -456,7 +480,12 @@ def train_bc(
             val_losses = []
             val_l1_losses = []
             val_l1_infer_losses = []  # 推理模式 L1 losses
-            num_queries = policy.num_queries
+            # Get num_queries/action_horizon for slicing actions
+            # DiffusionPolicy uses num_queries, ACTPolicy also has num_queries
+            num_queries = getattr(policy, 'num_queries', None)
+            if num_queries is None:
+                # Fallback for DiffusionPolicy if num_queries not set
+                num_queries = getattr(policy, 'action_horizon', 30)
             with torch.inference_mode():
                 val_bar = tqdm(val_dataloader, desc=f"Val {epoch}", leave=False)
                 for data in val_bar:
@@ -482,7 +511,7 @@ def train_bc(
                     if "l1" in forward_dict:
                         val_l1_losses.append(forward_dict["l1"].item())
                     
-                    # 2. 推理模式 Loss（不传入 actions，使用零向量 latent，反映真实推理能力）
+                    # 2. 推理模式 Loss（不传入 actions，反映真实推理能力）
                     if use_amp:
                         with autocast('cuda'):
                             a_hat_infer = policy(qpos_data, image_data, actions=None, is_pad=None, command_embedding=command_embedding, encode_command=encode_command)
@@ -490,7 +519,16 @@ def train_bc(
                         a_hat_infer = policy(qpos_data, image_data, actions=None, is_pad=None, command_embedding=command_embedding, encode_command=encode_command)
                     
                     # 计算推理模式 L1 loss（手动计算，排除 padding）
+                    # a_hat_infer shape: [batch, seq, action_dim] for both ACT and Diffusion
                     action_gt = action_data[:, :num_queries]
+                    # Ensure a_hat_infer matches the shape
+                    if a_hat_infer.shape[1] > num_queries:
+                        a_hat_infer = a_hat_infer[:, :num_queries, :]
+                    elif a_hat_infer.shape[1] < num_queries:
+                        # Pad if needed (shouldn't happen normally)
+                        pad_size = num_queries - a_hat_infer.shape[1]
+                        a_hat_infer = F.pad(a_hat_infer, (0, 0, 0, pad_size), mode='constant', value=0.0)
+                    
                     is_pad_slice = is_pad[:, :num_queries]
                     mask = (~is_pad_slice).unsqueeze(-1)  # [batch, seq, 1]
                     action_dim = action_gt.shape[-1]
@@ -989,6 +1027,9 @@ def main(args: Dict):
         # Default logic: share backbone if not using language and not using film
         shared_backbone = not use_language and "film" not in args["image_encoder"]
     
+    # Determine policy type
+    policy_type = args.get("policy_type", "act").lower()
+    
     policy_config = {
         "lr": args["lr"],
         "num_queries": args["chunk_size"],
@@ -998,26 +1039,46 @@ def main(args: Dict):
         "lr_backbone": args.get("lr_backbone", 1e-5),
         "weight_decay": args.get("weight_decay", 1e-4),
         "backbone": args["image_encoder"],
-        "enc_layers": args.get("enc_layers_num", 4),  # For backward compatibility
-        "cvae_enc_layers": args.get("cvae_enc_layers", None),
-        "transformer_enc_layers": args.get("transformer_enc_layers", None),
-        "dec_layers": args.get("dec_layers_num", 7),
-        "nheads": 8,
         "camera_names": camera_names,
         "multi_gpu": args["multi_gpu"],
         "use_language": use_language,
         "state_dim": stats.get("action_mean", np.zeros(0)).shape[0] if "action_mean" in stats else 20,
-        "no_encoder": args.get("no_encoder", False),
-        "vq": args.get("vq", False),
-        "vq_class": args.get("vq_class", 512),
-        "vq_dim": args.get("vq_dim", 32),
         "train_image_encoder": args.get("train_image_encoder", False),
         "use_state": use_state,
-        "shared_backbone": shared_backbone,
-        "use_gated_attention": args.get("use_gated_attention", False),
-        "mlp_type": args.get("mlp_type", "swiglu"),
-        "gate_mode": args.get("gate_mode", "element-wise"),
+        "policy_type": policy_type,  # Add policy type to config
+        "device": device,  # Add device for DiffusionPolicy
     }
+    
+    # Add policy-specific configurations
+    if policy_type == "act":
+        # ACT-specific config
+        policy_config.update({
+            "enc_layers": args.get("enc_layers_num", 4),  # For backward compatibility
+            "cvae_enc_layers": args.get("cvae_enc_layers", None),
+            "transformer_enc_layers": args.get("transformer_enc_layers", None),
+            "dec_layers": args.get("dec_layers_num", 7),
+            "nheads": 8,
+            "no_encoder": args.get("no_encoder", False),
+            "vq": args.get("vq", False),
+            "vq_class": args.get("vq_class", 512),
+            "vq_dim": args.get("vq_dim", 32),
+            "shared_backbone": shared_backbone,
+            "use_gated_attention": args.get("use_gated_attention", False),
+            "mlp_type": args.get("mlp_type", "swiglu"),
+            "gate_mode": args.get("gate_mode", "element-wise"),
+        })
+    elif policy_type == "diffusion":
+        # Diffusion-specific config
+        policy_config.update({
+            "observation_horizon": args.get("observation_horizon", 1),
+            "action_horizon": args.get("action_horizon", args["chunk_size"]),
+            "prediction_horizon": args.get("prediction_horizon", args.get("action_horizon", args["chunk_size"])),
+            "num_inference_timesteps": args.get("num_inference_timesteps", 16),
+            "action_dim": stats.get("action_mean", np.zeros(0)).shape[0] if "action_mean" in stats else 20,
+            "image_size": args.get("image_size", 224),
+            "image_height": args.get("image_height", None),
+            "image_width": args.get("image_width", None),
+        })
 
     config = {
         "num_epochs": args["num_epochs"],
@@ -1045,6 +1106,10 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, required=True)
     parser.add_argument("--use_amp", action="store_true", help="Enable mixed precision training (AMP) to reduce GPU memory usage")
 
+    # Policy type selection
+    parser.add_argument("--policy_type", type=str, default="act", choices=["act", "diffusion"], 
+                        help="Policy type: 'act' for ACT policy (default) or 'diffusion' for Diffusion policy")
+
     # Model options
     parser.add_argument("--kl_weight", type=float, default=1.0)
     parser.add_argument("--chunk_size", type=int, default=30)
@@ -1070,6 +1135,12 @@ if __name__ == "__main__":
         help="Use gated attention in DETR transformer and encoder (ablation flag)",
     )
     parser.add_argument("--shared_backbone", type=lambda x: x.lower() in ('true', '1', 'yes'), default=None, help="Whether to share backbone across cameras (default: auto-detect based on use_language and image_encoder)")
+
+    # Diffusion policy specific options
+    parser.add_argument("--observation_horizon", type=int, default=1, help="Number of observation frames to use as condition (for diffusion policy)")
+    parser.add_argument("--action_horizon", type=int, default=None, help="Action horizon for diffusion policy (default: same as chunk_size)")
+    parser.add_argument("--prediction_horizon", type=int, default=None, help="Prediction horizon for diffusion policy (default: same as action_horizon)")
+    parser.add_argument("--num_inference_timesteps", type=int, default=16, help="Number of inference timesteps for diffusion policy (default: 16)")
 
     parser.add_argument("--use_language", action="store_true")
     parser.add_argument("--language_encoder", type=str, default="distilbert", choices=["distilbert", "clip"])
