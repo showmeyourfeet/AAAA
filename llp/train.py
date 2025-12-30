@@ -520,16 +520,15 @@ def train_bc(
                     
                     # 计算推理模式 L1 loss（手动计算，排除 padding）
                     # a_hat_infer shape: [batch, seq, action_dim] for both ACT and Diffusion
-                    action_gt = action_data[:, :num_queries]
-                    # Ensure a_hat_infer matches the shape
-                    if a_hat_infer.shape[1] > num_queries:
-                        a_hat_infer = a_hat_infer[:, :num_queries, :]
-                    elif a_hat_infer.shape[1] < num_queries:
-                        # Pad if needed (shouldn't happen normally)
-                        pad_size = num_queries - a_hat_infer.shape[1]
-                        a_hat_infer = F.pad(a_hat_infer, (0, 0, 0, pad_size), mode='constant', value=0.0)
+                    # For diffusion policy, it may return prediction_horizon length instead of action_horizon
+                    # Use the actual returned length to ensure compatibility
+                    actual_seq_len = a_hat_infer.shape[1]
+                    # Use min of num_queries and actual_seq_len to avoid shape mismatch
+                    eval_seq_len = min(num_queries, actual_seq_len)
                     
-                    is_pad_slice = is_pad[:, :num_queries]
+                    action_gt = action_data[:, :eval_seq_len]
+                    a_hat_infer = a_hat_infer[:, :eval_seq_len, :]
+                    is_pad_slice = is_pad[:, :eval_seq_len]
                     mask = (~is_pad_slice).unsqueeze(-1)  # [batch, seq, 1]
                     action_dim = action_gt.shape[-1]
                     valid = mask.sum() * action_dim
@@ -1163,7 +1162,9 @@ if __name__ == "__main__":
     parser.add_argument("--mix_ratio", type=float, default=0.5, help="Ratio of correction command samples in each batch (default: 0.5, range: 0.0-1.0)")
     parser.add_argument("--camera_names", nargs="*", default=["left_frame", "right_frame"])
     parser.add_argument("--use_augmentation", action="store_true", help="Enable data augmentation for images")
-    parser.add_argument("--image_size", type=int, default=224, help="Image size for augmentation")
+    parser.add_argument("--image_size", type=int, default=224, help="Image size for augmentation (square images)")
+    parser.add_argument("--image_height", type=int, default=None, help="Image height for non-square images (for diffusion policy)")
+    parser.add_argument("--image_width", type=int, default=None, help="Image width for non-square images (for diffusion policy)")
     parser.add_argument("--use_episodic_sampling", action="store_true", help="Use episodic sampling mode (similar to EpisodicDataset): traverse run IDs, randomly sample stage, then start_ts. Default: single random mode (traverse all stage/run, randomly sample start_ts)")
     
     # DataLoader options
