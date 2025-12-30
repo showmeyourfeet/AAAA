@@ -353,16 +353,21 @@ class DiffusionPolicy(nn.Module):
                 loss = all_l2.mean()
                 l1_loss = all_l1.mean()
 
-            self.step(self.nets.parameters())
+            # Update EMA weights during training
+            if self.training and self.ema is not None:
+                # EMAModel.step expects the updated model, not parameters
+                self.ema.step(self.nets)
 
             return {
                 "l2_loss": loss,
                 "l1": l1_loss,  # Added for compatibility with train.py
-                "loss": loss
+                "loss": loss,
             }
         else:
             # ------------------------------------------- Inference Mode -------------------------------------------
             # init action (Gaussian Prior)
+            # Use EMA-averaged weights for inference if available
+            nets = self.ema.averaged_model if self.ema is not None else self.nets
             Tp = self.prediction_horizon
             action_dim = self.action_dim
 
@@ -395,12 +400,53 @@ class DiffusionPolicy(nn.Module):
             return naction[:, :return_seq_len, :]
 
     def serialize(self):
-        return self.nets.state_dict()
+        """
+        Serialize model and EMA weights for checkpointing.
+        """
+        result = {
+            "nets": self.nets.state_dict(),
+        }
+        if self.ema is not None:
+            # Save EMA averaged model weights and EMA state
+            result["ema"] = {
+                "averaged_model": self.ema.averaged_model.state_dict(),
+                "optimization_step": self.ema.optimization_step,
+                "decay": self.ema.decay,
+            }
+        else:
+            result["ema"] = None
+        return result
 
     def deserialize(self, model_dict):
-            # Load model state dict.
-            if "nets" in model_dict:
-                self.nets.load_state_dict(model_dict["nets"])
+        """
+        Load model and EMA weights from checkpoint.
+
+        Supports:
+        - Legacy checkpoints that only contain policy weights (no 'nets' key)
+        - New-style checkpoints with separate 'nets' and 'ema' entries
+        """
+        # Legacy format: a flat state dict for self.nets["policy"]
+        if "nets" not in model_dict and "policy" in model_dict:
+            self.nets.load_state_dict(model_dict)
+            return "Loaded legacy diffusion model"
+
+        # New format: separate 'nets' and optional 'ema'
+        if "nets" in model_dict:
+            self.nets.load_state_dict(model_dict["nets"])
+
+        if "ema" in model_dict and model_dict["ema"] is not None and self.ema is not None:
+            print("Loading EMA state...")
+            ema_state = model_dict["ema"]
+            # Load averaged model weights
+            if isinstance(ema_state, dict) and "averaged_model" in ema_state:
+                self.ema.averaged_model.load_state_dict(ema_state["averaged_model"])
+                # Restore EMA state if available
+                if "optimization_step" in ema_state:
+                    self.ema.optimization_step = ema_state["optimization_step"]
+                if "decay" in ema_state:
+                    self.ema.decay = ema_state["decay"]
             else:
-                self.nets.load_state_dict(model_dict)
-            return "Loaded diffusion model weights"
+                # Legacy format: assume ema_state is the averaged_model state_dict directly
+                self.ema.averaged_model.load_state_dict(ema_state)
+
+        return "Loaded diffusion model weights + EMA"
