@@ -201,7 +201,7 @@ class DiffusionPolicy(nn.Module):
                     # Try to find a suitable num_groups
                     # Prefer groups of 8, 16, or 32, but ensure divisibility
                     num_groups = None
-                    for preferred_groups in [8, 16, 32]:
+                    for preferred_groups in [32, 16, 8]:
                         if num_channels % preferred_groups == 0:
                             num_groups = preferred_groups
                             break
