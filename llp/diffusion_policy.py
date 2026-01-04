@@ -181,7 +181,7 @@ class DiffusionPolicy(nn.Module):
         )
 
         self.noise_scheduler = DDIMScheduler(
-            num_train_timesteps = 100,
+            num_train_timesteps = 50,
             beta_schedule="squaredcos_cap_v2",
             clip_sample=True,
             set_alpha_to_one=True,
