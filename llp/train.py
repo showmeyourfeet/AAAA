@@ -27,8 +27,7 @@ try:
         MixedDataset,
         MixedRatioSampler,
     )
-    from .policy import ACTPolicy
-    from .diffusion_policy import DiffusionPolicy
+    from .policy import ACTPolicy, DiffusionPolicy, FlowMatchingPolicy
     from .utils import (
         compute_dict_mean,
         detach_dict,
@@ -47,8 +46,7 @@ except ImportError:
         MixedDataset,
         MixedRatioSampler,
     )
-    from llp.policy import ACTPolicy
-    from llp.diffusion_policy import DiffusionPolicy
+    from llp.policy import ACTPolicy, DiffusionPolicy, FlowMatchingPolicy
     from llp.utils import (
         compute_dict_mean,
         detach_dict,
@@ -111,7 +109,7 @@ def make_policy(policy_config: Dict):
         policy_config: Configuration dictionary containing policy_type and other parameters
         
     Returns:
-        Policy instance (ACTPolicy or DiffusionPolicy)
+        Policy instance (ACTPolicy, DiffusionPolicy, or FlowMatchingPolicy)
     """
     policy_type = policy_config.get("policy_type", "act").lower()
     
@@ -119,8 +117,10 @@ def make_policy(policy_config: Dict):
         policy = DiffusionPolicy(policy_config)
     elif policy_type == "act":
         policy = ACTPolicy(policy_config)
+    elif policy_type == "flow_matching":
+        policy = FlowMatchingPolicy(policy_config)
     else:
-        raise ValueError(f"Unknown policy_type: {policy_type}. Must be 'act' or 'diffusion'")
+        raise ValueError(f"Unknown policy_type: {policy_type}. Must be 'act', 'diffusion', or 'flow_matching'")
     
     return policy
 
@@ -230,6 +230,9 @@ def train_bc(
     val_dataloader=None,
     logger: logging.Logger | None = None,
 ):
+    # Get policy type to determine which metrics to compute
+    policy_type = config.get("policy_config", {}).get("policy_type", "act").lower()
+    use_l1_metrics = (policy_type == "act")  # Only ACT uses L1 metrics
     """
     Train a behavior cloning policy (ACT or Diffusion).
     
@@ -479,7 +482,7 @@ def train_bc(
             policy.eval()
             val_losses = []
             val_l1_losses = []
-            val_l1_infer_losses = []  # 推理模式 L1 losses
+            val_l1_infer_losses = []  # 推理模式 L1 losses (only for ACT)
             # Get num_queries/action_horizon for slicing actions
             # DiffusionPolicy uses num_queries, ACTPolicy also has num_queries
             num_queries = getattr(policy, 'num_queries', None)
@@ -501,44 +504,48 @@ def train_bc(
                     action_data = action_data.to(device)
                     is_pad = is_pad.to(device)
                     
-                    # 1. 重建模式 Loss（传入 GT actions，用于监控 VAE 训练）
+                    # 1. 重建模式 Loss（传入 GT actions，用于监控训练）
                     if use_amp:
                         with autocast('cuda'):
                             forward_dict = policy(qpos_data, image_data, action_data, is_pad, command_embedding, encode_command=encode_command)
                     else:
                         forward_dict = policy(qpos_data, image_data, action_data, is_pad, command_embedding, encode_command=encode_command)
                     val_losses.append(forward_dict["loss"].item())
-                    if "l1" in forward_dict:
+                    # Only compute L1 loss for ACT policy
+                    if use_l1_metrics and "l1" in forward_dict:
                         val_l1_losses.append(forward_dict["l1"].item())
                     
                     # 2. 推理模式 Loss（不传入 actions，反映真实推理能力）
-                    if use_amp:
-                        with autocast('cuda'):
+                    # Only compute L1 inference loss for ACT policy
+                    if use_l1_metrics:
+                        if use_amp:
+                            with autocast('cuda'):
+                                a_hat_infer = policy(qpos_data, image_data, actions=None, is_pad=None, command_embedding=command_embedding, encode_command=encode_command)
+                        else:
                             a_hat_infer = policy(qpos_data, image_data, actions=None, is_pad=None, command_embedding=command_embedding, encode_command=encode_command)
-                    else:
-                        a_hat_infer = policy(qpos_data, image_data, actions=None, is_pad=None, command_embedding=command_embedding, encode_command=encode_command)
+                        
+                        # 计算推理模式 L1 loss（手动计算，排除 padding）
+                        # a_hat_infer shape: [batch, seq, action_dim] for both ACT and Diffusion
+                        # For diffusion policy, it may return prediction_horizon length instead of action_horizon
+                        # Use the actual returned length to ensure compatibility
+                        actual_seq_len = a_hat_infer.shape[1]
+                        # Use min of num_queries and actual_seq_len to avoid shape mismatch
+                        eval_seq_len = min(num_queries, actual_seq_len)
+                        
+                        action_gt = action_data[:, :eval_seq_len]
+                        a_hat_infer = a_hat_infer[:, :eval_seq_len, :]
+                        is_pad_slice = is_pad[:, :eval_seq_len]
+                        mask = (~is_pad_slice).unsqueeze(-1)  # [batch, seq, 1]
+                        action_dim = action_gt.shape[-1]
+                        valid = mask.sum() * action_dim
+                        l1_infer = (F.l1_loss(action_gt, a_hat_infer, reduction="none") * mask).sum() / valid.clamp(min=1)
+                        val_l1_infer_losses.append(l1_infer.item())
                     
-                    # 计算推理模式 L1 loss（手动计算，排除 padding）
-                    # a_hat_infer shape: [batch, seq, action_dim] for both ACT and Diffusion
-                    # For diffusion policy, it may return prediction_horizon length instead of action_horizon
-                    # Use the actual returned length to ensure compatibility
-                    actual_seq_len = a_hat_infer.shape[1]
-                    # Use min of num_queries and actual_seq_len to avoid shape mismatch
-                    eval_seq_len = min(num_queries, actual_seq_len)
-                    
-                    action_gt = action_data[:, :eval_seq_len]
-                    a_hat_infer = a_hat_infer[:, :eval_seq_len, :]
-                    is_pad_slice = is_pad[:, :eval_seq_len]
-                    mask = (~is_pad_slice).unsqueeze(-1)  # [batch, seq, 1]
-                    action_dim = action_gt.shape[-1]
-                    valid = mask.sum() * action_dim
-                    l1_infer = (F.l1_loss(action_gt, a_hat_infer, reduction="none") * mask).sum() / valid.clamp(min=1)
-                    val_l1_infer_losses.append(l1_infer.item())
-                    
-                    val_bar.set_postfix({
-                        "loss": f"{val_losses[-1]:.4f}",
-                        "l1_infer": f"{val_l1_infer_losses[-1]:.4f}"
-                    })
+                    # Update progress bar
+                    postfix_dict = {"loss": f"{val_losses[-1]:.4f}"}
+                    if use_l1_metrics and val_l1_infer_losses:
+                        postfix_dict["l1_infer"] = f"{val_l1_infer_losses[-1]:.4f}"
+                    val_bar.set_postfix(postfix_dict)
             
             val_loss = float(np.mean(val_losses)) if val_losses else float("inf")
             val_l1 = float(np.mean(val_l1_losses)) if val_l1_losses else None
@@ -850,6 +857,8 @@ def main(args: Dict):
             raise ValueError("--normal_root_dir (or --splitted_root) must be provided when --use_splitted is set")
         
         camera_names = args.get("camera_names", ["left_frame", "right_frame"])
+        # Use chunk_size as unified interface for action sequence length
+        # For all policies (ACT, diffusion, flow_matching), chunk_size defines the action sequence length
         max_episode_len = args.get("chunk_size", 30)
         
         # Check if DAgger mode is enabled
@@ -1031,7 +1040,7 @@ def main(args: Dict):
     
     policy_config = {
         "lr": args["lr"],
-        "num_queries": args["chunk_size"],
+        "num_queries": args["chunk_size"],  # Unified interface: chunk_size for all policies
         "kl_weight": args["kl_weight"],
         "hidden_dim": args["hidden_dim"],
         "dim_feedforward": args["dim_feedforward"],
@@ -1068,24 +1077,52 @@ def main(args: Dict):
         })
     elif policy_type == "diffusion":
         # Diffusion-specific config
+        # Use chunk_size as unified interface for action sequence length
         policy_config.update({
             "observation_horizon": args.get("observation_horizon", 1),
-            "action_horizon": args.get("action_horizon", args["chunk_size"]),
-            "prediction_horizon": args.get("prediction_horizon", args.get("action_horizon", args["chunk_size"])),
+            "action_horizon": args["chunk_size"],  # Use chunk_size
+            "prediction_horizon": args.get("prediction_horizon", args["chunk_size"]),  # Default to chunk_size
             "num_inference_timesteps": args.get("num_inference_timesteps", 16),
             "action_dim": stats.get("action_mean", np.zeros(0)).shape[0] if "action_mean" in stats else 20,
             "image_size": args.get("image_size", 224),
             "image_height": args.get("image_height", None),
             "image_width": args.get("image_width", None),
         })
+    elif policy_type == "flow_matching":
+        # Flow Matching-specific config
+        # Use chunk_size as unified interface for action sequence length
+        policy_config.update({
+            "action_seq_len": args["chunk_size"],  # Use chunk_size
+            "action_dim": stats.get("action_mean", np.zeros(0)).shape[0] if "action_mean" in stats else 20,
+            "num_train_timesteps": args.get("num_train_timesteps", 1000),
+            "shift": args.get("shift", 1.0),
+            "num_inference_timesteps": args.get("num_inference_timesteps", 10),
+            "image_size": args.get("image_size", 224),
+            "image_height": args.get("image_height", None),
+            "image_width": args.get("image_width", None),
+            # Transformer config (same as ACT, build_transformer expects "nheads" not "n_heads")
+            "nheads": args.get("n_heads", 8),
+            "transformer_enc_layers": args.get("transformer_enc_layers", None),
+            "enc_layers": args.get("enc_layers_num", 4),  # For backward compatibility
+            "dec_layers": args.get("dec_layers_num", 4),
+            "pre_norm": args.get("pre_norm", False),
+            "use_gated_attention": args.get("use_gated_attention", True),
+            "mlp_type": args.get("mlp_type", "swiglu"),
+            "gate_mode": args.get("gate_mode", "element-wise"),
+        })
 
+    # Set default best_model_metric based on policy type
+    # ACT uses l1_loss_infer, diffusion/flow_matching use loss (MSE)
+    default_best_metric = "loss" if policy_type in ["diffusion", "flow_matching"] else "l1_loss_infer"
+    best_model_metric = args.get("best_model_metric", default_best_metric)
+    
     config = {
         "num_epochs": args["num_epochs"],
         "ckpt_dir": ckpt_dir,
         "seed": args["seed"],
         "policy_config": policy_config,
         "log_every": args.get("log_every", 1),
-        "best_model_metric": args.get("best_model_metric", "total_loss"),
+        "best_model_metric": best_model_metric,
         "constant_lr": args.get("constant_lr", False),
         "save_ckpt_every": args.get("save_ckpt_every", 20),
         "disable_latest_checkpoint": args.get("disable_latest_checkpoint", False),
@@ -1106,8 +1143,8 @@ if __name__ == "__main__":
     parser.add_argument("--use_amp", action="store_true", help="Enable mixed precision training (AMP) to reduce GPU memory usage")
 
     # Policy type selection
-    parser.add_argument("--policy_type", type=str, default="act", choices=["act", "diffusion"], 
-                        help="Policy type: 'act' for ACT policy (default) or 'diffusion' for Diffusion policy")
+    parser.add_argument("--policy_type", type=str, default="act", choices=["act", "diffusion", "flow_matching"], 
+                        help="Policy type: 'act' for ACT policy (default), 'diffusion' for Diffusion policy, or 'flow_matching' for Flow Matching policy")
 
     # Model options
     parser.add_argument("--kl_weight", type=float, default=1.0)
@@ -1137,9 +1174,13 @@ if __name__ == "__main__":
 
     # Diffusion policy specific options
     parser.add_argument("--observation_horizon", type=int, default=1, help="Number of observation frames to use as condition (for diffusion policy)")
-    parser.add_argument("--action_horizon", type=int, default=None, help="Action horizon for diffusion policy (default: same as chunk_size)")
+    parser.add_argument("--action_horizon", type=int, default=None, help="Action horizon for diffusion/flow_matching policy (default: same as chunk_size)")
     parser.add_argument("--prediction_horizon", type=int, default=None, help="Prediction horizon for diffusion policy (default: same as action_horizon)")
-    parser.add_argument("--num_inference_timesteps", type=int, default=16, help="Number of inference timesteps for diffusion policy (default: 16)")
+    parser.add_argument("--num_inference_timesteps", type=int, default=16, help="Number of inference timesteps for diffusion/flow_matching policy (default: 16 for diffusion, 10 for flow_matching)")
+    
+    # Flow Matching policy specific options
+    parser.add_argument("--num_train_timesteps", type=int, default=1000, help="Number of training timesteps for flow matching (default: 1000)")
+    parser.add_argument("--shift", type=float, default=1.0, help="Time scaling shift parameter for flow matching (default: 1.0)")
 
     parser.add_argument("--use_language", action="store_true")
     parser.add_argument("--language_encoder", type=str, default="distilbert", choices=["distilbert", "clip"])
