@@ -849,12 +849,11 @@ def main(args: Dict):
         raise ValueError("--use_splitted must be provided. Only SplittedEpisodicDataset format is supported.")
 
     if use_splitted:
-        # Unified interface: use new parameter names, fallback to old ones for backward compatibility
-        normal_root_dir = args.get("normal_root_dir") or args.get("splitted_root")
-        normal_val_root = args.get("normal_val_root") or args.get("val_splitted_root")
+        normal_root_dir = args.get("normal_root_dir")
+        normal_val_root = args.get("normal_val_root")
         
         if not normal_root_dir:
-            raise ValueError("--normal_root_dir (or --splitted_root) must be provided when --use_splitted is set")
+            raise ValueError("--normal_root_dir must be provided when --use_splitted is set")
         
         camera_names = args.get("camera_names", ["left_frame", "right_frame"])
         # Use chunk_size as unified interface for action sequence length
@@ -1061,9 +1060,8 @@ def main(args: Dict):
     if policy_type == "act":
         # ACT-specific config
         policy_config.update({
-            "enc_layers": args.get("enc_layers_num", 4),  # For backward compatibility
-            "cvae_enc_layers": args.get("cvae_enc_layers", None),
-            "transformer_enc_layers": args.get("transformer_enc_layers", None),
+            "cvae_enc_layers": args.get("cvae_enc_layers", 4),
+            "enc_layers_num": args.get("enc_layers_num", 4),
             "dec_layers": args.get("dec_layers_num", 7),
             "nheads": 8,
             "no_encoder": args.get("no_encoder", False),
@@ -1102,8 +1100,7 @@ def main(args: Dict):
             "image_width": args.get("image_width", None),
             # Transformer config (same as ACT, build_transformer expects "nheads" not "n_heads")
             "nheads": args.get("n_heads", 8),
-            "transformer_enc_layers": args.get("transformer_enc_layers", None),
-            "enc_layers": args.get("enc_layers_num", 4),  # For backward compatibility
+            "enc_layers_num": args.get("enc_layers_num", 4),
             "dec_layers": args.get("dec_layers_num", 4),
             "pre_norm": args.get("pre_norm", False),
             "use_gated_attention": args.get("use_gated_attention", True),
@@ -1113,8 +1110,18 @@ def main(args: Dict):
 
     # Set default best_model_metric based on policy type
     # ACT uses l1_loss_infer, diffusion/flow_matching use loss (MSE)
-    default_best_metric = "loss" if policy_type in ["diffusion", "flow_matching"] else "l1_loss_infer"
-    best_model_metric = args.get("best_model_metric", default_best_metric)
+    user_specified_metric = args.get("best_model_metric", "l1_loss_infer")
+    if policy_type in ["diffusion", "flow_matching"]:
+        # For diffusion/flow_matching, use "loss" (MSE) as default
+        # If user specified "l1_loss_infer" or "l1_loss" (ACT-specific metrics), override to "loss"
+        if user_specified_metric in ["l1_loss_infer", "l1_loss"]:
+            best_model_metric = "loss"
+        else:
+            # User explicitly set a valid metric (e.g., "total_loss" or "loss"), use it
+            best_model_metric = user_specified_metric
+    else:
+        # For ACT, use the specified metric (default is l1_loss_infer)
+        best_model_metric = user_specified_metric
     
     config = {
         "num_epochs": args["num_epochs"],
@@ -1151,9 +1158,8 @@ if __name__ == "__main__":
     parser.add_argument("--chunk_size", type=int, default=30)
     parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--dim_feedforward", type=int, default=3200)
-    parser.add_argument("--enc_layers_num", type=int, default=4, help="[Deprecated] Use --cvae_enc_layers and --transformer_enc_layers instead. If provided, sets both encoder layer counts.")
-    parser.add_argument("--cvae_enc_layers", type=int, default=None, help="Number of layers in CVAE encoder (default: same as --enc_layers_num if provided, else 4)")
-    parser.add_argument("--transformer_enc_layers", type=int, default=None, help="Number of layers in DETRTransformer encoder (default: same as --enc_layers_num if provided, else 4)")
+    parser.add_argument("--enc_layers_num", type=int, default=4, help="Number of layers in DETRTransformer encoder (default: 4). Unified name used across all policies.")
+    parser.add_argument("--cvae_enc_layers", type=int, default=4, help="Number of layers in CVAE encoder (ACT policy only, default: 4)")
     parser.add_argument("--dec_layers_num", type=int, default=7)
     parser.add_argument("--image_encoder", type=str, default="efficientnet_b3film")
     parser.add_argument("--gpu", type=int, default=None, help="GPU ID to use (default: auto-select first available GPU, or CPU if no GPU available)")
@@ -1189,8 +1195,6 @@ if __name__ == "__main__":
 
     # Dataset options
     parser.add_argument("--use_splitted", action="store_true")
-    parser.add_argument("--splitted_root", type=str, help="[Deprecated] Use --normal_root_dir instead. Root directory for splitted dataset (training data)")
-    parser.add_argument("--val_splitted_root", type=str, help="[Deprecated] Use --normal_val_root instead. Root directory for validation (splitted format)")
     parser.add_argument("--normal_root_dir", type=str, help="Root directory for normal datasets (training data). In DAgger mode: expert demonstrations. In normal mode: training datasets.")
     parser.add_argument("--normal_val_root", type=str, help="Root directory for normal validation datasets. In DAgger mode: expert validation. In normal mode: validation datasets.")
     parser.add_argument("--stage_embeddings_file", type=str)
@@ -1225,8 +1229,8 @@ if __name__ == "__main__":
         "--best_model_metric",
         type=str,
         default="l1_loss_infer",
-        choices=["total_loss", "l1_loss", "l1_loss_infer"],
-        help="Metric for selecting best model: 'total_loss' (l1 + kl_weight * kl), 'l1_loss' (reconstruction L1), or 'l1_loss_infer' (default, inference-mode L1 - reflects true inference capability)"
+        choices=["total_loss", "loss", "l1_loss", "l1_loss_infer"],
+        help="Metric for selecting best model: 'total_loss' or 'loss' (MSE loss, for diffusion/flow_matching), 'l1_loss' (reconstruction L1), or 'l1_loss_infer' (default for ACT, inference-mode L1)"
     )
     parser.add_argument("--constant_lr", action="store_true", help="Disable learning rate scheduler and keep LR constant")
     parser.add_argument("--save_ckpt_every", type=int, default=20, help="Interval size for saving best checkpoint within each interval [i*n, (i+1)*n) based on val l1 loss (default: 100)")

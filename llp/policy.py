@@ -223,13 +223,11 @@ class DiffusionPolicy(nn.Module):
 
         dummy_input = torch.randn(1, 3, img_h, img_w)
         if use_language:
-            print(f"Using FiLMed backbone: {backbone_name}")
             temp_backbone = FilMedBackbone(backbone_name)
             dummy_cmd = torch.randn(1, 768)
             with torch.no_grad():
                 dummy_feature = temp_backbone(dummy_input, dummy_cmd)
         else:
-            print(f"Using Robomimic ResNet18Conv backbone.")
             temp_backbone = ResNet18Conv(**{
                 "input_channel": 3,
                 "pretrained": False,
@@ -240,7 +238,12 @@ class DiffusionPolicy(nn.Module):
 
         _, c_out, h_out, w_out = dummy_feature.shape
         input_shape = (c_out, h_out, w_out)
-        print(f"Auto-detected backbone output shape: {input_shape} from input {img_h}x{img_w}")
+        print(f"Policy Type: Diffusion")
+        print(f"Using FiLMed Backbone: {use_language}")
+        if use_language:
+            print(f"Backbone type: {backbone_name}")
+        print(f"Input size: {img_h}x{img_w}")
+        print(f"Output shape: {input_shape}")
 
         del temp_backbone
 
@@ -250,11 +253,9 @@ class DiffusionPolicy(nn.Module):
 
         for _ in self.camera_names:
             if use_language:
-                print(f"Using FiLMed Backbone: {backbone_name}")
                 # initialize the FiLMed backbone
                 backbone = FilMedBackbone(backbone_name)
             else:
-                print(f"Using Robomimic ResNet18Conv backbone.")
                 backbone = ResNet18Conv(**{
                     "input_channel": 3,
                     "pretrained": False,
@@ -290,7 +291,7 @@ class DiffusionPolicy(nn.Module):
         # Use a safer replacement that handles channels not divisible by 16
         self.backbones = self._replace_bn_with_gn_safe(self.backbones)
 
-        # Get use_state flag (default True for backward compatibility)
+        # Get use_state flag
         self.use_state = args_override.get("use_state", True)
 
         # calculate Observation Dimension
@@ -663,34 +664,29 @@ class ActionHead(nn.Module):
         # Build the Transformer directly using config (same as ACT)
         # build_transformer expects an object with attributes, so convert dict to object if needed
         from additional_modules.DETRTransformer import build_transformer
+        from types import SimpleNamespace
         
+        # Convert config to dict, handling both dict and object types
         if isinstance(config, dict):
-            # Create a simple object wrapper for dict config
-            class ConfigObject:
-                def __init__(self, config_dict):
-                    # Copy all config values as attributes
-                    for key, value in config_dict.items():
-                        setattr(self, key, value)
-                    # Add missing defaults
-                    if not hasattr(self, "dropout"):
-                        self.dropout = 0.1
-                    if not hasattr(self, "nheads"):
-                        self.nheads = get_config("n_heads", 8)
-                    if not hasattr(self, "transformer_enc_layers"):
-                        self.transformer_enc_layers = None
-            
-            transformer_config = ConfigObject(config)
+            config_dict = config.copy()
         else:
-            # For object config, ensure attributes exist
-            transformer_config = config
-            if not hasattr(transformer_config, "dropout"):
-                transformer_config.dropout = 0.1
-            if not hasattr(transformer_config, "nheads"):
-                transformer_config.nheads = get_config("n_heads", 8)
-            if not hasattr(transformer_config, "transformer_enc_layers"):
-                transformer_config.transformer_enc_layers = None
+            # Convert object to dict using vars() or __dict__
+            config_dict = vars(config) if hasattr(config, '__dict__') else {}
+            # Fallback: manually extract common attributes
+            if not config_dict:
+                for attr in ['hidden_dim', 'dim_feedforward', 'enc_layers_num', 'dec_layers', 
+                            'nheads', 'dropout', 'pre_norm',
+                            'use_gated_attention', 'mlp_type', 'gate_mode']:
+                    if hasattr(config, attr):
+                        config_dict[attr] = getattr(config, attr)
         
-        # build_transformer will handle the rest
+        # Set defaults for transformer config
+        config_dict.setdefault("dropout", 0.1)
+        config_dict.setdefault("nheads", get_config("n_heads", 8))
+        config_dict.setdefault("enc_layers_num", 4)
+        
+        # Convert to SimpleNamespace for build_transformer
+        transformer_config = SimpleNamespace(**config_dict)
         self.transformer = build_transformer(transformer_config)
 
         # Project the observation features to the hidden dimension
@@ -704,10 +700,12 @@ class ActionHead(nn.Module):
         self.action_head = nn.Linear(hidden_dim, action_dim)
 
         # Timestep embedding
+        # Use SiLU (Swish) activation, commonly used in Diffusion/Flow Matching models
+        # and consistent with EfficientNet backbone in this codebase
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.Mish(),
+            nn.SiLU(),  # SiLU is more standard for generative models than Mish
             nn.Linear(hidden_dim, hidden_dim),
         )
 
@@ -851,7 +849,12 @@ class FlowMatchingPolicy(nn.Module):
         
         _, c_out, h_out, w_out = dummy_feature.shape
         input_shape = (c_out, h_out, w_out)
-        print(f"Flow Matching: Auto-detected backbone output shape: {input_shape} from input {img_h}x{img_w}")
+        print(f"Policy Type: Flow Matching")
+        print(f"Using FiLMed Backbone: {use_language}")
+        if use_language:
+            print(f"Backbone type: {backbone_name}")
+        print(f"Input size: {img_h}x{img_w}")
+        print(f"Output shape: {input_shape}")
         del temp_backbone
         
         # Build backbones, pools, and linears for each camera

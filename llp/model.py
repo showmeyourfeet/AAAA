@@ -410,10 +410,8 @@ def build_encoder(args) -> TransformerEncoder:
     GatedDETRDecoderLayer when use_gated_attention is enabled.
     Both encoder and decoder support mlp_type and gate_mode configuration.
     """
-    # Get CVAE encoder layers (backward compatible: use enc_layers if cvae_enc_layers not provided)
-    cvae_enc_layers = getattr(args, "cvae_enc_layers", None)
-    if cvae_enc_layers is None:
-        cvae_enc_layers = getattr(args, "enc_layers", 4)
+    # Get CVAE encoder layers
+    cvae_enc_layers = getattr(args, "cvae_enc_layers", 4)
     
     if getattr(args, "use_gated_attention", False):
         mlp_type = getattr(args, "mlp_type", "swiglu")
@@ -465,19 +463,17 @@ def build_act_model(args) -> DETRVAE:
     # Build transformer (decoder supports GatedDETRDecoderLayer when use_gated_attention is enabled)
     transformer = build_transformer(args)
 
-    # Decoder-only architecture: --no_encoder + transformer_enc_layers=0
+    # Decoder-only architecture: --no_encoder + enc_layers_num=0
     # This creates a simpler architecture without CVAE encoder and Transformer encoder
     # Pros: Fewer parameters, faster inference, simpler training (no KL divergence)
     # Cons: Less expressive, no uncertainty modeling, may need stronger decoder
-    transformer_enc_layers = getattr(args, "transformer_enc_layers", None)
-    if transformer_enc_layers is None:
-        transformer_enc_layers = getattr(args, "enc_layers", 4)
+    transformer_enc_layers = getattr(args, "enc_layers_num", 4)
     is_decoder_only = args.no_encoder and transformer_enc_layers == 0
     if is_decoder_only:
         print("=" * 60)
         print("Using Decoder-Only Architecture:")
         print("  - CVAE encoder: DISABLED (--no_encoder)")
-        print("  - Transformer encoder: DISABLED (transformer_enc_layers=0)")
+        print("  - Transformer encoder: DISABLED (enc_layers_num=0)")
         print("  - Only Transformer decoder is active")
         print("  - Latent input will be zero vector")
         print("=" * 60)
@@ -554,9 +550,8 @@ def get_args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--position_embedding", default="sine", type=str, choices=("sine", "learned", "v2", "v3"))
     parser.add_argument("--camera_names", default=[], type=list)
 
-    parser.add_argument("--enc_layers", default=4, type=int, help="[Deprecated] Use --cvae_enc_layers and --transformer_enc_layers instead. If provided, sets both encoder layer counts.")
-    parser.add_argument("--cvae_enc_layers", default=None, type=int, help="Number of layers in CVAE encoder (default: same as --enc_layers if provided, else 4)")
-    parser.add_argument("--transformer_enc_layers", default=None, type=int, help="Number of layers in DETRTransformer encoder (default: same as --enc_layers if provided, else 4)")
+    parser.add_argument("--cvae_enc_layers", default=4, type=int, help="Number of layers in CVAE encoder (ACT policy only, default: 4)")
+    parser.add_argument("--enc_layers_num", default=4, type=int, help="Number of layers in DETRTransformer encoder (default: 4). Unified name used across all policies.")
     parser.add_argument("--dec_layers", default=6, type=int)
     parser.add_argument("--dim_feedforward", default=2048, type=int)
     parser.add_argument("--hidden_dim", default=256, type=int)
