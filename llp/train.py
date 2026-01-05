@@ -1076,19 +1076,47 @@ def main(args: Dict):
     elif policy_type == "diffusion":
         # Diffusion-specific config
         # Use chunk_size as unified interface for action sequence length
+        noise_pred_arch = args.get("noise_pred_arch", "unet")  # Default to "unet" for diffusion
+        # Use chunk_size as action_horizon (unified interface)
+        action_horizon = args["chunk_size"]
         policy_config.update({
             "observation_horizon": args.get("observation_horizon", 1),
-            "action_horizon": args["chunk_size"],  # Use chunk_size
-            "prediction_horizon": args.get("prediction_horizon", args["chunk_size"]),  # Default to chunk_size
+            "action_horizon": action_horizon,
+            "prediction_horizon": args.get("prediction_horizon", action_horizon),  # Default to action_horizon
             "num_inference_timesteps": args.get("num_inference_timesteps", 16),
             "action_dim": stats.get("action_mean", np.zeros(0)).shape[0] if "action_mean" in stats else 20,
             "image_size": args.get("image_size", 224),
             "image_height": args.get("image_height", None),
             "image_width": args.get("image_width", None),
+            "noise_pred_arch": noise_pred_arch,
         })
+        
+        # Add transformer config if using dit architecture
+        if noise_pred_arch == "dit":
+            # Warn if enc_layers_num is provided (DiT is decoder-only, no encoder)
+            if args.get("enc_layers_num") is not None:
+                print(
+                    "Warning: --enc_layers_num is ignored for DiT architecture (decoder-only, no encoder). "
+                    "Use --dec_layers_num to control the number of DiT blocks."
+                )
+            policy_config.update({
+                "hidden_dim": args.get("hidden_dim", 256),  # Default 256 for dit in diffusion
+                "nheads": args.get("nheads") or args.get("n_heads", 8),
+                # Note: enc_layers_num is not used for DiT (decoder-only architecture)
+                "dec_layers": args.get("dec_layers_num", 6),  # Default 6 for dit
+                "dim_feedforward": args.get("dim_feedforward", 1024),  # Default 1024 for DiT
+                "dropout": args.get("dropout", 0.1),
+                "pre_norm": args.get("pre_norm", False),
+                "use_gated_attention": args.get("use_gated_attention", False),
+                "mlp_type": args.get("mlp_type", "standard"),  # Default to standard MLP for DiT
+                "gate_mode": args.get("gate_mode", "element-wise"),
+                "activation": args.get("activation", "gelu"),
+            })
     elif policy_type == "flow_matching":
         # Flow Matching-specific config
         # Use chunk_size as unified interface for action sequence length
+        # Default to "unet" for flow_matching, but allow switching to "dit"
+        noise_pred_arch = args.get("noise_pred_arch", "unet")
         policy_config.update({
             "action_seq_len": args["chunk_size"],  # Use chunk_size
             "action_dim": stats.get("action_mean", np.zeros(0)).shape[0] if "action_mean" in stats else 20,
@@ -1098,15 +1126,30 @@ def main(args: Dict):
             "image_size": args.get("image_size", 224),
             "image_height": args.get("image_height", None),
             "image_width": args.get("image_width", None),
-            # Transformer config (same as ACT, build_transformer expects "nheads" not "n_heads")
-            "nheads": args.get("n_heads", 8),
-            "enc_layers_num": args.get("enc_layers_num", 4),
-            "dec_layers": args.get("dec_layers_num", 4),
-            "pre_norm": args.get("pre_norm", False),
-            "use_gated_attention": args.get("use_gated_attention", True),
-            "mlp_type": args.get("mlp_type", "swiglu"),
-            "gate_mode": args.get("gate_mode", "element-wise"),
+            "noise_pred_arch": noise_pred_arch,
         })
+        
+        # Add transformer config if using standard DiT architecture
+        if noise_pred_arch == "dit":
+            # Warn if enc_layers_num is provided (DiT is decoder-only, no encoder)
+            if args.get("enc_layers_num") is not None:
+                print(
+                    "Warning: --enc_layers_num is ignored for DiT architecture (decoder-only, no encoder). "
+                    "Use --dec_layers_num to control the number of DiT blocks."
+                )
+            # Standard DiT config
+            policy_config.update({
+                "hidden_dim": args.get("hidden_dim", 256),
+                "dec_layers": args.get("dec_layers_num", 6),
+                "nheads": args.get("nheads") or args.get("n_heads", 8),
+                "dim_feedforward": args.get("dim_feedforward", 1024),  # Default 1024 for DiT
+                "dropout": args.get("dropout", 0.1),
+                "activation": args.get("activation", "gelu"),
+                "mlp_type": args.get("mlp_type", "standard"),  # Default to standard MLP for DiT
+                "use_gated_attention": args.get("use_gated_attention", False),
+                "gate_mode": args.get("gate_mode", "element-wise"),
+            })
+        # Note: UNet config is handled by ConditionalUnet1D defaults
 
     # Set default best_model_metric based on policy type
     # ACT uses l1_loss_infer, diffusion/flow_matching use loss (MSE)
@@ -1153,18 +1196,55 @@ if __name__ == "__main__":
     parser.add_argument("--policy_type", type=str, default="act", choices=["act", "diffusion", "flow_matching"], 
                         help="Policy type: 'act' for ACT policy (default), 'diffusion' for Diffusion policy, or 'flow_matching' for Flow Matching policy")
 
-    # Model options
+    # Model options (shared across policies where applicable)
     parser.add_argument("--kl_weight", type=float, default=1.0)
     parser.add_argument("--chunk_size", type=int, default=30)
-    parser.add_argument("--hidden_dim", type=int, default=512)
-    parser.add_argument("--dim_feedforward", type=int, default=3200)
-    parser.add_argument("--enc_layers_num", type=int, default=4, help="Number of layers in DETRTransformer encoder (default: 4). Unified name used across all policies.")
-    parser.add_argument("--cvae_enc_layers", type=int, default=4, help="Number of layers in CVAE encoder (ACT policy only, default: 4)")
-    parser.add_argument("--dec_layers_num", type=int, default=7)
+    parser.add_argument(
+        "--hidden_dim",
+        type=int,
+        default=512,
+        help="Transformer hidden dimension. Used by ACT DETR decoder and by DiT when noise_pred_arch='dit'.",
+    )
+    parser.add_argument(
+        "--dim_feedforward",
+        type=int,
+        default=3200,
+        help="Transformer FFN dimension. Used by ACT DETR and DiT (for DiT, this is the MLP feedforward dimension).",
+    )
+    parser.add_argument(
+        "--enc_layers_num",
+        type=int,
+        default=4,
+        help="Number of encoder layers in DETRTransformer (ACT only). Ignored by diffusion/flow_matching DiT.",
+    )
+    parser.add_argument(
+        "--cvae_enc_layers",
+        type=int,
+        default=4,
+        help="Number of layers in CVAE encoder (ACT policy only, default: 4).",
+    )
+    parser.add_argument(
+        "--dec_layers_num",
+        type=int,
+        default=7,
+        help="Number of decoder layers. Used by ACT DETR decoder and as DiT depth when noise_pred_arch='dit'.",
+    )
     parser.add_argument("--image_encoder", type=str, default="efficientnet_b3film")
     parser.add_argument("--gpu", type=int, default=None, help="GPU ID to use (default: auto-select first available GPU, or CPU if no GPU available)")
-    parser.add_argument("--mlp_type", type=str, default="swiglu", choices=["swiglu", "standard"], help="MLP block type for Transformer FFN")
-    parser.add_argument("--gate_mode", type=str, default="element-wise", choices=["element-wise", "head-wise"], help="Gated attention mode")
+    parser.add_argument(
+        "--mlp_type",
+        type=str,
+        default="swiglu",
+        choices=["swiglu", "standard"],
+        help="MLP block type for Transformer FFN (ACT DETR and DiT).",
+    )
+    parser.add_argument(
+        "--gate_mode",
+        type=str,
+        default="element-wise",
+        choices=["element-wise", "head-wise"],
+        help="Gated attention mode (only relevant when use_gated_attention is enabled).",
+    )
     parser.add_argument("--multi_gpu", action="store_true")
     parser.add_argument("--no_state", action="store_true", help="Disable qpos/state inputs throughout training/inference pipeline")
     parser.add_argument("--no_encoder", action="store_true", help="Disable VAE encoder, use zero latent vector instead")
@@ -1174,15 +1254,45 @@ if __name__ == "__main__":
     parser.add_argument(
         "--use_gated_attention",
         action="store_true",
-        help="Use gated attention in DETR transformer and encoder (ablation flag)",
+        help="Use gated attention in DETR/Transformer blocks (ablation flag).",
     )
     parser.add_argument("--shared_backbone", type=lambda x: x.lower() in ('true', '1', 'yes'), default=None, help="Whether to share backbone across cameras (default: auto-detect based on use_language and image_encoder)")
 
-    # Diffusion policy specific options
+    # Sequence policy options (diffusion & flow_matching)
     parser.add_argument("--observation_horizon", type=int, default=1, help="Number of observation frames to use as condition (for diffusion policy)")
-    parser.add_argument("--action_horizon", type=int, default=None, help="Action horizon for diffusion/flow_matching policy (default: same as chunk_size)")
-    parser.add_argument("--prediction_horizon", type=int, default=None, help="Prediction horizon for diffusion policy (default: same as action_horizon)")
-    parser.add_argument("--num_inference_timesteps", type=int, default=16, help="Number of inference timesteps for diffusion/flow_matching policy (default: 16 for diffusion, 10 for flow_matching)")
+    parser.add_argument("--prediction_horizon", type=int, default=None, help="Prediction horizon for diffusion policy inference (default: same as chunk_size/action_horizon). Allows predicting shorter sequences than training length.")
+    parser.add_argument(
+        "--num_inference_timesteps",
+        type=int,
+        default=16,
+        help="Number of inference timesteps for diffusion/flow_matching policy (default: 16 for diffusion, 10 for flow_matching).",
+    )
+    parser.add_argument(
+        "--noise_pred_arch",
+        type=str,
+        default=None,
+        choices=["unet", "dit"],
+        help="Noise prediction architecture for diffusion/flow_matching: 'unet' or 'dit' (standard DiT). Ignored by ACT.",
+    )
+    parser.add_argument(
+        "--nheads",
+        type=int,
+        default=None,
+        help="Number of attention heads for Transformer/DiT (default: 8). Used by ACT DETR and by DiT when noise_pred_arch='dit'.",
+    )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.1,
+        help="Dropout rate for DiT blocks (default: 0.1). Only used when noise_pred_arch='dit'.",
+    )
+    parser.add_argument(
+        "--activation",
+        type=str,
+        default="gelu",
+        choices=["gelu", "relu"],
+        help="Activation function for DiT MLP blocks (default: gelu). Only used when noise_pred_arch='dit'.",
+    )
     
     # Flow Matching policy specific options
     parser.add_argument("--num_train_timesteps", type=int, default=1000, help="Number of training timesteps for flow matching (default: 1000)")

@@ -7,10 +7,14 @@ import torch.nn as nn
 from torch.nn import functional as F
 import numpy as np
 import math
+from typing import Optional
 from torch.distributions import Beta
 
 from .model import build_act_model_and_optimizer
 
+from llp.robomimic_utils import ResNet18Conv, ResNet50Conv, SpatialSoftmax, ConditionalUnet1D
+from llp.diffusers_utils import DDIMScheduler, EMAModel
+from llp.backbone_impl import FilMedBackbone
 
 class ACTPolicy(nn.Module):
     def __init__(self, args_override: dict) -> None:
@@ -167,23 +171,16 @@ def kl_divergence(mu: torch.Tensor, logvar: torch.Tensor):
 class DiffusionPolicy(nn.Module):
     def __init__(self, args_override: dict) -> None:
         super().__init__()
-        from robomimic.models.base_nets import ResNet18Conv, ResNet50Conv, SpatialSoftmax
-        from robomimic.models.diffusion_policy_nets import ConditionalUnet1D
-        from robomimic.algo.diffusion_policy import replace_bn_with_gn
-        from diffusers.schedulers.scheduling_ddim import DDIMScheduler
-        from diffusers.training_utils import EMAModel
-        from llp.backbone_impl import FilMedBackbone
-
 
         self.camera_names = args_override['camera_names']
         self.observation_horizon = args_override.get('observation_horizon', 1)
         self.action_horizon = args_override.get("action_horizon", args_override.get("num_queries", 30))      #  close to action chunk size
         self.prediction_horizon = args_override.get("prediction_horizon", self.action_horizon)
         
-        # num_queries 用于兼容 train.py 的接口
+        # num_queries are used for compatibility with train.py interface
         self.num_queries = self.action_horizon
         
-        # 警告：若 observation_horizon > 1，需要确保 __call__ 中输入维度正确展平
+        # if observation_horizon > 1, ensure input dimensions are correctly flattened in __call__
         if self.observation_horizon > 1:
              print(f"Warning: observation_horizon is {self.observation_horizon}. Ensure input formatting flattens history correctly.")
 
@@ -287,6 +284,9 @@ class DiffusionPolicy(nn.Module):
         self.pools = nn.ModuleList(pools)
         self.linears = nn.ModuleList(linears)
 
+        # Replace BatchNorm with GroupNorm for better stability on small batches
+        self.backbones = self._replace_bn_with_gn_safe(self.backbones)
+
         # replace the batch norm with group norm to fit the small batch size
         # Use a safer replacement that handles channels not divisible by 16
         self.backbones = self._replace_bn_with_gn_safe(self.backbones)
@@ -307,12 +307,64 @@ class DiffusionPolicy(nn.Module):
         if use_language:
             self.observation_dim += self.feature_dim  # Add projected language embedding dimension
 
-        # core diffusion model: Conditional U-Net
-        # Note: observation_condition will be flattened if observation_horizon > 1
-        self.noise_pred_net = ConditionalUnet1D(
-            input_dim = self.action_dim,
-            global_cond_dim = self.observation_dim * self.observation_horizon,
-        )
+        # Choose noise prediction architecture: "unet" or "dit" (standard DiT)
+        noise_pred_arch = args_override.get("noise_pred_arch", "unet")
+        if noise_pred_arch is None:
+            noise_pred_arch = "unet"
+        noise_pred_arch = noise_pred_arch.lower()
+        self.noise_pred_arch = noise_pred_arch
+        
+        if noise_pred_arch == "unet":
+            # core diffusion model: Conditional U-Net
+            # Note: observation_condition will be flattened if observation_horizon > 1
+            self.noise_pred_net = ConditionalUnet1D(
+                input_dim=self.action_dim,
+                global_cond_dim=self.observation_dim * self.observation_horizon,
+            )
+        elif noise_pred_arch == "dit":
+            # Standard DiT (Diffusion Transformer) for diffusion policy
+            from additional_modules.DiffusionTransformer import DiT
+
+            hidden_dim = args_override.get("hidden_dim", 256)
+            depth = args_override.get("dec_layers", args_override.get("dec_layers_num", 6))
+            num_heads = args_override.get("nheads", args_override.get("n_heads", 8))
+            max_seq_len = self.action_horizon
+            use_gated_attention = args_override.get("use_gated_attention", False)
+            gate_mode = args_override.get("gate_mode", "element-wise")
+            dropout = args_override.get("dropout", 0.0)
+            activation = args_override.get("activation", "gelu")
+            dim_feedforward = args_override.get("dim_feedforward", 1024)  # Default 1024 for DiT
+            mlp_type = args_override.get("mlp_type", "standard")
+
+            # DiT expects:
+            # - input_dim: action dimension
+            # - hidden_size: transformer width
+            # - depth: number of DiT blocks
+            # - num_heads: attention heads
+            # - max_seq_len: action sequence length
+            # - obs_dim: dimension of global observation feature (flattened over horizon)
+            # - use_gated_attention: whether to use gated attention (optional)
+            # - gate_mode: gating mode ("element-wise" or "head-wise")
+            # - mlp_type: MLP type ("standard" or "swiglu")
+            # - dim_feedforward: MLP feedforward dimension
+            self.noise_pred_net = DiT(
+                input_dim=self.action_dim,
+                hidden_size=hidden_dim,
+                depth=depth,
+                num_heads=num_heads,
+                max_seq_len=max_seq_len,
+                obs_dim=self.observation_dim * self.observation_horizon,
+                use_gated_attention=use_gated_attention,
+                gate_mode=gate_mode,
+                dropout=dropout,
+                activation=activation,
+                dim_feedforward=dim_feedforward,
+                mlp_type=mlp_type,
+            )
+            gated_info = f" with gated attention ({gate_mode})" if use_gated_attention else ""
+            print(f"Using standard DiT (Diffusion Transformer) for noise prediction{gated_info}")
+        else:
+            raise ValueError(f"Unknown noise_pred_arch: {noise_pred_arch}. Must be 'unet' or 'dit'")
 
         nets_dict = {
             "backbones": self.backbones,
@@ -322,7 +374,6 @@ class DiffusionPolicy(nn.Module):
         }
 
         if use_language:
-            # Modified: 定义层必须在赋值之前
             self.lang_embed_proj = nn.Linear(
                 self.lang_embed_dim, self.feature_dim
             )
@@ -422,7 +473,7 @@ class DiffusionPolicy(nn.Module):
             encode_command: Ignored for diffusion policy (kept for interface compatibility)
         """
 
-        B = qpos.shape[0]
+        bs = qpos.shape[0]
 
         nets = self.nets
         all_features = []
@@ -473,7 +524,7 @@ class DiffusionPolicy(nn.Module):
             # Repeat the current observation to match observation_horizon
             # In a proper implementation, you would concatenate historical observations here
             observation_condition = observation_condition.unsqueeze(1).repeat(1, self.observation_horizon, 1)
-            observation_condition = observation_condition.reshape(B, -1)  # Flatten: [B, observation_dim * observation_horizon]
+            observation_condition = observation_condition.reshape(bs, -1)  # Flatten: [bs, observation_dim * observation_horizon]
 
         # ------------------------------------------- Training Mode -------------------------------------------
         if actions is not None:
@@ -483,8 +534,8 @@ class DiffusionPolicy(nn.Module):
             # sample diffusion timesteps
             timesteps = torch.randint(
                 0,
-                self.noise_scheduler.config.num_train_timesteps,
-                (B,),
+                self.noise_scheduler.num_train_timesteps,
+                (bs,),
                 device=observation_condition.device,
             ).long()
 
@@ -533,13 +584,13 @@ class DiffusionPolicy(nn.Module):
             action_dim = self.action_dim
 
             noisy_actions = torch.randn(
-                (B, Tp, action_dim),
+                (bs, Tp, action_dim),
                 device = observation_condition.device,
             )
             naction = noisy_actions
 
             # configure diffusion steps (less than training steps, accelerate inference)
-            self.noise_scheduler.set_timesteps(self.num_inference_timesteps)
+            self.noise_scheduler.set_timesteps(self.num_inference_timesteps, device=observation_condition.device)
 
             # reverse diffusion process step by step
             for k in self.noise_scheduler.timesteps:
@@ -617,168 +668,6 @@ class DiffusionPolicy(nn.Module):
 # Flow Matching Policy (The pi_0/0.5/*0.6 style flow matching policy)
 # ============================================================================
 
-class SinusoidalPosEmb(nn.Module):
-    """
-    1-D sinusoidal position encoding for Diffusion/Flow Matching timesteps.
-    The PositionEmbeddingSine in DETRTransformer is generally 2D (H, W), which is not suitable for timesteps.
-    """
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, x):
-        device = x.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
-        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb
-
-class ActionHead(nn.Module):
-    """
-    DETR-style Action Expert for the flow matching policy.
-    """
-
-    def __init__(
-        self,
-        config
-    ):
-        super().__init__()
-        self.config = config
-
-        # Helper function to get config value (supports both dict and object)
-        def get_config(key, default=None):
-            if isinstance(config, dict):
-                value = config.get(key, default)
-            else:
-                value = getattr(config, key, default)
-            # If value is None, return default
-            return value if value is not None else default
-
-        # config parameters
-        hidden_dim = get_config("hidden_dim")
-        action_dim = get_config("action_dim")
-        self.seq_len = get_config("action_seq_len")
-
-        # Build the Transformer directly using config (same as ACT)
-        # build_transformer expects an object with attributes, so convert dict to object if needed
-        from additional_modules.DETRTransformer import build_transformer
-        from types import SimpleNamespace
-        
-        # Convert config to dict, handling both dict and object types
-        if isinstance(config, dict):
-            config_dict = config.copy()
-        else:
-            # Convert object to dict using vars() or __dict__
-            config_dict = vars(config) if hasattr(config, '__dict__') else {}
-            # Fallback: manually extract common attributes
-            if not config_dict:
-                for attr in ['hidden_dim', 'dim_feedforward', 'enc_layers_num', 'dec_layers', 
-                            'nheads', 'dropout', 'pre_norm',
-                            'use_gated_attention', 'mlp_type', 'gate_mode']:
-                    if hasattr(config, attr):
-                        config_dict[attr] = getattr(config, attr)
-        
-        # Set defaults for transformer config
-        config_dict.setdefault("dropout", 0.1)
-        config_dict.setdefault("nheads", get_config("n_heads", 8))
-        config_dict.setdefault("enc_layers_num", 4)
-        
-        # Convert to SimpleNamespace for build_transformer
-        transformer_config = SimpleNamespace(**config_dict)
-        self.transformer = build_transformer(transformer_config)
-
-        # Project the observation features to the hidden dimension
-        obs_dim = get_config("obs_dim")
-        self.obs_proj = nn.Linear(obs_dim, hidden_dim)
-
-        # Project the action features to the hidden dimension
-        self.action_proj = nn.Linear(action_dim, hidden_dim)
-
-        # Re-project the hidden dimension to the action dimension (predict Vector Field)
-        self.action_head = nn.Linear(hidden_dim, action_dim)
-
-        # Timestep embedding
-        # Use SiLU (Swish) activation, commonly used in Diffusion/Flow Matching models
-        # and consistent with EfficientNet backbone in this codebase
-        self.time_mlp = nn.Sequential(
-            SinusoidalPosEmb(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),  # SiLU is more standard for generative models than Mish
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-
-        # Sequence Positional Embedding
-        # For distinguishing different time steps in the action sequence
-        self.action_pos_embed = nn.Embedding(self.seq_len, hidden_dim)
-    
-    def forward(
-        self,
-        obs_embed,
-        noisy_action,
-        timestep
-    ):
-        """
-        Args:
-            obs_emb: [bs, N, obs_dim] (Image Patch Features) or [bs, obs_dim] (Global Features)
-            noisy_action: [bs, seq, action_dim] (action with noise)
-            timesteps: [bs] (Timesteps)
-        """
-        bs, seq, _ = noisy_action.shape
-
-        # --------------------- input processing ---------------------
-        # preparing the observation features (Memory/Encoder features)
-        if len(obs_embed.shape) == 2:
-            obs_embed = obs_embed.unsqueeze(1) # [bs, 1, obs_dim]
-        src = self.obs_proj(obs_embed) # [bs, 1, hidden_dim]
-
-        # DETR generally need the (seq, bs, dim) format for the memory features
-        src = src.permute(1, 0, 2) # [1, bs, hidden_dim]
-
-        # preparing the action Queries (Target / Decoder inputs)
-        tgt = self.action_proj(noisy_action) # [bs, seq, hidden_dim]
-
-        # time conditioning
-        time_emb = self.time_mlp(timestep) # [bs, hidden_dim]
-
-        # sequence positional embedding
-        tgt = tgt + time_emb.unsqueeze(1) # [bs, seq, hidden_dim]
-
-        tgt = tgt.permute(1, 0, 2) # [seq, bs, hidden_dim]
-
-        # --------------------- Positional Embeddings ---------------------
-        # Query Positional Embedding (slice to match actual sequence length)
-        action_pos_embed = self.action_pos_embed.weight[:seq].unsqueeze(1).repeat(1, bs, 1) # [seq, bs, hidden_dim]
-
-        # Src Positional Embedding
-        src_pos = torch.zeros_like(src)
-
-        # --------------------- Transformer Forward Pass ---------------------
-        # Encoder: observation features
-        memory = self.transformer.encoder(
-            src,
-            pos = src_pos,
-        )
-
-        # Decoder: action features
-        hs = self.transformer.decoder(
-            tgt,
-            memory,
-            pos = src_pos,
-            query_pos = action_pos_embed,
-        )
-
-        # hs is generally a list of intermediate outputs from each layer
-        # we take the last layer output for the final prediction
-        hs = hs[-1].permute(1, 0, 2) # [bs, seq, hidden_dim] (permute from [seq, bs, hidden_dim])
-
-        # --------------------- Action Prediction ---------------------
-        # Predict the Vector Field
-        action_pred = self.action_head(hs) # [bs, seq, action_dim]
-
-        return action_pred
-
 class FlowMatchingPolicy(nn.Module):
     """
     Flow Matching Policy for the flow matching training.
@@ -810,7 +699,7 @@ class FlowMatchingPolicy(nn.Module):
         
         # Build observation feature extractor (similar to DiffusionPolicy)
         from llp.backbone_impl import FilMedBackbone
-        from robomimic.models.base_nets import ResNet18Conv, SpatialSoftmax
+        from llp.robomimic_utils import ResNet18Conv, SpatialSoftmax
         
         backbone_name = get_config("backbone", "efficientnet_b3film")
         use_language = get_config("use_language", False)
@@ -903,31 +792,68 @@ class FlowMatchingPolicy(nn.Module):
             self.lang_embed_proj = nn.Linear(self.lang_embed_dim, self.feature_dim)
             self.observation_dim += self.feature_dim
         
-        # action generation expert
-        # Update config with observation dimension (create a copy to avoid modifying original)
-        if isinstance(config, dict):
-            config_with_obs = config.copy()
-            config_with_obs["obs_dim"] = self.observation_dim
-        else:
-            # If config is an object, create a dict-like wrapper
-            class ConfigWrapper:
-                def __init__(self, original_config, obs_dim):
-                    self._original = original_config
-                    self.obs_dim = obs_dim
-                def __getattr__(self, key):
-                    if key == "obs_dim":
-                        return self.obs_dim
-                    return getattr(self._original, key)
-                def get(self, key, default=None):
-                    if key == "obs_dim":
-                        return self.obs_dim
-                    return getattr(self._original, key, default)
-            config_with_obs = ConfigWrapper(config, self.observation_dim)
+        # Choose noise prediction architecture: "dit" (standard DiT), or "unet"
+        noise_pred_arch = get_config("noise_pred_arch", "dit").lower()
+        self.noise_pred_arch = noise_pred_arch
         
-        self.model = ActionHead(config_with_obs)
+        if noise_pred_arch == "dit":
+            # Standard DiT (Diffusion Transformer) for flow matching
+            from additional_modules.DiffusionTransformer import DiT
+            
+            hidden_dim = get_config("hidden_dim", 256)
+            depth = get_config("dec_layers", get_config("dec_layers_num", 6))
+            num_heads = get_config("nheads", get_config("n_heads", 8))
+            max_seq_len = get_config("action_seq_len", 60)
+            use_gated_attention = get_config("use_gated_attention", False)
+            gate_mode = get_config("gate_mode", "element-wise")
+            dropout = get_config("dropout", 0.0)
+            activation = get_config("activation", "gelu")
+            dim_feedforward = get_config("dim_feedforward", 1024)  # Default 1024 for DiT
+            mlp_type = get_config("mlp_type", "standard")
+            
+            # DiT expects:
+            # - input_dim: action dimension
+            # - hidden_size: transformer width
+            # - depth: number of DiT blocks
+            # - num_heads: attention heads
+            # - max_seq_len: action sequence length
+            # - obs_dim: dimension of global observation feature
+            # - use_gated_attention: whether to use gated attention (optional)
+            # - gate_mode: gating mode ("element-wise" or "head-wise")
+            # - mlp_type: MLP type ("standard" or "swiglu")
+            # - dim_feedforward: MLP feedforward dimension
+            self.model = DiT(
+                input_dim=self.action_dim,
+                hidden_size=hidden_dim,
+                depth=depth,
+                num_heads=num_heads,
+                max_seq_len=max_seq_len,
+                obs_dim=self.observation_dim,
+                use_gated_attention=use_gated_attention,
+                gate_mode=gate_mode,
+                dropout=dropout,
+                activation=activation,
+                dim_feedforward=dim_feedforward,
+                mlp_type=mlp_type,
+            )
+            gated_info = f" with gated attention ({gate_mode})" if use_gated_attention else ""
+            print(f"Using standard DiT (Diffusion Transformer) for vector field prediction{gated_info}")
+        elif noise_pred_arch == "unet":
+            # U-Net for flow matching (alternative architecture)
+            from llp.robomimic_utils import ConditionalUnet1D
+            
+            # For flow matching, we need to adapt ConditionalUnet1D
+            # The observation condition will be the global condition
+            self.model = ConditionalUnet1D(
+                input_dim=self.action_dim,
+                global_cond_dim=self.observation_dim,
+            )
+            print(f"Using U-Net for vector field prediction")
+        else:
+            raise ValueError(f"Unknown noise_pred_arch: {noise_pred_arch}. Must be 'dit' or 'unet'")
         
         # flow scheduler
-        from .flow_scheduler import FlowMatchEulerDiscreteScheduler
+        from .diffusers_utils import FlowMatchEulerDiscreteScheduler
         self.scheduler = FlowMatchEulerDiscreteScheduler(
             num_train_timesteps = get_config("num_train_timesteps", 1000),
             shift = get_config("shift", 1.0),
@@ -941,6 +867,56 @@ class FlowMatchingPolicy(nn.Module):
         # Inference timesteps
         self.num_inference_timesteps = get_config("num_inference_timesteps", 10)
 
+        # EMA model for more stable inference, similar to DiffusionPolicy
+        self.ema_power = get_config("ema_power", 0.75)
+        self.ema = EMAModel(
+            model=self.model,
+            power=self.ema_power,
+        )
+
+    def _replace_bn_with_gn_safe(self, module_list):
+        """
+        Safely replace BatchNorm with GroupNorm, handling cases where
+        num_channels is not divisible by the desired num_groups.
+        """
+        def safe_replace_bn(module):
+            for name, child in list(module.named_children()):
+                if isinstance(child, nn.BatchNorm2d):
+                    num_channels = child.num_features
+                    # Try to find a suitable num_groups
+                    # Prefer groups of 8, 16, or 32, but ensure divisibility
+                    num_groups = None
+                    for preferred_groups in [32, 16, 8]:
+                        if num_channels % preferred_groups == 0:
+                            num_groups = preferred_groups
+                            break
+
+                    # If no preferred group size works, use the largest divisor <= 32
+                    if num_groups is None:
+                        for g in range(32, 0, -1):
+                            if num_channels % g == 0:
+                                num_groups = g
+                                break
+
+                    # Fallback: use num_channels (equivalent to LayerNorm)
+                    if num_groups is None:
+                        num_groups = num_channels
+
+                    # Create GroupNorm with matching affine parameters
+                    gn = nn.GroupNorm(num_groups, num_channels, eps=child.eps, affine=child.affine)
+                    if child.affine:
+                        gn.weight.data.copy_(child.weight.data)
+                        gn.bias.data.copy_(child.bias.data)
+                    setattr(module, name, gn)
+                else:
+                    # Recursively process child modules
+                    safe_replace_bn(child)
+            return module
+
+        for i, backbone in enumerate(module_list):
+            safe_replace_bn(backbone)
+        return module_list
+
     def sample_timesteps(
         self,
         batch_size,
@@ -949,9 +925,9 @@ class FlowMatchingPolicy(nn.Module):
         """
         Sample timesteps from the beta distribution: p(tau) ~ Beta((s-tau)/s; 1.5, 1.0).
         Note: if x = (s - tau) / s, then x ~ Beta(1.5, 1.0)
-        Then, tau = s * (1 - x)
-        s * x = s - tau
-        tau = s * (1 - x)
+              Then, tau = s * (1 - x)
+              s * x = s - tau
+              tau = s * (1 - x)
         Args:
             batch_size: int
             device: str
@@ -1080,8 +1056,15 @@ class FlowMatchingPolicy(nn.Module):
         # project the tau to the hidden dimension range.
         model_timesteps = tau * self.scheduler.num_train_timesteps
 
-        # Ensure the observation features is just took as the key/value in the cross-attention..
-        pred_vfield = self.model(obs_embed, x_tau, model_timesteps)
+        # Call model based on architecture type
+        if self.noise_pred_arch == "dit":
+            # Standard DiT interface: (x, timestep, global_cond)
+            pred_vfield = self.model(x=x_tau, timestep=model_timesteps, global_cond=obs_embed)
+        elif self.noise_pred_arch == "unet":
+            # UNet (ConditionalUnet1D) interface: (sample, timestep, global_cond)
+            pred_vfield = self.model(sample=x_tau, timestep=model_timesteps, global_cond=obs_embed)
+        else:
+            raise ValueError(f"Unknown noise_pred_arch: {self.noise_pred_arch}")
 
         # ------------------------ Calculate Loss ------------------------
         # Handle padding mask similar to diffusion policy
@@ -1096,6 +1079,10 @@ class FlowMatchingPolicy(nn.Module):
             loss = (all_loss * mask).sum() / valid.clamp(min=1)
         else:
             loss = all_loss.mean()
+
+        # Update EMA weights during training (only for the core flow model)
+        if self.training and getattr(self, "ema", None) is not None:
+            self.ema.step(self.model)
 
         return {
             "loss": loss,
@@ -1120,6 +1107,9 @@ class FlowMatchingPolicy(nn.Module):
 
         self.scheduler.set_timesteps(num_inference_steps, device=device)
 
+        # Use EMA-averaged core model for inference if available
+        core_model = self.ema.averaged_model if getattr(self, "ema", None) is not None else self.model
+
         x_t = torch.randn(bs, seq_len, action_dim, device=device) # [bs, seq, action_dim]
 
         # Iterate through timesteps (from noise t=1.0 to data t=0.0)
@@ -1133,7 +1123,15 @@ class FlowMatchingPolicy(nn.Module):
             else:
                 t_batch = torch.full((bs,), t, device=device, dtype=torch.float32)
             
-            model_output = self.model(obs_embed, x_t, t_batch)
+            # Call model based on architecture type
+            if self.noise_pred_arch == "dit":
+                # Standard DiT interface: (x, timestep, global_cond)
+                model_output = core_model(x=x_t, timestep=t_batch, global_cond=obs_embed)
+            elif self.noise_pred_arch == "unet":
+                # UNet (ConditionalUnet1D) interface: (sample, timestep, global_cond)
+                model_output = core_model(sample=x_t, timestep=t_batch, global_cond=obs_embed)
+            else:
+                raise ValueError(f"Unknown noise_pred_arch: {self.noise_pred_arch}")
 
             # Euler Step: x_{t-1} = x_t + (sigma_next - sigma_curr) * v
             # Use index directly to avoid searching (more efficient)
