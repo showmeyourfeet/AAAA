@@ -6,21 +6,52 @@ This module provides utilities for transferring Pi0.5 to a new domain
 
 Key Steps:
 1. Prepare action data (chunk, normalize)
-2. Fit FAST tokenizer on new domain data
+2. Fit FAST tokenizer on new domain data (REQUIRED: adapts to new action distribution)
 3. Expand VLM vocabulary with action tokens
 4. Resize model embeddings
+
+Why Re-train FAST Tokenizer?
+-----------------------------
+When transferring to a new domain (e.g., home → surgical), the action distribution
+can be significantly different:
+- Different action ranges and dynamics
+- Different normalization statistics (quantile percentiles)
+- Different BPE vocabulary needs
+
+The FAST tokenizer.fit() method:
+- Recomputes normalization statistics (1st/99th percentiles) from new domain data
+- Retrains the BPE vocabulary to efficiently compress new action patterns
+- Ensures the discrete action tokens align with the new domain's action space
+
+Required Data:
+--------------
+- action_trajectories: Raw action trajectories from the new domain
+    - Format: List[np.ndarray] where each array is [T_i, action_dim]
+    - Or: np.ndarray of shape [N, T, action_dim]
+    - Should represent typical action sequences in the new domain
+    - No need for paired observations or task labels (actions only)
+    
+- vlm_model: Pre-trained VLM model (e.g., PaliGemma)
+- vlm_tokenizer: Pre-trained VLM tokenizer
 
 Usage:
     from domain_transfer import prepare_surgical_domain
     
+    # Collect raw action trajectories from surgical domain
+    surgical_actions = load_surgical_trajectories()  # List of [T, action_dim] arrays
+    
     # One-stop domain transfer
-    fast_tokenizer, updated_vlm_tokenizer = prepare_surgical_domain(
-        action_dataset=surgical_actions,  # Raw action trajectories
+    fast_tokenizer, updated_vlm_tokenizer, info = prepare_surgical_domain(
+        surgical_actions=surgical_actions,  # Raw action trajectories from new domain
         vlm_model=paligemma_model,
         vlm_tokenizer=paligemma_tokenizer,
         output_dir="./surgical_fast",
         control_freq=50,
     )
+    
+    # The FAST tokenizer is now adapted to surgical actions
+    # The VLM tokenizer has been expanded with action tokens
+    # Save the updated model for training
 """
 
 import logging
@@ -215,13 +246,30 @@ def fit_fast_tokenizer(
     """
     Fit FAST tokenizer on new domain data using official implementation.
     
+    This function adapts the FAST tokenizer to a new action distribution by:
+    1. Recomputing normalization statistics (quantile percentiles) from new data
+    2. Retraining the BPE vocabulary to efficiently compress new action patterns
+    
+    Why re-train?
+    -------------
+    Different domains (e.g., home vs. surgical) have different action distributions:
+    - Different action ranges and dynamics
+    - Different normalization statistics needed
+    - Different action patterns that benefit from domain-specific BPE tokens
+    
     Args:
         action_chunks: [N, chunk_size, action_dim] normalized action chunks
-            Should be normalized to [-1, 1] range
+            Should be normalized to [-1, 1] range (done by prepare_action_dataset)
         pretrained_path: Path or HF hub ID for pretrained FAST tokenizer
+            The pretrained tokenizer provides the base architecture and initialization
         
     Returns:
-        Fitted FAST tokenizer
+        Fitted FAST tokenizer adapted to the new domain's action distribution
+        
+    Note:
+        The tokenizer.fit() method retrains both:
+        - Normalization statistics (quantile-based normalization)
+        - BPE vocabulary (Byte Pair Encoding for action compression)
     """
     from transformers import AutoProcessor
     
@@ -279,15 +327,31 @@ def expand_vlm_vocabulary(
     # Record old vocab size
     old_vocab_size = len(vlm_tokenizer)
     
-    # Add tokens
-    num_added = vlm_tokenizer.add_tokens(action_tokens, special_tokens=False)
+    # Check if tokens already exist
+    existing_tokens = []
+    missing_tokens = []
+    for token_name in action_tokens:
+        if token_name in vlm_tokenizer.get_vocab():
+            existing_tokens.append(token_name)
+        else:
+            missing_tokens.append(token_name)
     
-    logger.info(
-        f"Expanded VLM vocabulary: {old_vocab_size} → {len(vlm_tokenizer)} "
-        f"(+{num_added} action tokens)"
-    )
+    # Add tokens (only missing ones)
+    if missing_tokens:
+        num_added = vlm_tokenizer.add_tokens(missing_tokens, special_tokens=False)
+        logger.info(
+            f"Expanded VLM vocabulary: {old_vocab_size} → {len(vlm_tokenizer)} "
+            f"(+{num_added} new action tokens, {len(existing_tokens)} already existed)"
+        )
+    else:
+        num_added = 0
+        logger.info(
+            f"VLM vocabulary already contains all {len(action_tokens)} action tokens. "
+            f"No expansion needed (vocab size: {len(vlm_tokenizer)})"
+        )
     
     # Create mapping: action_idx -> vlm_token_id
+    # This mapping is always needed, even if tokens already existed
     action_to_vlm = {}
     for i, token_name in enumerate(action_tokens):
         vlm_id = vlm_tokenizer.convert_tokens_to_ids(token_name)
@@ -323,6 +387,14 @@ def resize_model_embeddings(
     else:
         embeddings = model.get_input_embeddings()
         old_vocab_size = embeddings.weight.shape[0]
+    
+    # Check if resize is needed
+    if old_vocab_size == new_vocab_size:
+        logger.info(
+            f"Model embeddings already have correct size ({old_vocab_size}). "
+            f"No resize needed."
+        )
+        return
     
     # Resize
     model.resize_token_embeddings(new_vocab_size)
