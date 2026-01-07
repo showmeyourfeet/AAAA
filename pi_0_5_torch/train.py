@@ -115,6 +115,7 @@ def build_model_and_preprocessor(
     device: str,
     dataset_stats_path: Optional[str] = None,
     use_augmentation: bool = True,
+    fast_tokenizer_path: Optional[str] = None,
 ) -> tuple[PI05Model, Pi05Preprocessor]:
     """Build model and preprocessor with optional dataset statistics."""
     # Load dataset statistics if provided
@@ -135,6 +136,7 @@ def build_model_and_preprocessor(
         dataset_stats=stats,
         device=device,
         use_augmentation=use_augmentation,
+        fast_tokenizer_path=fast_tokenizer_path,
     )
 
     model = PI05Model(config)
@@ -304,6 +306,8 @@ def train_one_epoch_hierarchical(
             actions=inputs["actions"],
             subtask_ids=inputs["subtask_input_ids"],
             subtask_mask=inputs["subtask_attention_mask"],
+            fast_action_ids=inputs.get("fast_action_ids"),
+            fast_action_mask=inputs.get("fast_action_mask"),
             alpha=alpha,
         )
 
@@ -385,6 +389,8 @@ def validate_hierarchical(
             actions=inputs["actions"],
             subtask_ids=inputs["subtask_input_ids"],
             subtask_mask=inputs["subtask_attention_mask"],
+            fast_action_ids=inputs.get("fast_action_ids"),
+            fast_action_mask=inputs.get("fast_action_mask"),
             alpha=alpha,
         )
 
@@ -443,6 +449,16 @@ def main():
         help="High-level policy finetune (text CE only). Forces hierarchical dataloader; sets alpha=0."
     )
     parser.add_argument(
+        "--use_fast_tokens", action="store_true",
+        help="Use FAST discrete action tokens in planar_mode (pre-training style). "
+             "Aligns subtask and action tokens in semantic space for better transfer."
+    )
+    parser.add_argument(
+        "--fast_tokenizer_path", type=str, default=None,
+        help="Path to FAST tokenizer (required if --use_fast_tokens). "
+             "Can be 'physical-intelligence/fast' for official pretrained tokenizer."
+    )
+    parser.add_argument(
         "--action_expert_mode", action="store_true",
         help="Action expert training only (flow matching). Uses standard dataloader; skips text loss."
     )
@@ -459,7 +475,20 @@ def main():
         # Force hierarchical data for subtask supervision
         args.hierarchical = True
         args.alpha = 0.0  # Only supervise text loss
-        logger.info("[Mode] Planar mode enabled: high-level text CE only (alpha=0).")
+        if args.use_fast_tokens:
+            if args.fast_tokenizer_path is None:
+                logger.warning(
+                    "[Mode] --use_fast_tokens enabled but --fast_tokenizer_path not provided. "
+                    "Using default 'physical-intelligence/fast'"
+                )
+                args.fast_tokenizer_path = "physical-intelligence/fast"
+            logger.info(
+                "[Mode] Planar mode with FAST tokens: "
+                "high-level text CE + FAST action tokens (pre-training style). "
+                "This aligns subtask and action tokens in semantic space for better transfer."
+            )
+        else:
+            logger.info("[Mode] Planar mode enabled: high-level text CE only (alpha=0).")
     if args.action_expert_mode:
         # Ensure we do action-only training
         args.hierarchical = False
@@ -501,6 +530,7 @@ def main():
         device=device,
         dataset_stats_path=args.dataset_stats,
         use_augmentation=args.use_augmentation,
+        fast_tokenizer_path=args.fast_tokenizer_path if args.use_fast_tokens else None,
     )
 
     # Enable gradient checkpointing if requested
