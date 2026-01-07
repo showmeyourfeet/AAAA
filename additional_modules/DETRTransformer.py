@@ -539,17 +539,15 @@ def _get_clones(module, N):
 
 
 def build_transformer(args):
-    # Get Transformer encoder layers (backward compatible: use enc_layers if transformer_enc_layers not provided)
-    transformer_enc_layers = getattr(args, "transformer_enc_layers", None)
-    if transformer_enc_layers is None:
-        transformer_enc_layers = getattr(args, "enc_layers", 4)
+    # Get Transformer encoder layers
+    enc_layers = getattr(args, "enc_layers_num", 4)
     
     return Transformer(
         d_model=args.hidden_dim,
         dropout=args.dropout,
         nhead=args.nheads,
         dim_feedforward=args.dim_feedforward,
-        num_encoder_layers=transformer_enc_layers,
+        num_encoder_layers=enc_layers,
         num_decoder_layers=args.dec_layers,
         normalize_before=args.pre_norm,
         return_intermediate_dec=True,

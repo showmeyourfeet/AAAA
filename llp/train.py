@@ -27,7 +27,7 @@ try:
         MixedDataset,
         MixedRatioSampler,
     )
-    from .policy import ACTPolicy
+    from .policy import ACTPolicy, DiffusionPolicy, FlowMatchingPolicy
     from .utils import (
         compute_dict_mean,
         detach_dict,
@@ -46,7 +46,7 @@ except ImportError:
         MixedDataset,
         MixedRatioSampler,
     )
-    from llp.policy import ACTPolicy
+    from llp.policy import ACTPolicy, DiffusionPolicy, FlowMatchingPolicy
     from llp.utils import (
         compute_dict_mean,
         detach_dict,
@@ -101,12 +101,31 @@ def format_number(num: int) -> str:
         return str(num)
 
 
-def make_policy(policy_config: Dict) -> ACTPolicy:
-    policy = ACTPolicy(policy_config)
+def make_policy(policy_config: Dict):
+    """
+    Create a policy based on the policy_type specified in config.
+    
+    Args:
+        policy_config: Configuration dictionary containing policy_type and other parameters
+        
+    Returns:
+        Policy instance (ACTPolicy, DiffusionPolicy, or FlowMatchingPolicy)
+    """
+    policy_type = policy_config.get("policy_type", "act").lower()
+    
+    if policy_type == "diffusion":
+        policy = DiffusionPolicy(policy_config)
+    elif policy_type == "act":
+        policy = ACTPolicy(policy_config)
+    elif policy_type == "flow_matching":
+        policy = FlowMatchingPolicy(policy_config)
+    else:
+        raise ValueError(f"Unknown policy_type: {policy_type}. Must be 'act', 'diffusion', or 'flow_matching'")
+    
     return policy
 
 
-def make_optimizer(policy: ACTPolicy) -> torch.optim.Optimizer:
+def make_optimizer(policy) -> torch.optim.Optimizer:
     return policy.configure_optimizers()
 
 
@@ -191,7 +210,7 @@ def compute_splitted_norm_stats(roots: Sequence[str]) -> Dict[str, np.ndarray]:
     }
 
 
-def forward_pass(data, policy: ACTPolicy, device: torch.device, encode_command: bool = False):
+def forward_pass(data, policy, device: torch.device, encode_command: bool = False):
     if len(data) == 5:
         image_data, qpos_data, action_data, is_pad, command_embedding = data
         command_embedding = command_embedding.to(device)
@@ -211,6 +230,14 @@ def train_bc(
     val_dataloader=None,
     logger: logging.Logger | None = None,
 ):
+    # Get policy type to determine which metrics to compute
+    policy_type = config.get("policy_config", {}).get("policy_type", "act").lower()
+    use_l1_metrics = (policy_type == "act")  # Only ACT uses L1 metrics
+    """
+    Train a behavior cloning policy (ACT or Diffusion).
+    
+    Supports both ACTPolicy and DiffusionPolicy through unified interface.
+    """
     num_epochs = config["num_epochs"]
     ckpt_dir = config["ckpt_dir"]
     seed = config["seed"]
@@ -455,8 +482,13 @@ def train_bc(
             policy.eval()
             val_losses = []
             val_l1_losses = []
-            val_l1_infer_losses = []  # 推理模式 L1 losses
-            num_queries = policy.num_queries
+            val_l1_infer_losses = []  # 推理模式 L1 losses (only for ACT)
+            # Get num_queries/action_horizon for slicing actions
+            # DiffusionPolicy uses num_queries, ACTPolicy also has num_queries
+            num_queries = getattr(policy, 'num_queries', None)
+            if num_queries is None:
+                # Fallback for DiffusionPolicy if num_queries not set
+                num_queries = getattr(policy, 'action_horizon', 30)
             with torch.inference_mode():
                 val_bar = tqdm(val_dataloader, desc=f"Val {epoch}", leave=False)
                 for data in val_bar:
@@ -472,36 +504,48 @@ def train_bc(
                     action_data = action_data.to(device)
                     is_pad = is_pad.to(device)
                     
-                    # 1. 重建模式 Loss（传入 GT actions，用于监控 VAE 训练）
+                    # 1. 重建模式 Loss（传入 GT actions，用于监控训练）
                     if use_amp:
                         with autocast('cuda'):
                             forward_dict = policy(qpos_data, image_data, action_data, is_pad, command_embedding, encode_command=encode_command)
                     else:
                         forward_dict = policy(qpos_data, image_data, action_data, is_pad, command_embedding, encode_command=encode_command)
                     val_losses.append(forward_dict["loss"].item())
-                    if "l1" in forward_dict:
+                    # Only compute L1 loss for ACT policy
+                    if use_l1_metrics and "l1" in forward_dict:
                         val_l1_losses.append(forward_dict["l1"].item())
                     
-                    # 2. 推理模式 Loss（不传入 actions，使用零向量 latent，反映真实推理能力）
-                    if use_amp:
-                        with autocast('cuda'):
+                    # 2. 推理模式 Loss（不传入 actions，反映真实推理能力）
+                    # Only compute L1 inference loss for ACT policy
+                    if use_l1_metrics:
+                        if use_amp:
+                            with autocast('cuda'):
+                                a_hat_infer = policy(qpos_data, image_data, actions=None, is_pad=None, command_embedding=command_embedding, encode_command=encode_command)
+                        else:
                             a_hat_infer = policy(qpos_data, image_data, actions=None, is_pad=None, command_embedding=command_embedding, encode_command=encode_command)
-                    else:
-                        a_hat_infer = policy(qpos_data, image_data, actions=None, is_pad=None, command_embedding=command_embedding, encode_command=encode_command)
+                        
+                        # 计算推理模式 L1 loss（手动计算，排除 padding）
+                        # a_hat_infer shape: [batch, seq, action_dim] for both ACT and Diffusion
+                        # For diffusion policy, it may return prediction_horizon length instead of action_horizon
+                        # Use the actual returned length to ensure compatibility
+                        actual_seq_len = a_hat_infer.shape[1]
+                        # Use min of num_queries and actual_seq_len to avoid shape mismatch
+                        eval_seq_len = min(num_queries, actual_seq_len)
+                        
+                        action_gt = action_data[:, :eval_seq_len]
+                        a_hat_infer = a_hat_infer[:, :eval_seq_len, :]
+                        is_pad_slice = is_pad[:, :eval_seq_len]
+                        mask = (~is_pad_slice).unsqueeze(-1)  # [batch, seq, 1]
+                        action_dim = action_gt.shape[-1]
+                        valid = mask.sum() * action_dim
+                        l1_infer = (F.l1_loss(action_gt, a_hat_infer, reduction="none") * mask).sum() / valid.clamp(min=1)
+                        val_l1_infer_losses.append(l1_infer.item())
                     
-                    # 计算推理模式 L1 loss（手动计算，排除 padding）
-                    action_gt = action_data[:, :num_queries]
-                    is_pad_slice = is_pad[:, :num_queries]
-                    mask = (~is_pad_slice).unsqueeze(-1)  # [batch, seq, 1]
-                    action_dim = action_gt.shape[-1]
-                    valid = mask.sum() * action_dim
-                    l1_infer = (F.l1_loss(action_gt, a_hat_infer, reduction="none") * mask).sum() / valid.clamp(min=1)
-                    val_l1_infer_losses.append(l1_infer.item())
-                    
-                    val_bar.set_postfix({
-                        "loss": f"{val_losses[-1]:.4f}",
-                        "l1_infer": f"{val_l1_infer_losses[-1]:.4f}"
-                    })
+                    # Update progress bar
+                    postfix_dict = {"loss": f"{val_losses[-1]:.4f}"}
+                    if use_l1_metrics and val_l1_infer_losses:
+                        postfix_dict["l1_infer"] = f"{val_l1_infer_losses[-1]:.4f}"
+                    val_bar.set_postfix(postfix_dict)
             
             val_loss = float(np.mean(val_losses)) if val_losses else float("inf")
             val_l1 = float(np.mean(val_l1_losses)) if val_l1_losses else None
@@ -805,14 +849,15 @@ def main(args: Dict):
         raise ValueError("--use_splitted must be provided. Only SplittedEpisodicDataset format is supported.")
 
     if use_splitted:
-        # Unified interface: use new parameter names, fallback to old ones for backward compatibility
-        normal_root_dir = args.get("normal_root_dir") or args.get("splitted_root")
-        normal_val_root = args.get("normal_val_root") or args.get("val_splitted_root")
+        normal_root_dir = args.get("normal_root_dir")
+        normal_val_root = args.get("normal_val_root")
         
         if not normal_root_dir:
-            raise ValueError("--normal_root_dir (or --splitted_root) must be provided when --use_splitted is set")
+            raise ValueError("--normal_root_dir must be provided when --use_splitted is set")
         
         camera_names = args.get("camera_names", ["left_frame", "right_frame"])
+        # Use chunk_size as unified interface for action sequence length
+        # For all policies (ACT, diffusion, flow_matching), chunk_size defines the action sequence length
         max_episode_len = args.get("chunk_size", 30)
         
         # Check if DAgger mode is enabled
@@ -989,43 +1034,145 @@ def main(args: Dict):
         # Default logic: share backbone if not using language and not using film
         shared_backbone = not use_language and "film" not in args["image_encoder"]
     
+    # Determine policy type
+    policy_type = args.get("policy_type", "act").lower()
+    
     policy_config = {
         "lr": args["lr"],
-        "num_queries": args["chunk_size"],
+        "num_queries": args["chunk_size"],  # Unified interface: chunk_size for all policies
         "kl_weight": args["kl_weight"],
         "hidden_dim": args["hidden_dim"],
         "dim_feedforward": args["dim_feedforward"],
         "lr_backbone": args.get("lr_backbone", 1e-5),
         "weight_decay": args.get("weight_decay", 1e-4),
         "backbone": args["image_encoder"],
-        "enc_layers": args.get("enc_layers_num", 4),  # For backward compatibility
-        "cvae_enc_layers": args.get("cvae_enc_layers", None),
-        "transformer_enc_layers": args.get("transformer_enc_layers", None),
-        "dec_layers": args.get("dec_layers_num", 7),
-        "nheads": 8,
         "camera_names": camera_names,
         "multi_gpu": args["multi_gpu"],
         "use_language": use_language,
         "state_dim": stats.get("action_mean", np.zeros(0)).shape[0] if "action_mean" in stats else 20,
-        "no_encoder": args.get("no_encoder", False),
-        "vq": args.get("vq", False),
-        "vq_class": args.get("vq_class", 512),
-        "vq_dim": args.get("vq_dim", 32),
         "train_image_encoder": args.get("train_image_encoder", False),
         "use_state": use_state,
-        "shared_backbone": shared_backbone,
-        "use_gated_attention": args.get("use_gated_attention", False),
-        "mlp_type": args.get("mlp_type", "swiglu"),
-        "gate_mode": args.get("gate_mode", "element-wise"),
+        "policy_type": policy_type,  # Add policy type to config
+        "device": device,  # Add device for DiffusionPolicy
     }
+    
+    # Add policy-specific configurations
+    if policy_type == "act":
+        # ACT-specific config
+        policy_config.update({
+            "cvae_enc_layers": args.get("cvae_enc_layers", 4),
+            "enc_layers_num": args.get("enc_layers_num", 4),
+            "dec_layers": args.get("dec_layers_num", 7),
+            "nheads": 8,
+            "no_encoder": args.get("no_encoder", False),
+            "vq": args.get("vq", False),
+            "vq_class": args.get("vq_class", 512),
+            "vq_dim": args.get("vq_dim", 32),
+            "shared_backbone": shared_backbone,
+            "use_gated_attention": args.get("use_gated_attention", False),
+            "mlp_type": args.get("mlp_type", "swiglu"),
+            "gate_mode": args.get("gate_mode", "element-wise"),
+        })
+    elif policy_type == "diffusion":
+        # Diffusion-specific config
+        # Use chunk_size as unified interface for action sequence length
+        noise_pred_arch = args.get("noise_pred_arch", "unet")  # Default to "unet" for diffusion
+        # Use chunk_size as action_horizon (unified interface)
+        action_horizon = args["chunk_size"]
+        policy_config.update({
+            "observation_horizon": args.get("observation_horizon", 1),
+            "action_horizon": action_horizon,
+            "prediction_horizon": args.get("prediction_horizon", action_horizon),  # Default to action_horizon
+            "num_inference_timesteps": args.get("num_inference_timesteps", 16),
+            "action_dim": stats.get("action_mean", np.zeros(0)).shape[0] if "action_mean" in stats else 20,
+            "image_size": args.get("image_size", 224),
+            "image_height": args.get("image_height", None),
+            "image_width": args.get("image_width", None),
+            "noise_pred_arch": noise_pred_arch,
+        })
+        
+        # Add transformer config if using dit architecture
+        if noise_pred_arch == "dit":
+            # Warn if enc_layers_num is provided (DiT is decoder-only, no encoder)
+            if args.get("enc_layers_num") is not None:
+                print(
+                    "Warning: --enc_layers_num is ignored for DiT architecture (decoder-only, no encoder). "
+                    "Use --dec_layers_num to control the number of DiT blocks."
+                )
+            policy_config.update({
+                "hidden_dim": args.get("hidden_dim", 256),  # Default 256 for dit in diffusion
+                "nheads": args.get("nheads") or args.get("n_heads", 8),
+                # Note: enc_layers_num is not used for DiT (decoder-only architecture)
+                "dec_layers": args.get("dec_layers_num", 6),  # Default 6 for dit
+                "dim_feedforward": args.get("dim_feedforward", 1024),  # Default 1024 for DiT
+                "dropout": args.get("dropout", 0.1),
+                "pre_norm": args.get("pre_norm", False),
+                "use_gated_attention": args.get("use_gated_attention", False),
+                "mlp_type": args.get("mlp_type", "standard"),  # Default to standard MLP for DiT
+                "gate_mode": args.get("gate_mode", "element-wise"),
+                "activation": args.get("activation", "gelu"),
+            })
+    elif policy_type == "flow_matching":
+        # Flow Matching-specific config
+        # Use chunk_size as unified interface for action sequence length
+        # Default to "unet" for flow_matching, but allow switching to "dit"
+        noise_pred_arch = args.get("noise_pred_arch", "unet")
+        policy_config.update({
+            "action_seq_len": args["chunk_size"],  # Use chunk_size
+            "action_dim": stats.get("action_mean", np.zeros(0)).shape[0] if "action_mean" in stats else 20,
+            "num_train_timesteps": args.get("num_train_timesteps", 1000),
+            "shift": args.get("shift", 1.0),
+            "num_inference_timesteps": args.get("num_inference_timesteps", 10),
+            "image_size": args.get("image_size", 224),
+            "image_height": args.get("image_height", None),
+            "image_width": args.get("image_width", None),
+            "noise_pred_arch": noise_pred_arch,
+        })
+        
+        # Add transformer config if using standard DiT architecture
+        if noise_pred_arch == "dit":
+            # Warn if enc_layers_num is provided (DiT is decoder-only, no encoder)
+            if args.get("enc_layers_num") is not None:
+                print(
+                    "Warning: --enc_layers_num is ignored for DiT architecture (decoder-only, no encoder). "
+                    "Use --dec_layers_num to control the number of DiT blocks."
+                )
+            # Standard DiT config
+            policy_config.update({
+                "hidden_dim": args.get("hidden_dim", 256),
+                "dec_layers": args.get("dec_layers_num", 6),
+                "nheads": args.get("nheads") or args.get("n_heads", 8),
+                "dim_feedforward": args.get("dim_feedforward", 1024),  # Default 1024 for DiT
+                "dropout": args.get("dropout", 0.1),
+                "activation": args.get("activation", "gelu"),
+                "mlp_type": args.get("mlp_type", "standard"),  # Default to standard MLP for DiT
+                "use_gated_attention": args.get("use_gated_attention", False),
+                "gate_mode": args.get("gate_mode", "element-wise"),
+            })
+        # Note: UNet config is handled by ConditionalUnet1D defaults
 
+    # Set default best_model_metric based on policy type
+    # ACT uses l1_loss_infer, diffusion/flow_matching use loss (MSE)
+    user_specified_metric = args.get("best_model_metric", "l1_loss_infer")
+    if policy_type in ["diffusion", "flow_matching"]:
+        # For diffusion/flow_matching, use "loss" (MSE) as default
+        # If user specified "l1_loss_infer" or "l1_loss" (ACT-specific metrics), override to "loss"
+        if user_specified_metric in ["l1_loss_infer", "l1_loss"]:
+            best_model_metric = "loss"
+        else:
+            # User explicitly set a valid metric (e.g., "total_loss" or "loss"), use it
+            best_model_metric = user_specified_metric
+    else:
+        # For ACT, use the specified metric (default is l1_loss_infer)
+        best_model_metric = user_specified_metric
+    
     config = {
         "num_epochs": args["num_epochs"],
         "ckpt_dir": ckpt_dir,
         "seed": args["seed"],
         "policy_config": policy_config,
         "log_every": args.get("log_every", 1),
-        "best_model_metric": args.get("best_model_metric", "total_loss"),
+        "best_model_metric": best_model_metric,
         "constant_lr": args.get("constant_lr", False),
         "save_ckpt_every": args.get("save_ckpt_every", 20),
         "disable_latest_checkpoint": args.get("disable_latest_checkpoint", False),
@@ -1045,19 +1192,59 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, required=True)
     parser.add_argument("--use_amp", action="store_true", help="Enable mixed precision training (AMP) to reduce GPU memory usage")
 
-    # Model options
+    # Policy type selection
+    parser.add_argument("--policy_type", type=str, default="act", choices=["act", "diffusion", "flow_matching"], 
+                        help="Policy type: 'act' for ACT policy (default), 'diffusion' for Diffusion policy, or 'flow_matching' for Flow Matching policy")
+
+    # Model options (shared across policies where applicable)
     parser.add_argument("--kl_weight", type=float, default=1.0)
     parser.add_argument("--chunk_size", type=int, default=30)
-    parser.add_argument("--hidden_dim", type=int, default=512)
-    parser.add_argument("--dim_feedforward", type=int, default=3200)
-    parser.add_argument("--enc_layers_num", type=int, default=4, help="[Deprecated] Use --cvae_enc_layers and --transformer_enc_layers instead. If provided, sets both encoder layer counts.")
-    parser.add_argument("--cvae_enc_layers", type=int, default=None, help="Number of layers in CVAE encoder (default: same as --enc_layers_num if provided, else 4)")
-    parser.add_argument("--transformer_enc_layers", type=int, default=None, help="Number of layers in DETRTransformer encoder (default: same as --enc_layers_num if provided, else 4)")
-    parser.add_argument("--dec_layers_num", type=int, default=7)
+    parser.add_argument(
+        "--hidden_dim",
+        type=int,
+        default=512,
+        help="Transformer hidden dimension. Used by ACT DETR decoder and by DiT when noise_pred_arch='dit'.",
+    )
+    parser.add_argument(
+        "--dim_feedforward",
+        type=int,
+        default=3200,
+        help="Transformer FFN dimension. Used by ACT DETR and DiT (for DiT, this is the MLP feedforward dimension).",
+    )
+    parser.add_argument(
+        "--enc_layers_num",
+        type=int,
+        default=4,
+        help="Number of encoder layers in DETRTransformer (ACT only). Ignored by diffusion/flow_matching DiT.",
+    )
+    parser.add_argument(
+        "--cvae_enc_layers",
+        type=int,
+        default=4,
+        help="Number of layers in CVAE encoder (ACT policy only, default: 4).",
+    )
+    parser.add_argument(
+        "--dec_layers_num",
+        type=int,
+        default=7,
+        help="Number of decoder layers. Used by ACT DETR decoder and as DiT depth when noise_pred_arch='dit'.",
+    )
     parser.add_argument("--image_encoder", type=str, default="efficientnet_b3film")
     parser.add_argument("--gpu", type=int, default=None, help="GPU ID to use (default: auto-select first available GPU, or CPU if no GPU available)")
-    parser.add_argument("--mlp_type", type=str, default="swiglu", choices=["swiglu", "standard"], help="MLP block type for Transformer FFN")
-    parser.add_argument("--gate_mode", type=str, default="element-wise", choices=["element-wise", "head-wise"], help="Gated attention mode")
+    parser.add_argument(
+        "--mlp_type",
+        type=str,
+        default="swiglu",
+        choices=["swiglu", "standard"],
+        help="MLP block type for Transformer FFN (ACT DETR and DiT).",
+    )
+    parser.add_argument(
+        "--gate_mode",
+        type=str,
+        default="element-wise",
+        choices=["element-wise", "head-wise"],
+        help="Gated attention mode (only relevant when use_gated_attention is enabled).",
+    )
     parser.add_argument("--multi_gpu", action="store_true")
     parser.add_argument("--no_state", action="store_true", help="Disable qpos/state inputs throughout training/inference pipeline")
     parser.add_argument("--no_encoder", action="store_true", help="Disable VAE encoder, use zero latent vector instead")
@@ -1067,9 +1254,49 @@ if __name__ == "__main__":
     parser.add_argument(
         "--use_gated_attention",
         action="store_true",
-        help="Use gated attention in DETR transformer and encoder (ablation flag)",
+        help="Use gated attention in DETR/Transformer blocks (ablation flag).",
     )
     parser.add_argument("--shared_backbone", type=lambda x: x.lower() in ('true', '1', 'yes'), default=None, help="Whether to share backbone across cameras (default: auto-detect based on use_language and image_encoder)")
+
+    # Sequence policy options (diffusion & flow_matching)
+    parser.add_argument("--observation_horizon", type=int, default=1, help="Number of observation frames to use as condition (for diffusion policy)")
+    parser.add_argument("--prediction_horizon", type=int, default=None, help="Prediction horizon for diffusion policy inference (default: same as chunk_size/action_horizon). Allows predicting shorter sequences than training length.")
+    parser.add_argument(
+        "--num_inference_timesteps",
+        type=int,
+        default=16,
+        help="Number of inference timesteps for diffusion/flow_matching policy (default: 16 for diffusion, 10 for flow_matching).",
+    )
+    parser.add_argument(
+        "--noise_pred_arch",
+        type=str,
+        default=None,
+        choices=["unet", "dit"],
+        help="Noise prediction architecture for diffusion/flow_matching: 'unet' or 'dit' (standard DiT). Ignored by ACT.",
+    )
+    parser.add_argument(
+        "--nheads",
+        type=int,
+        default=None,
+        help="Number of attention heads for Transformer/DiT (default: 8). Used by ACT DETR and by DiT when noise_pred_arch='dit'.",
+    )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.1,
+        help="Dropout rate for DiT blocks (default: 0.1). Only used when noise_pred_arch='dit'.",
+    )
+    parser.add_argument(
+        "--activation",
+        type=str,
+        default="gelu",
+        choices=["gelu", "relu"],
+        help="Activation function for DiT MLP blocks (default: gelu). Only used when noise_pred_arch='dit'.",
+    )
+    
+    # Flow Matching policy specific options
+    parser.add_argument("--num_train_timesteps", type=int, default=1000, help="Number of training timesteps for flow matching (default: 1000)")
+    parser.add_argument("--shift", type=float, default=1.0, help="Time scaling shift parameter for flow matching (default: 1.0)")
 
     parser.add_argument("--use_language", action="store_true")
     parser.add_argument("--language_encoder", type=str, default="distilbert", choices=["distilbert", "clip"])
@@ -1078,8 +1305,6 @@ if __name__ == "__main__":
 
     # Dataset options
     parser.add_argument("--use_splitted", action="store_true")
-    parser.add_argument("--splitted_root", type=str, help="[Deprecated] Use --normal_root_dir instead. Root directory for splitted dataset (training data)")
-    parser.add_argument("--val_splitted_root", type=str, help="[Deprecated] Use --normal_val_root instead. Root directory for validation (splitted format)")
     parser.add_argument("--normal_root_dir", type=str, help="Root directory for normal datasets (training data). In DAgger mode: expert demonstrations. In normal mode: training datasets.")
     parser.add_argument("--normal_val_root", type=str, help="Root directory for normal validation datasets. In DAgger mode: expert validation. In normal mode: validation datasets.")
     parser.add_argument("--stage_embeddings_file", type=str)
@@ -1092,7 +1317,9 @@ if __name__ == "__main__":
     parser.add_argument("--mix_ratio", type=float, default=0.5, help="Ratio of correction command samples in each batch (default: 0.5, range: 0.0-1.0)")
     parser.add_argument("--camera_names", nargs="*", default=["left_frame", "right_frame"])
     parser.add_argument("--use_augmentation", action="store_true", help="Enable data augmentation for images")
-    parser.add_argument("--image_size", type=int, default=224, help="Image size for augmentation")
+    parser.add_argument("--image_size", type=int, default=224, help="Image size for augmentation (square images)")
+    parser.add_argument("--image_height", type=int, default=None, help="Image height for non-square images (for diffusion policy)")
+    parser.add_argument("--image_width", type=int, default=None, help="Image width for non-square images (for diffusion policy)")
     parser.add_argument("--use_episodic_sampling", action="store_true", help="Use episodic sampling mode (similar to EpisodicDataset): traverse run IDs, randomly sample stage, then start_ts. Default: single random mode (traverse all stage/run, randomly sample start_ts)")
     
     # DataLoader options
@@ -1112,8 +1339,8 @@ if __name__ == "__main__":
         "--best_model_metric",
         type=str,
         default="l1_loss_infer",
-        choices=["total_loss", "l1_loss", "l1_loss_infer"],
-        help="Metric for selecting best model: 'total_loss' (l1 + kl_weight * kl), 'l1_loss' (reconstruction L1), or 'l1_loss_infer' (default, inference-mode L1 - reflects true inference capability)"
+        choices=["total_loss", "loss", "l1_loss", "l1_loss_infer"],
+        help="Metric for selecting best model: 'total_loss' or 'loss' (MSE loss, for diffusion/flow_matching), 'l1_loss' (reconstruction L1), or 'l1_loss_infer' (default for ACT, inference-mode L1)"
     )
     parser.add_argument("--constant_lr", action="store_true", help="Disable learning rate scheduler and keep LR constant")
     parser.add_argument("--save_ckpt_every", type=int, default=20, help="Interval size for saving best checkpoint within each interval [i*n, (i+1)*n) based on val l1 loss (default: 100)")
