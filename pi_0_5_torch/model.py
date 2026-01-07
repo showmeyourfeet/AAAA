@@ -892,6 +892,8 @@ class PI05Model(PreTrainedModel):
         actions: Tensor,
         subtask_ids: Optional[Tensor] = None,
         subtask_mask: Optional[Tensor] = None,
+        fast_action_ids: Optional[Tensor] = None,
+        fast_action_mask: Optional[Tensor] = None,
         alpha: float = 10.0,
         noise: Tensor | None = None,
         time: Tensor | None = None,
@@ -901,10 +903,13 @@ class PI05Model(PreTrainedModel):
         
         This jointly trains:
         1. Subtask prediction (cross-entropy loss on subtask_ids)
-        2. Action generation (flow matching loss)
+        2. Action generation (flow matching loss) OR FAST action tokens (if provided)
         
         Combined loss:
-            L = H(subtask_ids, logits) + α * ||u_t - v_t||²
+            - If fast_action_ids provided (pre-training style):
+                L = H(subtask_ids, logits) + H(fast_action_ids, logits)
+            - Otherwise (post-training style):
+                L = H(subtask_ids, logits) + α * ||u_t - v_t||²
         
         Args:
             pixel_values: [B, 3, H, W] image tensor
@@ -913,7 +918,9 @@ class PI05Model(PreTrainedModel):
             actions: [B, T, A] ground truth actions (normalized)
             subtask_ids: [B, S] ground truth subtask token ids (optional)
             subtask_mask: [B, S] subtask token mask (optional)
-            alpha: Weight for flow matching loss (default 10.0 from paper)
+            fast_action_ids: [B, A] FAST action token ids (optional, for pre-training style)
+            fast_action_mask: [B, A] FAST action token mask (optional)
+            alpha: Weight for flow matching loss (default 10.0, ignored if fast_action_ids provided)
             noise: Optional noise tensor
             time: Optional timesteps [B]
             
@@ -954,7 +961,7 @@ class PI05Model(PreTrainedModel):
 
         text_loss = None
         prefix_out_text: Tensor | None = None
-        if subtask_ids is not None:
+        if subtask_ids is not None or fast_action_ids is not None:
             # Forward only through PaliGemma language model (no action expert)
             lm_outputs = self.paligemma_with_expert.paligemma.language_model.forward(
                 inputs_embeds=prefix_embs,
@@ -967,79 +974,132 @@ class PI05Model(PreTrainedModel):
             # Get LM head for text prediction
             lm_head = self.paligemma_with_expert.paligemma.language_model.lm_head
             
-            # Get logits from prefix output (excluding image tokens, using text positions)
-            # We predict next token, so shift by 1
+            # Get logits from prefix output
             text_hidden = prefix_out_text.to(dtype=torch.float32)
             logits = lm_head(text_hidden)  # [B, prefix_len, vocab_size]
             
-            # Compute cross-entropy loss for subtask tokens
-            # Shift logits and labels for next-token prediction
-            # Only compute loss on positions where subtask_mask is True
-            
-            # Get the text portion of prefix (after image tokens)
-            # For simplicity, use the last S tokens of prefix for subtask prediction
-            S = subtask_ids.shape[1]
-            if logits.shape[1] >= S:
-                shift_logits = logits[:, -S-1:-1, :].contiguous()  # [B, S, vocab]
-                shift_labels = subtask_ids.contiguous()  # [B, S]
+            # Combine subtask and FAST action tokens for pre-training style
+            if fast_action_ids is not None:
+                # Pre-training style: predict both subtask and FAST action tokens
+                # Target sequence: [subtask_tokens, fast_action_tokens]
+                target_tokens_list = []
+                target_mask_list = []
                 
-                # Flatten for cross-entropy
-                loss_fct = nn.CrossEntropyLoss(reduction="none")
-                flat_logits = shift_logits.view(-1, shift_logits.size(-1))
-                flat_labels = shift_labels.view(-1)
-                text_loss = loss_fct(flat_logits, flat_labels).view(bsize, S)  # [B, S]
+                if subtask_ids is not None:
+                    S = subtask_ids.shape[1]
+                    target_tokens_list.append(subtask_ids)
+                    if subtask_mask is not None:
+                        target_mask_list.append(subtask_mask.float())
+                    else:
+                        target_mask_list.append(torch.ones(bsize, S, device=subtask_ids.device))
                 
-                # Apply mask if provided
-                if subtask_mask is not None:
-                    text_loss = text_loss * subtask_mask.float()
+                A = fast_action_ids.shape[1]
+                target_tokens_list.append(fast_action_ids)
+                if fast_action_mask is not None:
+                    target_mask_list.append(fast_action_mask.float())
+                else:
+                    target_mask_list.append(torch.ones(bsize, A, device=fast_action_ids.device))
+                
+                # Concatenate targets
+                all_target_ids = torch.cat(target_tokens_list, dim=1)  # [B, S+A]
+                all_target_mask = torch.cat(target_mask_list, dim=1)  # [B, S+A]
+                total_target_len = all_target_ids.shape[1]
+                
+                # Extract logits for target positions (after prompt)
+                # Use the last total_target_len positions of prefix for prediction
+                if logits.shape[1] >= total_target_len:
+                    # Shift for next-token prediction
+                    shift_logits = logits[:, -total_target_len-1:-1, :].contiguous()  # [B, S+A, vocab]
+                    shift_labels = all_target_ids.contiguous()  # [B, S+A]
+                    
+                    # Flatten for cross-entropy
+                    loss_fct = nn.CrossEntropyLoss(reduction="none")
+                    flat_logits = shift_logits.view(-1, shift_logits.size(-1))
+                    flat_labels = shift_labels.view(-1)
+                    text_loss = loss_fct(flat_logits, flat_labels).view(bsize, total_target_len)  # [B, S+A]
+                    
+                    # Apply mask
+                    text_loss = text_loss * all_target_mask
+            elif subtask_ids is not None:
+                # Post-training style: only predict subtask tokens
+                S = subtask_ids.shape[1]
+                if logits.shape[1] >= S:
+                    shift_logits = logits[:, -S-1:-1, :].contiguous()  # [B, S, vocab]
+                    shift_labels = subtask_ids.contiguous()  # [B, S]
+                    
+                    # Flatten for cross-entropy
+                    loss_fct = nn.CrossEntropyLoss(reduction="none")
+                    flat_logits = shift_logits.view(-1, shift_logits.size(-1))
+                    flat_labels = shift_labels.view(-1)
+                    text_loss = loss_fct(flat_logits, flat_labels).view(bsize, S)  # [B, S]
+                    
+                    # Apply mask if provided
+                    if subtask_mask is not None:
+                        text_loss = text_loss * subtask_mask.float()
 
         # ------------------------------------------------------------------
         # 2) Low-level action path: joint prefix+suffix forward for flow loss
         #    IMPORTANT: detach prefix_embs so action gradients do not update
         #    the high-level planner (VLM), matching Pi0.5's decoupling.
+        #    SKIP if fast_action_ids provided (pre-training style, alpha=0)
         # ------------------------------------------------------------------
+        
+        action_loss = None
+        suffix_out = None
+        
+        if fast_action_ids is None:
+            # Post-training style: compute flow matching loss
+            # Reuse prefix masks, but detach embeddings for action branch
+            prefix_embs_detached = prefix_embs.detach()
 
-        # Reuse prefix masks, but detach embeddings for action branch
-        prefix_embs_detached = prefix_embs.detach()
+            # Embed suffix (noisy actions)
+            suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
 
-        # Embed suffix (noisy actions)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+            if model_dtype == torch.bfloat16:
+                suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
 
-        if model_dtype == torch.bfloat16:
-            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+            # Concatenate prefix + suffix for joint attention
+            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+            att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
-        # Concatenate prefix + suffix for joint attention
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+            att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+            position_ids = torch.cumsum(pad_masks, dim=1) - 1
+            att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+            # Forward through joint model; prefix embeddings are treated as constants
+            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+                attention_mask=att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs_detached, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
 
-        # Forward through joint model; prefix embeddings are treated as constants
-        (_, suffix_out), _ = self.paligemma_with_expert.forward(
-            attention_mask=att_2d_masks_4d,
-            position_ids=position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs_detached, suffix_embs],
-            use_cache=False,
-            adarms_cond=[None, adarms_cond],
-        )
-
-        # Compute action loss (flow matching) from suffix branch only
-        suffix_out = suffix_out[:, -self.config.chunk_size:]
-        suffix_out = suffix_out.to(dtype=torch.float32)
-        v_t = self.action_out_proj(suffix_out)
-        action_loss = F.mse_loss(u_t, v_t, reduction="none")  # [B, T, A]
+            # Compute action loss (flow matching) from suffix branch only
+            suffix_out = suffix_out[:, -self.config.chunk_size:]
+            suffix_out = suffix_out.to(dtype=torch.float32)
+            v_t = self.action_out_proj(suffix_out)
+            action_loss = F.mse_loss(u_t, v_t, reduction="none")  # [B, T, A]
         
         # Compute total loss
-        action_loss_mean = action_loss.mean()
-        if text_loss is not None:
-            text_loss_mean = text_loss.mean()
-            total_loss = text_loss_mean + alpha * action_loss_mean
+        if fast_action_ids is not None:
+            # Pre-training style: only text loss (subtask + FAST action tokens)
+            if text_loss is not None:
+                total_loss = text_loss.mean()
+            else:
+                total_loss = torch.tensor(0.0, device=pixel_values.device)
+            action_loss_mean = None
+            text_loss_mean = text_loss.mean() if text_loss is not None else None
         else:
-            text_loss_mean = None
-            total_loss = alpha * action_loss_mean
+            # Post-training style: text loss + flow matching loss
+            action_loss_mean = action_loss.mean() if action_loss is not None else None
+            if text_loss is not None:
+                text_loss_mean = text_loss.mean()
+                total_loss = text_loss_mean + alpha * action_loss_mean
+            else:
+                text_loss_mean = None
+                total_loss = alpha * action_loss_mean if action_loss_mean is not None else torch.tensor(0.0, device=pixel_values.device)
         
         return Pi05HierarchicalOutput(
             action_loss=action_loss,

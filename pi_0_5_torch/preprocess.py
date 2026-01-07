@@ -264,6 +264,7 @@ class Pi05Preprocessor:
         device: Optional[str] = None,
         image_keys: tuple[str, ...] = DEFAULT_IMAGE_KEYS,
         use_augmentation: bool = True,
+        fast_tokenizer_path: Optional[str] = None,
     ) -> None:
         self.config = config
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -279,6 +280,41 @@ class Pi05Preprocessor:
         self.image_processor = SiglipImageProcessor.from_pretrained(
             "google/paligemma-3b-pt-224",
         )
+        
+        # FAST tokenizer for discrete action tokenization (optional)
+        self.fast_tokenizer = None
+        self.fast_to_vlm_mapping: Optional[Dict[int, int]] = None
+        if fast_tokenizer_path is not None:
+            from transformers import AutoProcessor
+            import pickle
+            import os
+            
+            logger.info(f"Loading FAST tokenizer from {fast_tokenizer_path}")
+            self.fast_tokenizer = AutoProcessor.from_pretrained(
+                fast_tokenizer_path,
+                trust_remote_code=True,
+            )
+            
+            # Try to load action_to_vlm mapping if available
+            # This mapping is created by domain_transfer.py
+            mapping_path = os.path.join(fast_tokenizer_path, "..", "domain_transfer_info.pkl")
+            if not os.path.exists(mapping_path):
+                mapping_path = os.path.join(fast_tokenizer_path, "domain_transfer_info.pkl")
+            
+            if os.path.exists(mapping_path):
+                try:
+                    with open(mapping_path, "rb") as f:
+                        info = pickle.load(f)
+                    self.fast_to_vlm_mapping = info.get("action_to_vlm_mapping")
+                    if self.fast_to_vlm_mapping:
+                        logger.info(f"Loaded FAST→VLM token mapping ({len(self.fast_to_vlm_mapping)} tokens)")
+                except Exception as e:
+                    logger.warning(f"Could not load FAST→VLM mapping: {e}")
+            else:
+                logger.warning(
+                    f"FAST→VLM mapping not found at {mapping_path}. "
+                    "FAST token IDs will be used directly (assumes VLM vocab already extended)."
+                )
 
     def _process_single_image(self, image: Image.Image) -> Tensor:
         """Process a single PIL image to tensor in [-1, 1] range."""
@@ -611,11 +647,84 @@ class Pi05Preprocessor:
         # 8. Normalize actions
         actions_norm = normalize_feature(actions, self.dataset_stats.action_stats)
         
+        # 9. FAST tokenization (if enabled for pre-training style)
+        fast_action_ids = None
+        fast_action_mask = None
+        if self.fast_tokenizer is not None:
+            # Convert actions to numpy for FAST tokenizer
+            actions_np = actions_norm.detach().cpu().numpy()  # [B, T, A]
+            
+            fast_token_ids_list = []
+            fast_mask_list = []
+            
+            for b in range(B):
+                # Get non-padded action chunk
+                valid_len = (~action_is_pad[b]).sum().item()
+                if valid_len > 0:
+                    action_chunk = actions_np[b, :valid_len]  # [valid_len, A]
+                    # FAST tokenizer expects [chunk_size, action_dim]
+                    # Pad to chunk_size if needed
+                    if valid_len < self.config.chunk_size:
+                        padded_chunk = np.zeros((self.config.chunk_size, action_chunk.shape[-1]), dtype=action_chunk.dtype)
+                        padded_chunk[:valid_len] = action_chunk
+                        action_chunk = padded_chunk
+                    
+                    # Tokenize action chunk
+                    # FAST tokenizer.tokenize() returns token IDs (FAST vocab IDs)
+                    try:
+                        fast_tokens = self.fast_tokenizer.tokenize(action_chunk)
+                        # Convert to list if needed
+                        if isinstance(fast_tokens, np.ndarray):
+                            fast_tokens = fast_tokens.tolist()
+                        elif not isinstance(fast_tokens, list):
+                            fast_tokens = [fast_tokens]
+                        
+                        # Map FAST token IDs to VLM token IDs if mapping available
+                        if self.fast_to_vlm_mapping is not None:
+                            vlm_tokens = [
+                                self.fast_to_vlm_mapping.get(tok_id, tok_id)
+                                for tok_id in fast_tokens
+                            ]
+                            fast_tokens = vlm_tokens
+                        
+                        fast_token_ids_list.append(fast_tokens)
+                        # Create mask (all tokens are valid for non-padded chunks)
+                        fast_mask_list.append([1] * len(fast_tokens))
+                    except Exception as e:
+                        logger.warning(f"FAST tokenization failed for sample {b}: {e}")
+                        # Fallback: empty tokens
+                        fast_token_ids_list.append([])
+                        fast_mask_list.append([])
+                else:
+                    # All padded, no tokens
+                    fast_token_ids_list.append([])
+                    fast_mask_list.append([])
+            
+            # Pad to same length and convert to tensor
+            max_fast_len = max(len(tokens) for tokens in fast_token_ids_list) if fast_token_ids_list else 0
+            if max_fast_len > 0:
+                # Pad all sequences to max_fast_len
+                padded_fast_ids = []
+                padded_fast_masks = []
+                for tokens, mask in zip(fast_token_ids_list, fast_mask_list):
+                    pad_len = max_fast_len - len(tokens)
+                    padded_tokens = tokens + [0] * pad_len  # 0 is typically PAD token
+                    padded_mask = mask + [0] * pad_len
+                    padded_fast_ids.append(padded_tokens)
+                    padded_fast_masks.append(padded_mask)
+                
+                fast_action_ids = torch.tensor(padded_fast_ids, dtype=torch.long, device=self.device)
+                fast_action_mask = torch.tensor(padded_fast_masks, dtype=torch.bool, device=self.device)
+            else:
+                # No valid tokens, create empty tensors
+                fast_action_ids = torch.zeros((B, 0), dtype=torch.long, device=self.device)
+                fast_action_mask = torch.zeros((B, 0), dtype=torch.bool, device=self.device)
+        
         # Move to device
         processed_images = [img.to(self.device) for img in processed_images]
         image_masks = [mask.to(self.device) for mask in image_masks]
         
-        return {
+        result = {
             # Images
             "pixel_values": processed_images[0] if len(processed_images) == 1 else processed_images[0],
             "images": processed_images,
@@ -649,3 +758,10 @@ class Pi05Preprocessor:
             "high_level_tasks": high_level_tasks,
             "subtasks": subtasks,
         }
+        
+        # Add FAST action tokens if available
+        if fast_action_ids is not None:
+            result["fast_action_ids"] = fast_action_ids
+            result["fast_action_mask"] = fast_action_mask
+        
+        return result
