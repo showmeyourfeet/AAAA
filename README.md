@@ -1,141 +1,93 @@
 # Hierarchical-Control-Systems-for-Robotic
 
-This project implements a hierarchical control system for robotic surgery/manipulation tasks. It decomposes the control problem into two levels:
-1.  **High-Level Policy (HLP):** Determines the current "stage" or high-level command (e.g., "grasp needle", "move to suture") based on visual observations.
-2.  **Low-Level Policy (LLP):** Generates precise robot joint actions to execute the command given by the HLP, conditioned on visual feedback and robot state.
+This project implements various hierarchical control systems and Vision-Language-Action (VLA) architectures for robotic surgery and manipulation tasks. It explores different ways to decompose control into high-level planning and low-level execution.
 
 ## Project Structure
 
 ```
 /
-├── hlp/                  # High-Level Policy
-│   ├── dataset.py        # HLP data loading (splitted, composite, etc.)
-│   ├── model.py          # HLP architecture (Swin-Tiny + Transformer/Gated Attention)
-│   └── train.py          # HLP training script
-├── llp/                  # Low-Level Policy
-│   ├── model.py          # LLP architecture (DETR-VAE + Gated Attention)
-│   ├── train.py          # LLP training script
-│   ├── policy.py         # Policy wrapper
-│   └── ...               # Backbone implementations (EfficientNet, ResNet)
+├── hlp/                  # High-Level Policy (Original Implementation)
+│   ├── dataset.py        # HLP data loading
+│   ├── model.py          # Swin-Tiny + Transformer/Gated Attention
+│   └── train.py          # Training script
+├── llp/                  # Low-Level Policy (Original Implementation)
+│   ├── model.py          # DETR-VAE + Gated Attention (ACT-based)
+│   ├── train.py          # Training script
+│   └── ...
+├── pi_0_5_torch/         # Pi0.5 Model Implementation (Physical Intelligence)
+│   ├── model.py          # PaliGemma + Gemma Expert + Flow Matching
+│   ├── train.py          # Training script
+│   └── ...
+├── SmolVLA_torch/        # SmolVLA Model Implementation
+│   ├── model.py          # SmolVLM + Action Expert (Cross-Attention)
+│   ├── train.py          # Training script
+│   └── ...
 ├── additional_modules/   # Custom Neural Network Modules
-│   └── gated_attention_SDPA.py # Gated Multi-Head Attention implementation
-|   └── DETRTransformer.py # DETR-style Transformer block implementation
-|   └── ...
+│   └── gated_attention_SDPA.py # Gated Multi-Head Attention
 └── ...
 ```
 
-## High-Level Policy (HLP)
+## 1. Standard Hierarchical Implementation (`hlp/` & `llp/`)
 
-The HLP predicts the high-level goal or "stage" of the task.
+This is the original two-stage approach:
 
-*   **Architecture:** Uses a **Swin-Tiny** image encoder followed by a decoder model. The decoder model can be a standard **DETR Transformer Decoder** or a custom **Gated Attention DETR Decoder**.
-*   **Input:** Sequence of images from multiple cameras (e.g., `left_frame`, `right_frame`).
-*   **Output:** Instrcuction command embedding, Correction flag embedding, Correction command flag.
+### High-Level Policy (HLP)
+Predicts the high-level goal or "stage" of the task.
+*   **Architecture:** **Swin-Tiny** image encoder + **Transformer/Gated Attention** decoder.
+*   **Input:** Multi-camera image sequences.
+*   **Output:** Command/Stage embedding.
 
-### Training
+### Low-Level Policy (LLP)
+Executes high-level commands. This module (`llp/policy.py`) now supports multiple policy architectures:
 
-To train the HLP, use `hlp/train.py`. The following command (based on `train_hl.sh`) demonstrates a robust training configuration:
+1.  **ACT (Action Chunking Transformer):**
+    *   **Architecture:** DETR-VAE based (CVAE encoder + Transformer Decoder).
+    *   **Features:** Supports optional **VQ-VAE** (Vector Quantization) and Gated Attention.
+2.  **Diffusion Policy:**
+    *   **Architecture:** **Conditional U-Net** (1D) or **DiT** (Diffusion Transformer).
+    *   **Mechanism:** Predicts action sequences via iterative denoising (DDIM Scheduler).
+    *   **Backbone:** ResNet or EfficientNet (FiLMed for language conditioning).
+3.  **Flow Matching Policy:**
+    *   **Architecture:** **DiT** (Diffusion Transformer) or **U-Net**.
+    *   **Mechanism:** Pi0.5-style Rectified Flow Matching (Euler sampling). Samples timesteps from a Beta distribution ($ \alpha=1.5, \beta=1 $).
+    *   **Features:** Efficient inference with **EMA** (Exponential Moving Average) support.
 
-```bash
-python hlp/train.py \
-  --normal_root_dir datasets/normal_training_datasets \
-  --normal_val_root datasets/normal_validation_datasets \
-  --stage_embeddings_file utils/stage_embeddings_file.json \
-  --stage_texts_file utils/stage_embeddings_file.json \
-  --dagger_embeddings_file utils/dagger_embeddings_file.json \
-  --ckpt_dir ckpts/hl_test \
-  --batch_size 4 \
-  --num_epochs 1000 \
-  --camera_names left_frame \
-  --train_image_encoder \
-  --lr 1e-5 \
-  --seed 42 \
-  --gpu 0 \
-  --history_len 4 \
-  --history_skip_frame 12 \
-  --prediction_offset 15 \
-  --use_composite \
-  --use_augmentation \
-  --sampling_strategy sequential \
-  --n_repeats 1 \
-  --use_weak_traversal \
-  --samples_non_cross_per_stage 2 \
-  --samples_cross_per_stage 2 \
-  --use_dagger \
-  --dagger_root_dir datasets/dagger_training_datasets \
-  --dagger_val_root datasets/dagger_validation_datasets \
-  --dagger_mix_ratio 0.5 \
-  --use_gated_attention \
-  --mlp_type swiglu \
-  --gate_mode element-wise
-```
+## 2. Pi0.5 Implementation (`pi_0_5_torch/`)
 
-**Key Arguments:**
-*   `--use_gated_attention`: Enables the custom Gated Transformer Encoder.
-*   `--train_image_encoder`: Unfreezes the Swin-Tiny backbone for fine-tuning.
-*   `--use_composite`: Uses composite dataset sampling (combining runs).
-*   `--use_dagger`: Enable dagger training mode.
+A faithful implementation of the **Pi0.5** architecture from OpenPI (Physical Intelligence).
 
-## Low-Level Policy (LLP)
+*   **Core Concept:** Hierarchical VLA with Flow Matching.
+*   **Architecture:**
+    *   **High-Level:** **PaliGemma** (VLM) for subtask prediction ($ \pi_\theta(\hat{\ell} | o_t, \ell) $).
+    *   **Low-Level:** **Gemma** (Action Expert) for action generation ($ \pi_\theta(a_{t:t+H} | o_t, \hat{\ell}) $).
+*   **Mechanism:**
+    *   Uses **Flow Matching** for action generation (instead of VAE/Diffusion).
+    *   Uses **AdaRMS** for time/condition injection.
+    *   Supports multi-camera inputs.
+*   **Training:** Jointly trains subtask prediction (Cross-Entropy) and action generation (Flow Matching).
 
-The LLP executes the high-level commands.
+## 3. SmolVLA Implementation (`SmolVLA_torch/`)
 
-*   **Architecture:** Based on **ACT (Action Chunking Transformer)**. It uses a **DETR**-like encoder-decoder with a **VAE** for generative modeling. It can optionally use **Gated Attention** layers.
-*   **Backbone:** Supports **EfficientNet** (e.g., `efficientnet_b3film`) or **ResNet** with FiLM layers for language/command conditioning.
-*   **Input:** Images, Robot Joint State (`qpos`), and High-Level Command Embedding.
-*   **Output:** A sequence (chunk) of future actions.
+A lightweight VLA model designed for efficiency.
 
-### Training
+*   **Architecture:**
+    *   **Backbone:** **SmolVLM2-500M-Video-Instruct** (Vision-Language Model).
+    *   **Action Expert:** A smaller Transformer Decoder (initialized from VLM config).
+*   **Mechanism:**
+    *   **Interleaved Attention:** The Action Expert attends to the VLM's hidden states via **Cross-Attention** layers inserted every $N$ layers.
+    *   **RoPE:** Uses Rotary Positional Embeddings.
+    *   **Efficiency:** Uses a smaller parameter count for the action head while leveraging a pre-trained VLM.
 
-To train the LLP, use `llp/train.py`. The following command (based on `train_ll.sh`) shows a standard configuration:
+## Custom Modules (`additional_modules/`)
 
-```bash
-python llp/train.py \
-  --ckpt_dir ckpts/ll_test \
-  --use_language \
-  --use_splitted \
-  --splitted_root splitted_datasets/training_datasets \
-  --val_splitted_root splitted_datasets/validation_datasets \
-  --stage_embeddings_file utils/stage_embeddings_file.json \
-  --batch_size 8 \
-  --seed 42 \
-  --kl_weight 20 \
-  --num_epochs 10 \
-  --lr 2e-5 \
-  --hidden_dim 512 \
-  --dim_feedforward 3200 \
-  --chunk_size 40 \
-  --camera_names left_frame right_frame \
-  --image_encoder efficientnet_b3film \
-  --train_image_encoder \
-  --best_model_metric l1_loss \
-  --prefetch_factor 1 \
-  --num_workers 1 \
-  --dec_layers_num 7 \
-  --gpu 0 \
-  --save_ckpt_every 2 \
-  --save_latest_every 5 \
-  --constant_lr \
-  --shared_backbone true \
-  --use_gated_attention
-```
-
-**Key Arguments:**
-*   `--shared_backbone true`: Shares the image encoder weights across different camera views.
-*   `--use_gated_attention`: Replaces standard attention with Gated Attention in the DETR transformer.
-*   `--chunk_size`: Length of the predicted action sequence.
-*   `--kl_weight`: Weight for the KL divergence loss term (VAE).
-
-## Custom Modules
-
-### Gated Attention (`additional_modules/`)
-This project implements a novel **Gated Multihead Attention** mechanism (`gated_attention_SDPA.py`). This mechanism introduces a gating signal to the attention output, potentially improving stability and performance for long-horizon tasks. This custom layer is integrated into both the HLP and LLP transformers when the `--use_gated_attention` flag is set.
+*   **Gated Attention:** Implements **Gated Multihead Attention** (`gated_attention_SDPA.py`) to introduce gating signals into attention mechanisms, improving stability for long-horizon tasks.
 
 ## Key Technologies
 
-*   **PyTorch**: Deep learning framework.
-*   **Transformers**: Core architecture for both policies.
-*   **DETR**: Object detection transformer adapted for action prediction.
-*   **VAE/VQ-VAE**: Variational Autoencoder for handling multimodal action distributions.
-*   **Swin Transformer**: Hierarchical vision transformer used in HLP.
-*   **EfficientNet/ResNet**: CNN backbones used in LLP.
+*   **PyTorch**
+*   **Transformers (Hugging Face)**
+*   **PaliGemma / Gemma / SmolVLM**
+*   **DETR / ACT**
+*   **Flow Matching / VAE**
+
+```
