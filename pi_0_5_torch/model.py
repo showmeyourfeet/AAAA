@@ -550,10 +550,12 @@ class PI05Model(PreTrainedModel):
 
     def forward(
         self,
-        pixel_values: Tensor,
+        pixel_values: Tensor | list[Tensor],
         input_ids: Tensor,
         attention_mask: Tensor,
         actions: Tensor,
+        images: list[Tensor] | None = None,
+        image_masks: list[Tensor] | None = None,
         noise: Tensor | None = None,
         time: Tensor | None = None,
     ) -> Tensor:
@@ -564,10 +566,12 @@ class PI05Model(PreTrainedModel):
         matching OpenPI's behavior.
 
         Args:
-            pixel_values: [B, 3, H, W] or list of [B, 3, H, W] for multi-camera
+            pixel_values: [B, 3, H, W] single camera image (for backward compatibility)
             input_ids: [B, L] token ids
             attention_mask: [B, L] attention mask
             actions: [B, T, A] normalized actions
+            images: Optional list of [B, 3, H, W] tensors for multi-camera support
+            image_masks: Optional list of [B] boolean tensors for multi-camera support
             noise: optional noise tensor
             time: optional timesteps [B]
 
@@ -588,10 +592,17 @@ class PI05Model(PreTrainedModel):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        # Embed prefix
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix_simple(
-            pixel_values, input_ids, attention_mask
-        )
+        # Embed prefix - support multi-camera if images provided
+        if images is not None and image_masks is not None:
+            # Multi-camera mode
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+                images, image_masks, input_ids, attention_mask
+            )
+        else:
+            # Single camera mode (backward compatibility)
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix_simple(
+                pixel_values, input_ids, attention_mask
+            )
 
         # Embed suffix
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
@@ -886,7 +897,7 @@ class PI05Model(PreTrainedModel):
 
     def forward_hierarchical(
         self,
-        pixel_values: Tensor,
+        pixel_values: Tensor | list[Tensor],
         input_ids: Tensor,
         attention_mask: Tensor,
         actions: Tensor,
@@ -894,6 +905,8 @@ class PI05Model(PreTrainedModel):
         subtask_mask: Optional[Tensor] = None,
         fast_action_ids: Optional[Tensor] = None,
         fast_action_mask: Optional[Tensor] = None,
+        images: list[Tensor] | None = None,
+        image_masks: list[Tensor] | None = None,
         alpha: float = 10.0,
         noise: Tensor | None = None,
         time: Tensor | None = None,
@@ -945,9 +958,17 @@ class PI05Model(PreTrainedModel):
         # 1) High-level text path: prefix-only forward for subtask CE loss
         #    Gradients from text loss can update the VLM (prefix branch).
         # ------------------------------------------------------------------
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix_simple(
-            pixel_values, input_ids, attention_mask
-        )
+        # Support multi-camera if images provided
+        if images is not None and image_masks is not None:
+            # Multi-camera mode
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+                images, image_masks, input_ids, attention_mask
+            )
+        else:
+            # Single camera mode (backward compatibility)
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix_simple(
+                pixel_values, input_ids, attention_mask
+            )
 
         # Cast prefix embeddings to model dtype if needed
         model_dtype = self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
