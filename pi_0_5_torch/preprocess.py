@@ -10,6 +10,7 @@ This module implements preprocessing that matches:
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+import logging
 
 import numpy as np
 import torch
@@ -18,6 +19,8 @@ from torch import Tensor
 from transformers import AutoTokenizer, SiglipImageProcessor
 
 from .configuration import PI05Config
+
+logger = logging.getLogger(__name__)
 
 # Default image keys matching OpenPI
 DEFAULT_IMAGE_KEYS = (
@@ -349,13 +352,19 @@ class Pi05Preprocessor:
         """
         if isinstance(images, dict):
             # Multi-camera case
+            # Check that all required image keys are present (matching OpenPI behavior)
+            missing_keys = set(self.image_keys) - set(images.keys())
+            if missing_keys:
+                raise ValueError(
+                    f"Multi-camera images dict missing required keys: expected {self.image_keys}, "
+                    f"got {list(images.keys())}, missing {list(missing_keys)}"
+                )
+            
             processed_images = []
             image_masks = []
 
+            # Process images in the order specified by image_keys (matching OpenPI)
             for key in self.image_keys:
-                if key not in images:
-                    continue
-
                 cam_images = images[key]
                 batch_tensors = [self._process_single_image(img) for img in cam_images]
                 batch_tensor = torch.stack(batch_tensors, dim=0)  # [B, 3, H, W]
@@ -414,13 +423,16 @@ class Pi05Preprocessor:
         subtasks: List[str],
         state_norm: Tensor,
         mode: str = "high_level",
+        pre_training_style: bool = False,
     ) -> tuple[List[str], List[str]]:
         """
         Build prompts for hierarchical policy training (Pi0.5 paper).
         
         High-level mode (subtask prediction):
-            Input: "Task: <high_level_task>, State: <state>;\nSubtask: "
-            Target: <subtask>
+            - Post-training style: "Task: <high_level_task>, State: <state>;\nSubtask: "
+              Target: <subtask> (only subtask tokens)
+            - Pre-training style: "Task: <high_level_task>, State: <state>;\n"
+              Target: <subtask> + <fast_action_tokens> (continuous sequence)
             
         Low-level mode (action generation):
             Input: "Task: <subtask>, State: <state>;\nAction: "
@@ -431,6 +443,8 @@ class Pi05Preprocessor:
             subtasks: List of subtask labels
             state_norm: [B, D] normalized state tensor
             mode: "high_level" or "low_level"
+            pre_training_style: If True, use pre-training prompt format (no "Subtask: " suffix)
+                                to predict [subtask, fast_action_tokens] as continuous sequence
             
         Returns:
             (prompts, targets) where targets are subtask texts for high-level mode
@@ -449,7 +463,13 @@ class Pi05Preprocessor:
             if mode == "high_level":
                 # High-level inference: predict subtask from task
                 hl_task = (high_level_tasks[i] or "").strip().replace("_", " ").replace("\n", " ")
-                prompt = f"Task: {hl_task}, State: {state_str};\nSubtask: "
+                if pre_training_style:
+                    # Pre-training style: predict [subtask, fast_action_tokens] as continuous sequence
+                    # No "Subtask: " suffix, model naturally predicts the full sequence
+                    prompt = f"Task: {hl_task}, State: {state_str};\n"
+                else:
+                    # Post-training style: only predict subtask tokens
+                    prompt = f"Task: {hl_task}, State: {state_str};\nSubtask: "
                 target = (subtasks[i] or "").strip().replace("_", " ").replace("\n", " ")
             else:
                 # Low-level inference: predict actions from subtask
@@ -533,7 +553,8 @@ class Pi05Preprocessor:
         state_norm = state_norm.to(self.device)
 
         # For backward compatibility, also provide single pixel_values
-        pixel_values = processed_images[0] if len(processed_images) == 1 else processed_images[0]
+        # Always use first camera image (for backward compatibility with single-camera code)
+        pixel_values = processed_images[0]
 
         return {
             "pixel_values": pixel_values,
@@ -608,8 +629,10 @@ class Pi05Preprocessor:
         state_norm = normalize_feature(states_padded, self.dataset_stats.state_stats)
         
         # 3. Build high-level prompts (for subtask prediction)
+        # Use pre-training style if FAST tokenizer is enabled (predicts [subtask, fast_action_tokens])
+        use_pre_training_style = self.fast_tokenizer is not None
         hl_prompts, subtask_targets = self._build_hierarchical_prompts(
-            high_level_tasks, subtasks, state_norm, mode="high_level"
+            high_level_tasks, subtasks, state_norm, mode="high_level", pre_training_style=use_pre_training_style
         )
         
         # 4. Build low-level prompts (for action generation)
@@ -726,7 +749,8 @@ class Pi05Preprocessor:
         
         result = {
             # Images
-            "pixel_values": processed_images[0] if len(processed_images) == 1 else processed_images[0],
+            # pixel_values: single tensor for backward compatibility (uses first camera)
+            "pixel_values": processed_images[0],
             "images": processed_images,
             "image_masks": image_masks,
             

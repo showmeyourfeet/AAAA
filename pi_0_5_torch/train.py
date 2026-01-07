@@ -175,12 +175,19 @@ def train_one_epoch(
         inputs = preprocessor.preprocess_batch(batch, train=True)
 
         # Forward pass - returns loss with reduction="none"
-        loss_per_elem = model(
-            pixel_values=inputs["pixel_values"],
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            actions=inputs["actions"],
-        )
+        # Support multi-camera if available
+        forward_kwargs = {
+            "pixel_values": inputs["pixel_values"],
+            "input_ids": inputs["input_ids"],
+            "attention_mask": inputs["attention_mask"],
+            "actions": inputs["actions"],
+        }
+        # Add multi-camera support if available
+        if "images" in inputs and "image_masks" in inputs:
+            forward_kwargs["images"] = inputs["images"]
+            forward_kwargs["image_masks"] = inputs["image_masks"]
+        
+        loss_per_elem = model(**forward_kwargs)
 
         # Aggregate loss (mean over all dimensions)
         # You can customize this for weighted loss, masking padded actions, etc.
@@ -228,12 +235,18 @@ def validate(
     for batch in dataloader:
         inputs = preprocessor.preprocess_batch(batch, train=False)
 
-        loss_per_elem = model(
-            pixel_values=inputs["pixel_values"],
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            actions=inputs["actions"],
-        )
+        # Support multi-camera if available
+        forward_kwargs = {
+            "pixel_values": inputs["pixel_values"],
+            "input_ids": inputs["input_ids"],
+            "attention_mask": inputs["attention_mask"],
+            "actions": inputs["actions"],
+        }
+        if "images" in inputs and "image_masks" in inputs:
+            forward_kwargs["images"] = inputs["images"]
+            forward_kwargs["image_masks"] = inputs["image_masks"]
+        
+        loss_per_elem = model(**forward_kwargs)
 
         action_is_pad = inputs["action_is_pad"]
         if action_is_pad.any():
@@ -299,17 +312,23 @@ def train_one_epoch_hierarchical(
         inputs = preprocessor.preprocess_hierarchical_batch(batch, train=True)
 
         # Forward pass with hierarchical output
-        output = model.forward_hierarchical(
-            pixel_values=inputs["pixel_values"],
-            input_ids=inputs["high_level_input_ids"],
-            attention_mask=inputs["high_level_attention_mask"],
-            actions=inputs["actions"],
-            subtask_ids=inputs["subtask_input_ids"],
-            subtask_mask=inputs["subtask_attention_mask"],
-            fast_action_ids=inputs.get("fast_action_ids"),
-            fast_action_mask=inputs.get("fast_action_mask"),
-            alpha=alpha,
-        )
+        # Support multi-camera if available
+        forward_kwargs = {
+            "pixel_values": inputs["pixel_values"],
+            "input_ids": inputs["high_level_input_ids"],
+            "attention_mask": inputs["high_level_attention_mask"],
+            "actions": inputs["actions"],
+            "subtask_ids": inputs["subtask_input_ids"],
+            "subtask_mask": inputs["subtask_attention_mask"],
+            "fast_action_ids": inputs.get("fast_action_ids"),
+            "fast_action_mask": inputs.get("fast_action_mask"),
+            "alpha": alpha,
+        }
+        if "images" in inputs and "image_masks" in inputs:
+            forward_kwargs["images"] = inputs["images"]
+            forward_kwargs["image_masks"] = inputs["image_masks"]
+        
+        output = model.forward_hierarchical(**forward_kwargs)
 
         # Get total loss
         loss = output.total_loss
@@ -382,17 +401,23 @@ def validate_hierarchical(
     for batch in dataloader:
         inputs = preprocessor.preprocess_hierarchical_batch(batch, train=False)
 
-        output = model.forward_hierarchical(
-            pixel_values=inputs["pixel_values"],
-            input_ids=inputs["high_level_input_ids"],
-            attention_mask=inputs["high_level_attention_mask"],
-            actions=inputs["actions"],
-            subtask_ids=inputs["subtask_input_ids"],
-            subtask_mask=inputs["subtask_attention_mask"],
-            fast_action_ids=inputs.get("fast_action_ids"),
-            fast_action_mask=inputs.get("fast_action_mask"),
-            alpha=alpha,
-        )
+        # Support multi-camera if available
+        forward_kwargs = {
+            "pixel_values": inputs["pixel_values"],
+            "input_ids": inputs["high_level_input_ids"],
+            "attention_mask": inputs["high_level_attention_mask"],
+            "actions": inputs["actions"],
+            "subtask_ids": inputs["subtask_input_ids"],
+            "subtask_mask": inputs["subtask_attention_mask"],
+            "fast_action_ids": inputs.get("fast_action_ids"),
+            "fast_action_mask": inputs.get("fast_action_mask"),
+            "alpha": alpha,
+        }
+        if "images" in inputs and "image_masks" in inputs:
+            forward_kwargs["images"] = inputs["images"]
+            forward_kwargs["image_masks"] = inputs["image_masks"]
+        
+        output = model.forward_hierarchical(**forward_kwargs)
 
         action_is_pad = inputs["action_is_pad"]
         if action_is_pad.any() and output.action_loss is not None:
